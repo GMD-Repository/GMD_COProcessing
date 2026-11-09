@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- EA Tools: a block of enumeration areas -->
+  <rect x="2" y="2" width="20" height="20" rx="3" fill="#1f5f8b"/>
+  <path d="M5 5 H12 V11 H5 Z" fill="#8fd18a" stroke="#ffffff" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M12 5 H19 V13 H12 Z" fill="#b8e3b4" stroke="#ffffff" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M5 11 H12 V19 H5 Z" fill="#b8e3b4" stroke="#ffffff" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M12 13 H19 V19 H12 Z" fill="#8fd18a" stroke="#ffffff" stroke-width="1.2" stroke-linejoin="round"/>
+</svg>

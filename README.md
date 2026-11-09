@@ -14,38 +14,42 @@ This repository is already cloned into the QGIS plugins folder:
 1. Restart QGIS (or use **Plugin Reloader**).
 2. Enable **GMD CO Processing** in *Plugins > Manage and Install Plugins > Installed*.
    Because the plugin is marked experimental, tick *Show also experimental plugins* in *Settings* if it does not appear.
-3. The algorithms appear in the Processing Toolbox under **GMD CO Processing**, and
-   the toolbar button / *Plugins > GMD CO Processing* menu opens the EA post-processing tool.
+3. A **GMD CO Processing** menu appears in the QGIS menu bar (before *Help*):
+   - *GMD CO Processing Panel*: show/hide the plugin panel (also the toolbar button)
+   - *Run Script*: run any script in `gmd_processing_tools/`
+   - *New Script…*, *Open Scripts Folder*
 
 ## Structure
 ```
 __init__.py                      # classFactory entry point
 metadata.txt                     # plugin metadata
-plugin.py                        # registers provider, menu and toolbar action
+plugin.py                        # menu bar menu, toolbar button and dock panel
 icon.svg
-processing_provider/
-    provider.py                  # QgsProcessingProvider; register algorithms in loadAlgorithms()
-    algorithms/
-        ea_post_processing.py    # template algorithm (copies input to output)
+gmd_processing_tools/            # YOUR SCRIPTS GO HERE (listed and run from the panel)
+    _template.py                 # template used by "New..."
+    example_ea_summary.py
+ui/
+    dock_widget.ui               # panel layout (Qt Designer)
+    dock_widget.py               # panel logic
 ```
 
-## Adding an algorithm
-1. Create a new `QgsProcessingAlgorithm` subclass in `processing_provider/algorithms/`.
-2. Add it in `GMDCOProcessingProvider.loadAlgorithms()`.
-
-It then appears automatically in the dock panel's tool list.
+## Scripts (`gmd_processing_tools/`)
+Drop `.py` files into [gmd_processing_tools/](gmd_processing_tools/); they appear in the panel
+automatically. See [gmd_processing_tools/README.md](gmd_processing_tools/README.md) for the
+variables available to scripts (`iface`, `ea_layer`).
 
 ## UI (dock panel)
-The toolbar button / *Plugins > GMD CO Processing* toggles a dock panel (`ui/`):
+*GMD CO Processing > GMD CO Processing Panel* (or the toolbar button) toggles the panel:
 
-- **EA layer**: the vector layer passed to the tool's first layer input.
-- **Tools**: every algorithm in the provider, with its help text.
-- **Run**: runs in the background; outputs are temporary layers added to the project.
-- **Advanced…**: opens the standard Processing dialog to set all parameters.
-- Progress bar and log.
+- **EA layer**: available in scripts as `ea_layer`.
+- **Scripts**: every script in `gmd_processing_tools/`, with its docstring as description.
+- **Run** (or double-click): runs the script; `print()` output and errors go to the log.
+- **Open**: opens the script in the QGIS Python console editor.
+- **New...**: creates a script from `_template.py` and opens it.
+- **Folder**: opens `gmd_processing_tools/` in Explorer.
 
 Edit the layout in `ui/dock_widget.ui` with Qt Designer (`qgis-ltr-designer.bat`
-in the QGIS `bin` folder, which includes the QGIS widgets); logic is in `ui/dock_widget.py`.
+in the QGIS `bin` folder, which includes the QGIS widgets).
 
 ## Releasing
 Publishing a GitHub release runs [.github/workflows/release.yml](.github/workflows/release.yml), which

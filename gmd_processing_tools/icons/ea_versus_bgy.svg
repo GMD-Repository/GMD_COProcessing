@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- EA vs Barangay: EA polygon against a fixed barangay boundary, mismatches highlighted -->
+  <path d="M3 4 L20 3 L21 19 L4 21 Z" fill="#e8f4e6" stroke="#1f5f8b" stroke-width="1.8" stroke-linejoin="round"/>
+  <path d="M6 7 L16 6 L17 12 L22.5 13 L22 17 L7 18 Z" fill="#8fd18a" fill-opacity="0.85" stroke="#2e7d32" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M20.6 12.6 L22.5 13 L22 17 L20.85 17.08 Z" fill="#ff7f00"/>
+  <path d="M3.4 9 L6 7 L7 18 L3.9 18.5 Z" fill="#e31a1c" fill-opacity="0.85"/>
+</svg>

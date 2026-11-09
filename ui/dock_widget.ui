@@ -29,26 +29,30 @@
         </widget>
        </item>
        <item row="0" column="1">
-        <widget class="QgsMapLayerComboBox" name="layerCombo"/>
+        <widget class="QgsMapLayerComboBox" name="layerCombo">
+         <property name="toolTip">
+          <string>Available in scripts as the variable ea_layer</string>
+         </property>
+        </widget>
        </item>
       </layout>
      </widget>
     </item>
     <item>
-     <widget class="QGroupBox" name="toolsGroup">
+     <widget class="QGroupBox" name="scriptsGroup">
       <property name="title">
-       <string>Tools</string>
+       <string>Scripts (gmd_processing_tools)</string>
       </property>
-      <layout class="QVBoxLayout" name="toolsLayout">
+      <layout class="QVBoxLayout" name="scriptsLayout">
        <item>
-        <widget class="QListWidget" name="toolList"/>
+        <widget class="QListWidget" name="scriptList"/>
        </item>
        <item>
         <widget class="QTextBrowser" name="helpText">
          <property name="maximumSize">
           <size>
            <width>16777215</width>
-           <height>90</height>
+           <height>80</height>
           </size>
          </property>
         </widget>
@@ -63,35 +67,38 @@
           </widget>
          </item>
          <item>
-          <widget class="QPushButton" name="cancelButton">
-           <property name="enabled">
-            <bool>false</bool>
+          <widget class="QPushButton" name="openButton">
+           <property name="toolTip">
+            <string>Open the script in the QGIS Python console editor</string>
            </property>
            <property name="text">
-            <string>Cancel</string>
+            <string>Open</string>
            </property>
           </widget>
          </item>
          <item>
-          <widget class="QPushButton" name="advancedButton">
+          <widget class="QPushButton" name="newButton">
            <property name="toolTip">
-            <string>Open the full Processing dialog to set every parameter</string>
+            <string>Create a new script from the template</string>
            </property>
            <property name="text">
-            <string>Advanced…</string>
+            <string>New…</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="folderButton">
+           <property name="toolTip">
+            <string>Open the gmd_processing_tools folder</string>
+           </property>
+           <property name="text">
+            <string>Folder</string>
            </property>
           </widget>
          </item>
         </layout>
        </item>
       </layout>
-     </widget>
-    </item>
-    <item>
-     <widget class="QProgressBar" name="progressBar">
-      <property name="value">
-       <number>0</number>
-      </property>
      </widget>
     </item>
     <item>

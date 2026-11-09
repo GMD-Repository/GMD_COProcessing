@@ -1,195 +1,217 @@
-"""Dock panel: pick an EA layer and a tool, run it in the background."""
+"""Dock panel: list, run and open the scripts in gmd_processing_tools/."""
 
 import os
+import re
+import runpy
+import sys
+import traceback
+from contextlib import redirect_stderr, redirect_stdout
 
-from qgis.core import (
-    QgsApplication,
-    QgsMapLayerProxyModel,
-    QgsProcessingAlgRunnerTask,
-    QgsProcessingAlgorithm,
-    QgsProcessingContext,
-    QgsProcessingFeedback,
-    QgsProcessingUtils,
-    QgsProject,
-)
+from qgis.core import QgsApplication, QgsMapLayerProxyModel
 from qgis.PyQt import uic
-from qgis.PyQt.QtCore import Qt, pyqtSignal
-from qgis.PyQt.QtWidgets import QDockWidget, QListWidgetItem
+from qgis.PyQt.QtCore import QFileSystemWatcher, QSize, Qt, QUrl
+from qgis.PyQt.QtGui import QDesktopServices, QFont
+from qgis.PyQt.QtWidgets import (
+    QApplication,
+    QDockWidget,
+    QInputDialog,
+    QListWidgetItem,
+    QMessageBox,
+)
+
+from ..script_registry import SCRIPTS_DIR, group_icon, grouped_scripts, theme_icon
+
+TEMPLATE = os.path.join(SCRIPTS_DIR, "_template.py")
+PATH_ROLE = Qt.UserRole
+DESCRIPTION_ROLE = Qt.UserRole + 1
 
 FORM_CLASS, _ = uic.loadUiType(
     os.path.join(os.path.dirname(__file__), "dock_widget.ui")
 )
 
-# Parameter types that can receive the selected EA layer.
-LAYER_PARAM_TYPES = {"source", "vector", "layer"}
 
+class _LogWriter:
+    """File-like object that sends print() output to the panel log."""
 
-class _Feedback(QgsProcessingFeedback):
-    """Forwards algorithm messages as a signal (safe across threads)."""
+    def __init__(self, log):
+        self._log = log
+        self._buffer = ""
 
-    message = pyqtSignal(str)
+    def write(self, text):
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            self._log(line)
+            QgsApplication.processEvents()  # keep the log updating during long scripts
 
-    def pushInfo(self, info):  # noqa: N802
-        super().pushInfo(info)
-        self.message.emit(info)
-
-    def pushWarning(self, warning):  # noqa: N802
-        super().pushWarning(warning)
-        self.message.emit(f"WARNING: {warning}")
-
-    def reportError(self, error, fatalError=False):  # noqa: N802, N803
-        super().reportError(error, fatalError)
-        self.message.emit(f"ERROR: {error}")
+    def flush(self):
+        if self._buffer:
+            self._log(self._buffer)
+            self._buffer = ""
 
 
 class GMDCOProcessingDock(QDockWidget, FORM_CLASS):
-    def __init__(self, provider, parent=None):
+    def __init__(self, iface, parent=None):
         super().__init__(parent)
         self.setupUi(self)
-        self.provider = provider
+        self.iface = iface
+        self._running = False
 
-        # Keep references alive while a task runs.
-        self._task = None
-        self._context = None
-        self._feedback = None
+        os.makedirs(SCRIPTS_DIR, exist_ok=True)
 
         self.layerCombo.setFilters(QgsMapLayerProxyModel.VectorLayer)
+        self.layerCombo.setAllowEmptyLayer(True)
 
-        self.toolList.currentItemChanged.connect(self._update_help)
+        self.scriptList.setIconSize(QSize(20, 20))
+        self.runButton.setIcon(theme_icon("mActionStart.svg"))
+        self.openButton.setIcon(theme_icon("mActionFileOpen.svg"))
+        self.newButton.setIcon(theme_icon("mActionFileNew.svg"))
+        self.folderButton.setIcon(theme_icon("mIconFolderOpen.svg"))
+
+        self.scriptList.currentItemChanged.connect(self._update_help)
+        self.scriptList.itemDoubleClicked.connect(lambda *_: self.run_selected())
         self.runButton.clicked.connect(self.run_selected)
-        self.cancelButton.clicked.connect(self.cancel)
-        self.advancedButton.clicked.connect(self.open_advanced)
-        self.provider.algorithmsLoaded.connect(self.populate_tools)
+        self.openButton.clicked.connect(self.open_selected)
+        self.newButton.clicked.connect(self.new_script)
+        self.folderButton.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(SCRIPTS_DIR))
+        )
 
-        self.populate_tools()
+        # Refresh the list automatically when files are added/removed/renamed.
+        self._watcher = QFileSystemWatcher([SCRIPTS_DIR], self)
+        self._watcher.directoryChanged.connect(lambda *_: self.populate_scripts())
 
-    # ----------------------------------------------------------------- tools
-    def populate_tools(self):
-        self.toolList.clear()
-        algs = sorted(self.provider.algorithms(), key=lambda a: a.displayName())
-        for alg in algs:
-            item = QListWidgetItem(alg.icon(), alg.displayName())
-            item.setData(Qt.UserRole, alg.id())
-            item.setToolTip(alg.group())
-            self.toolList.addItem(item)
-        if algs:
-            self.toolList.setCurrentRow(0)
-        self._update_buttons()
+        self.populate_scripts()
 
-    def _selected_alg_id(self):
-        item = self.toolList.currentItem()
-        return item.data(Qt.UserRole) if item else None
+    # --------------------------------------------------------------- listing
+    def populate_scripts(self, select=None):
+        """Group headings (not selectable) followed by their scripts."""
+        current = select or self._selected_path()
+        self.scriptList.clear()
+        bold = QFont()
+        bold.setBold(True)
+        first_script = None
+        for group, scripts in grouped_scripts():
+            heading = QListWidgetItem(group_icon(group), group)
+            heading.setFont(bold)
+            heading.setFlags(Qt.ItemIsEnabled)  # a heading, not a script
+            self.scriptList.addItem(heading)
+            for script in scripts:
+                item = QListWidgetItem(script.icon, "    " + script.name)
+                item.setData(PATH_ROLE, script.path)
+                item.setData(DESCRIPTION_ROLE, script.description)
+                item.setToolTip(os.path.basename(script.path))
+                self.scriptList.addItem(item)
+                first_script = first_script or item
+                if script.path == current:
+                    self.scriptList.setCurrentItem(item)
+        if self.scriptList.currentItem() is None and first_script is not None:
+            self.scriptList.setCurrentItem(first_script)
+        self._update_help()
+
+    def _selected_path(self):
+        item = self.scriptList.currentItem()
+        return item.data(PATH_ROLE) if item else None
 
     def _update_help(self, *_):
-        alg_id = self._selected_alg_id()
-        alg = QgsApplication.processingRegistry().algorithmById(alg_id) if alg_id else None
-        self.helpText.setHtml((alg.shortHelpString() or "") if alg else "")
+        item = self.scriptList.currentItem()
+        self.helpText.setPlainText((item.data(DESCRIPTION_ROLE) or "") if item else "")
         self._update_buttons()
 
     def _update_buttons(self):
-        running = self._task is not None
-        has_tool = self._selected_alg_id() is not None
-        self.runButton.setEnabled(has_tool and not running)
-        self.advancedButton.setEnabled(has_tool and not running)
-        self.cancelButton.setEnabled(running)
-        self.toolList.setEnabled(not running)
-        self.layerCombo.setEnabled(not running)
+        has_script = self._selected_path() is not None
+        for button in (self.runButton, self.openButton):
+            button.setEnabled(has_script and not self._running)
+        self.newButton.setEnabled(not self._running)
+        self.scriptList.setEnabled(not self._running)
 
-    # ------------------------------------------------------------ parameters
-    def _build_params(self, alg):
-        """Selected layer -> first layer input; temporary outputs for destinations."""
-        params = {}
-        layer = self.layerCombo.currentLayer()
-        layer_assigned = False
-        for p in alg.parameterDefinitions():
-            if p.isDestination():
-                params[p.name()] = "TEMPORARY_OUTPUT"
-            elif not layer_assigned and layer and p.type() in LAYER_PARAM_TYPES:
-                params[p.name()] = layer.id()
-                layer_assigned = True
-        return params
-
-    # ------------------------------------------------------------------- run
     def log(self, text):
         self.logView.appendPlainText(text)
 
+    # ------------------------------------------------------------------- run
     def run_selected(self):
-        alg_id = self._selected_alg_id()
-        if not alg_id:
-            return
-        alg = QgsApplication.processingRegistry().createAlgorithmById(alg_id)
+        path = self._selected_path()
+        if path:
+            self.run_script(path)
 
-        context = QgsProcessingContext()
-        context.setProject(QgsProject.instance())
-        feedback = _Feedback()
-        feedback.message.connect(self.log)
-        feedback.progressChanged.connect(lambda v: self.progressBar.setValue(int(v)))
+    def run_script(self, path):
+        """Run a script; returns False if it raised an error (details in the log)."""
+        if self._running:
+            return False
 
-        params = self._build_params(alg)
-        ok, msg = alg.checkParameterValues(params, context)
-        if not ok:
-            self.log(f"Cannot run '{alg.displayName()}': {msg}")
-            self.log("Use 'Advanced…' to set the remaining parameters.")
-            return
+        name = os.path.basename(path)
+        script_globals = {
+            "iface": self.iface,
+            "ea_layer": self.layerCombo.currentLayer(),
+        }
 
-        self.progressBar.setValue(0)
-        self.log(f"▶ {alg.displayName()} started")
-
-        if alg.flags() & QgsProcessingAlgorithm.FlagNoThreading:
-            ok, results = alg.run(params, context, feedback)
-            self._finished(alg, context, ok, results)
-            return
-
-        task = QgsProcessingAlgRunnerTask(alg, params, context, feedback)
-        task.executed.connect(
-            lambda success, results: self._finished(alg, context, success, results)
-        )
-        self._task, self._context, self._feedback = task, context, feedback
+        self._running = True
         self._update_buttons()
-        QgsApplication.taskManager().addTask(task)
+        self.log(f"▶ {name}")
+        writer = _LogWriter(self.log)
+        sys.path.insert(0, SCRIPTS_DIR)  # allow `import _helpers` from scripts
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            with redirect_stdout(writer), redirect_stderr(writer):
+                runpy.run_path(path, init_globals=script_globals, run_name="__main__")
+            writer.flush()
+            self.log(f"✔ {name} finished")
+            return True
+        except SystemExit:
+            writer.flush()
+            self.log(f"✔ {name} exited")
+            return True
+        except Exception:  # noqa: BLE001 - report any script error in the log
+            writer.flush()
+            self.log(traceback.format_exc().rstrip())
+            self.log(f"✖ {name} failed")
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+            if SCRIPTS_DIR in sys.path:
+                sys.path.remove(SCRIPTS_DIR)
+            self._running = False
+            self._update_buttons()
 
-    def cancel(self):
-        if self._feedback is not None:
-            self._feedback.cancel()
-            self.log("Cancelling…")
+    # ------------------------------------------------------------ open / new
+    def open_selected(self):
+        path = self._selected_path()
+        if path:
+            self.open_script(path)
 
-    def _finished(self, alg, context, success, results):
-        if success:
-            self._load_outputs(alg, context, results)
-            self.progressBar.setValue(100)
-            self.log(f"✔ {alg.displayName()} finished")
-        else:
-            self.log(f"✖ {alg.displayName()} failed or was cancelled")
-        self._task = self._context = self._feedback = None
-        self._update_buttons()
+    def open_script(self, path):
+        """Open in the QGIS Python console editor; fall back to the OS editor."""
+        try:
+            from console import console
 
-    def _load_outputs(self, alg, context, results):
-        for out in alg.outputDefinitions():
-            value = results.get(out.name())
-            if not isinstance(value, str):
-                continue
-            layer = QgsProcessingUtils.mapLayerFromString(value, context, True)
-            if layer is None:
-                if value:
-                    self.log(f"  {out.description()}: {value}")
-                continue
-            layer = context.takeResultLayer(layer.id()) or layer
-            layer.setName(out.description())
-            QgsProject.instance().addMapLayer(layer)
-            self.log(f"  Added layer '{layer.name()}'")
+            if console._console is None or not console._console.isVisible():
+                console.show_console()
+            console._console.console.tabEditorWidget.newTabEditor(filename=path)
+            console._console.console.splitterObj.show()  # make sure the editor pane is visible
+        except Exception:  # noqa: BLE001 - console internals differ between versions
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
 
-    def open_advanced(self):
-        alg_id = self._selected_alg_id()
-        if not alg_id:
+    def new_script(self):
+        title, ok = QInputDialog.getText(self, "New script", "Tool name (shown in the menu):")
+        if not ok or not title.strip():
             return
-        import processing
+        title = title.strip()
+        name = re.sub(r"\W+", "_", title).strip("_").lower()
+        if not name:
+            return
+        path = os.path.join(SCRIPTS_DIR, f"{name}.py")
+        if os.path.exists(path):
+            QMessageBox.warning(self, "New script", f"{name}.py already exists.")
+            return
 
-        alg = QgsApplication.processingRegistry().algorithmById(alg_id)
-        layer = self.layerCombo.currentLayer()
-        initial = {}
-        if layer:
-            for p in alg.parameterDefinitions():
-                if p.type() in LAYER_PARAM_TYPES:
-                    initial[p.name()] = layer.id()
-                    break
-        processing.execAlgorithmDialog(alg_id, initial)
+        try:
+            with open(TEMPLATE, encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            content = '"""Describe what this script does."""\n\nTOOL_NAME = "My New Tool"\n'
+        content = content.replace('TOOL_NAME = "My New Tool"', f"TOOL_NAME = {title!r}", 1)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        self.populate_scripts(select=path)
+        self.open_script(path)
