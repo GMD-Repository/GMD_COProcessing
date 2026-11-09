@@ -1,10 +1,13 @@
 name: Release QGIS plugin
 
-# Builds the plugin zip and plugins.xml and attaches them to every published GitHub release.
-# The release tag sets the plugin version: tag "v0.2.0" -> version=0.2.0.
+# Builds the plugin zip and plugins.xml for every published GitHub release.
+# The release tag sets the plugin version and must be a version number: "v0.2.0" -> version=0.2.0.
 #
-# QGIS plugin repository URL (always the newest non-pre-release):
-#   https://github.com/<owner>/<repo>/releases/latest/download/plugins.xml
+# Both files are attached to the release AND published to the "plugin-repo" branch, which is
+# served by raw.githubusercontent.com (reachable even where github.com downloads time out).
+#
+# QGIS plugin repository URL (Plugins > Manage and Install Plugins > Settings > Add...):
+#   https://raw.githubusercontent.com/<owner>/<repo>/plugin-repo/plugins.xml
 
 on:
   release:
@@ -16,12 +19,24 @@ permissions:
 env:
   # Folder name inside the zip = Python package name QGIS loads. Do not change.
   PLUGIN_DIR: GMD_COProcessing
+  REPO_BRANCH: plugin-repo
 
 jobs:
   package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check release tag is a version number
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION="${TAG#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
+            echo "::error::Release tag '$TAG' is not a version number. Use a tag like v0.2.0 (QGIS compares versions to offer upgrades)."
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Check Python syntax
         run: python -m compileall -q .
@@ -32,18 +47,17 @@ jobs:
           # Respects export-ignore entries in .gitattributes
           git archive --format=tar --prefix="${PLUGIN_DIR}/" HEAD | tar -x -C build
 
-      - name: Stamp version from release tag
+      - name: Stamp version and links into metadata.txt
         env:
-          TAG: ${{ github.event.release.tag_name }}
           PRERELEASE: ${{ github.event.release.prerelease }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
-          VERSION="${TAG#v}"
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           META="build/${PLUGIN_DIR}/metadata.txt"
           sed -i "s/^version=.*/version=${VERSION}/" "$META"
           if [ "$PRERELEASE" = "true" ]; then EXP=True; else EXP=False; fi
           sed -i "s/^experimental=.*/experimental=${EXP}/" "$META"
-          grep -E '^(version|experimental)=' "$META"
+          sed -i "s#^homepage=.*#homepage=${REPO_URL}#; s#^repository=.*#repository=${REPO_URL}#; s#^tracker=.*#tracker=${REPO_URL}/issues#" "$META"
+          grep -E '^(version|experimental|homepage|repository|tracker)=' "$META"
 
       - name: Build zip
         run: |
@@ -54,19 +68,36 @@ jobs:
 
       - name: Build plugins.xml (QGIS plugin repository file)
         env:
-          TAG: ${{ github.event.release.tag_name }}
-          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          RAW: https://raw.githubusercontent.com/${{ github.repository }}
         run: |
           python .github/scripts/make_plugins_xml.py \
             --metadata "build/${PLUGIN_DIR}/metadata.txt" \
             --version "${VERSION}" \
             --zip-name "${PLUGIN_DIR}-${VERSION}.zip" \
-            --download-url "${REPO_URL}/releases/download/${TAG}/${PLUGIN_DIR}-${VERSION}.zip" \
-            --icon-url "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/icon.svg" \
+            --download-url "${RAW}/${REPO_BRANCH}/${PLUGIN_DIR}-${VERSION}.zip" \
+            --icon-url "${RAW}/${REPO_BRANCH}/icon.svg" \
             --out plugins.xml
 
-      - name: Upload zip and plugins.xml to release
+      - name: Attach zip and plugins.xml to the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: gh release upload "$TAG" "${PLUGIN_DIR}-${VERSION}.zip" plugins.xml --clobber
+
+      - name: Publish to the plugin-repo branch (raw.githubusercontent.com)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir site
+          cp "${PLUGIN_DIR}-${VERSION}.zip" plugins.xml site/
+          cp icon.svg site/
+          cd site
+          git init -q -b "${REPO_BRANCH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -q -m "QGIS plugin repository: ${TAG}"
+          # The branch only ever holds the latest release, so it is replaced each time.
+          git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "${REPO_BRANCH}"
+          echo "Repository URL: https://raw.githubusercontent.com/${{ github.repository }}/${REPO_BRANCH}/plugins.xml"
