@@ -67,7 +67,7 @@ TOUCH_TOL_M = 1.0   # a gap within this distance of an EA counts as bordering th
 MIN_OWNER_SHARE = 0.3  # a gap is added to one EA only if that EA has at least this share of its EA border
 GRID_DEG = 1e-9     # fallback precision grid (~0.1 mm) when an exact snap gives an invalid geometry
 
-# Layer-name patterns used to preselect layers in the dialog.
+# Layer-name patterns used, after the fields, to autodetect the layers in the panel.
 BGY_LAYER_HINT = r"bgy|barangay"
 EA_LAYER_HINT = r"(^|_)ea"
 
@@ -827,14 +827,40 @@ def make_panel_class():
     issue_colours = {issue: QColor(*[int(v) for v in rgba.split(",")[:3]], 70) for issue, rgba in ISSUE_COLOURS}
     snappable = {STATUS_PENDING, STATUS_FAILED}
 
-    def layer_combo(hint):
+    def layer_combo():
         combo = QgsMapLayerComboBox()
         combo.setFilters(polygon_filter)
-        for i in range(combo.count()):
-            if combo.layer(i) is not None and re.search(hint, combo.layer(i).name(), re.I):
-                combo.setLayer(combo.layer(i))
-                break
+        combo.setAllowEmptyLayer(True)
         return combo
+
+    # Fields only an EA layer has; a barangay layer has a geocode but none of these.
+    ea_only = {"ea_geocode", "ean", "bgy_geo"}
+    bgy_geocode = {c.lower() for c in BGY_FIELDS["geocode"]}
+
+    def layer_scores(layer):
+        """(EA score, barangay score) from the layer's fields, with the layer name as a tie-breaker."""
+        try:
+            fields = {f.name().lower() for f in layer.fields()}
+        except Exception:  # noqa: BLE001 - not a vector layer
+            return 0, 0
+        is_ea = bool(fields & ea_only) or {"bgy_geocode", "geocode"} <= fields
+        name = layer.name()
+        ea = (4 if is_ea else 0) + (1 if re.search(EA_LAYER_HINT, name, re.I) else 0)
+        bgy = ((4 if fields & bgy_geocode and not is_ea else 0)
+               + (1 if re.search(BGY_LAYER_HINT, name, re.I) else 0)
+               + (1 if "barangay" in fields and not is_ea else 0))
+        return ea, bgy
+
+    def best_layer(combo, score_index, exclude=None):
+        best, best_score = None, 0
+        for i in range(combo.count()):
+            layer = combo.layer(i)
+            if layer is None or layer == exclude:
+                continue
+            score = layer_scores(layer)[score_index]
+            if score > best_score:
+                best, best_score = layer, score
+        return best
 
     class CheckPanel(QtWidgets.QDockWidget):
         def __init__(self, iface, parent=None):
@@ -851,13 +877,27 @@ def make_panel_class():
             # ---- inputs
             inputs = QtWidgets.QGroupBox("Input")
             form = QtWidgets.QFormLayout(inputs)
-            self.bgy = layer_combo(BGY_LAYER_HINT)
+            self.bgy = layer_combo()
             form.addRow("Barangay layer", self.bgy)
-            self.ea = layer_combo(EA_LAYER_HINT)
-            panel_layer = globals().get("ea_layer")  # set when run from the GMD CO Processing panel
-            if panel_layer is not None and self.ea.findText(panel_layer.name()) >= 0:
-                self.ea.setLayer(panel_layer)
+            self.ea = layer_combo()
             form.addRow("EA layer", self.ea)
+            # A combo the user has picked by hand is left alone by autodetection.
+            self.manual = {"bgy": False, "ea": False}
+            self._auto_setting = False
+            # Set when run from the GMD CO Processing panel. That combo often just holds the first
+            # layer, so it is used only if it looks at least as much like an EA layer as the best match.
+            panel_layer = globals().get("ea_layer")
+            if panel_layer is not None and self.ea.findText(panel_layer.name()) >= 0:
+                detected = best_layer(self.ea, 0)
+                best_score = layer_scores(detected)[0] if detected is not None else 0
+                if layer_scores(panel_layer)[0] >= max(best_score, 1):
+                    self.ea.setLayer(panel_layer)
+                    self.manual["ea"] = True
+            self.autodetect_layers()
+            self.bgy.layerChanged.connect(lambda _l: self.on_layer_picked("bgy"))
+            self.ea.layerChanged.connect(lambda _l: self.on_layer_picked("ea"))
+            # PyQt drops this connection when the panel is deleted (bound method of a QObject).
+            QgsProject.instance().layersAdded.connect(self.on_layers_added)
             self.min_area = QtWidgets.QDoubleSpinBox()
             self.min_area.setRange(0, 1e7)
             self.min_area.setDecimals(2)
@@ -945,6 +985,31 @@ def make_panel_class():
             splitter.setStretchFactor(1, 2)
             layout.addWidget(splitter, 1)
             self.update_buttons()
+
+        # ----------------------------------------------------- autodetect
+        def autodetect_layers(self):
+            """Pick the EA and barangay layers from their fields (then their names), never the same
+            layer for both. Combos the user set by hand are kept."""
+            self._auto_setting = True
+            try:
+                if not self.manual["ea"]:
+                    exclude = self.bgy.currentLayer() if self.manual["bgy"] else None
+                    self.ea.setLayer(best_layer(self.ea, 0, exclude))
+                if not self.manual["bgy"]:
+                    self.bgy.setLayer(best_layer(self.bgy, 1, self.ea.currentLayer()))
+            finally:
+                self._auto_setting = False
+
+        def on_layer_picked(self, which):
+            if self._auto_setting:
+                return
+            self.manual[which] = self.ea.currentLayer() is not None if which == "ea" \
+                else self.bgy.currentLayer() is not None
+            self.autodetect_layers()  # re-pick the other combo if it was autodetected
+
+        def on_layers_added(self, _layers):
+            if not self.running:
+                self.autodetect_layers()
 
         # ------------------------------------------------------------ log
         def log(self, text):
