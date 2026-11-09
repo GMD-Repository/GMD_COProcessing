@@ -1,7 +1,10 @@
 name: Release QGIS plugin
 
-# Builds the plugin zip and attaches it to every published GitHub release.
+# Builds the plugin zip and plugins.xml and attaches them to every published GitHub release.
 # The release tag sets the plugin version: tag "v0.2.0" -> version=0.2.0.
+#
+# QGIS plugin repository URL (always the newest non-pre-release):
+#   https://github.com/<owner>/<repo>/releases/latest/download/plugins.xml
 
 on:
   release:
@@ -49,8 +52,21 @@ jobs:
           cd ..
           unzip -l "${PLUGIN_DIR}-${VERSION}.zip"
 
-      - name: Upload zip to release
+      - name: Build plugins.xml (QGIS plugin repository file)
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          python .github/scripts/make_plugins_xml.py \
+            --metadata "build/${PLUGIN_DIR}/metadata.txt" \
+            --version "${VERSION}" \
+            --zip-name "${PLUGIN_DIR}-${VERSION}.zip" \
+            --download-url "${REPO_URL}/releases/download/${TAG}/${PLUGIN_DIR}-${VERSION}.zip" \
+            --icon-url "https://raw.githubusercontent.com/${{ github.repository }}/${TAG}/icon.svg" \
+            --out plugins.xml
+
+      - name: Upload zip and plugins.xml to release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$TAG" "${PLUGIN_DIR}-${VERSION}.zip" --clobber
+        run: gh release upload "$TAG" "${PLUGIN_DIR}-${VERSION}.zip" plugins.xml --clobber
