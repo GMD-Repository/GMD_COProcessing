@@ -1,0 +1,56 @@
+name: Release QGIS plugin
+
+# Builds the plugin zip and attaches it to every published GitHub release.
+# The release tag sets the plugin version: tag "v0.2.0" -> version=0.2.0.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  # Folder name inside the zip = Python package name QGIS loads. Do not change.
+  PLUGIN_DIR: GMD_COProcessing
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check Python syntax
+        run: python -m compileall -q .
+
+      - name: Export plugin files
+        run: |
+          mkdir -p build
+          # Respects export-ignore entries in .gitattributes
+          git archive --format=tar --prefix="${PLUGIN_DIR}/" HEAD | tar -x -C build
+
+      - name: Stamp version from release tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          VERSION="${TAG#v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          META="build/${PLUGIN_DIR}/metadata.txt"
+          sed -i "s/^version=.*/version=${VERSION}/" "$META"
+          if [ "$PRERELEASE" = "true" ]; then EXP=True; else EXP=False; fi
+          sed -i "s/^experimental=.*/experimental=${EXP}/" "$META"
+          grep -E '^(version|experimental)=' "$META"
+
+      - name: Build zip
+        run: |
+          cd build
+          zip -r "../${PLUGIN_DIR}-${VERSION}.zip" "${PLUGIN_DIR}"
+          cd ..
+          unzip -l "${PLUGIN_DIR}-${VERSION}.zip"
+
+      - name: Upload zip to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" "${PLUGIN_DIR}-${VERSION}.zip" --clobber

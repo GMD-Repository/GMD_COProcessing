@@ -1,0 +1,4 @@
+# Files left out of the released plugin zip (git archive)
+.github export-ignore
+.gitignore export-ignore
+.gitattributes export-ignore

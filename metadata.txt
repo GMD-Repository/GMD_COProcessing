@@ -1,0 +1,24 @@
+[general]
+name=GMD CO Processing
+qgisMinimumVersion=3.22
+description=EA post-processing tools for GMD.
+version=0.1.0
+author=psacjperez
+email=cj.perez.psa@gmail.com
+
+about=Collection of Processing algorithms for the post-processing of Enumeration Area (EA) data of the GMD.
+
+tracker=https://github.com/psacjperez/co-processing/issues
+repository=https://github.com/psacjperez/co-processing
+
+hasProcessingProvider=yes
+changelog=
+    0.1.0 - Initial plugin skeleton
+
+tags=processing,enumeration area,EA,GMD
+homepage=https://github.com/psacjperez/co-processing
+category=Analysis
+icon=icon.svg
+experimental=True
+deprecated=False
+server=False
