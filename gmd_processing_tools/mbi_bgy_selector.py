@@ -52,6 +52,9 @@ Workflow:
           out of the barangay features, so released overlaps leave the other barangays).
   Step 8  Export GPKG + CSV writes the processed MBI layer, the coverage parts, the joined
           barangays and a decision log CSV into the Export folder (applying pending choices first).
+  Step 9  Choose EAs in MBI EA Selector… applies pending choices and opens the MBI EA Selector
+          with this layer in barangay mode: each MBI is listed under its covering barangay
+          ('assigned_bgy') and only that barangay's EAs can be chosen to cover it.
 """
 # Menu / panel entry (read by the GMD CO Processing plugin)
 TOOL_NAME = "MBI Barangay Selector"
@@ -1293,7 +1296,21 @@ HELP_HTML = """
         it is assigned to — the joined MBI parts are drawn <b style="color:#c51162;">hatched magenta</b> and flagged
         <i>bgy_part</i> = <b>MBI</b> / <i>is_mbi</i> = <b>1</b>.</li>
     <li>Click <b>Export GPKG + CSV</b> to save the processed layer and a decision log.</li>
+    <li><b>Next step — choose the EA:</b> click <b>Choose EAs in MBI EA Selector…</b>. It applies any pending
+        choices, then opens the MBI EA Selector with this layer: every MBI is listed under the barangay you chose
+        here and <b>only that barangay's EAs</b> are offered. Tick the EA layers there and click <b>Load MBI
+        Cases</b>.</li>
   </ol>
+
+  <div style="background:#f9fafb; border:1px solid #e5e7eb; border-left:4px solid #2e7d32;
+              padding:10px 14px; margin:12px 0 16px 0;">
+    <b style="color:#111827;">After the barangay, the EA:</b>
+    The MBI EA Selector reads <i>assigned_bgy</i> from this layer (keep the Coverage field named
+    <i>assigned_bgy</i>). A shared overlap is listed there once per covering barangay, each with only its part.
+    MBIs still pending here are skipped there, so assign them first. It writes <i>assigned_ea</i> and
+    <i>ea_coverage_status</i> on the covering barangay's rows and never changes <i>assigned_bgy</i> or
+    <i>coverage_status</i>.
+  </div>
 
   <div style="background:#f9fafb; border:1px solid #e5e7eb; border-left:4px solid #4b5563;
               padding:10px 14px; margin:12px 0 16px 0;">
@@ -2073,6 +2090,20 @@ def make_dialog_class():
             arow.addWidget(self.join_btn, 2)
             arow.addWidget(self.export_btn, 2)
             gf.addLayout(arow)
+            # Next step: pick the covering EA inside each covering barangay (MBI EA Selector)
+            nrow = QtWidgets.QHBoxLayout()
+            self.next_label = QtWidgets.QLabel(
+                "<b>Next:</b> choose which EA of the covering barangay covers each MBI.")
+            self.next_label.setWordWrap(True)
+            nrow.addWidget(self.next_label, 1)
+            self.ea_sel_btn = button("Choose EAs in MBI EA Selector…", 32)
+            self.ea_sel_btn.setToolTip(
+                "Open the MBI EA Selector with this MBI layer: every MBI is listed under the covering\n"
+                "barangay chosen here, and only that barangay's EAs are offered. Choices not yet\n"
+                f"applied are applied first (the EA Selector reads '{COVERAGE_FIELD}').")
+            self.ea_sel_btn.clicked.connect(self.open_ea_selector)
+            nrow.addWidget(self.ea_sel_btn)
+            gf.addLayout(nrow)
             self.apply_group.setEnabled(False)
             rl.addWidget(self.apply_group)
 
@@ -3641,6 +3672,63 @@ def make_dialog_class():
                 self.set_busy(False)
                 self.update_summary()
             return None
+
+        def open_ea_selector(self):
+            """Hand the MBI layer over to the MBI EA Selector (barangay mode): it lists every MBI
+            under the covering barangay written here and offers only that barangay's EAs."""
+            if self.running:
+                return
+            mbi = self.mbi_layer
+            if mbi is None or not self.cases:
+                QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, "Load the MBI cases first.")
+                return
+            if self.coverage_field() != COVERAGE_FIELD:
+                QtWidgets.QMessageBox.warning(
+                    self, DIALOG_TITLE,
+                    f"The MBI EA Selector reads the covering barangays from '{COVERAGE_FIELD}', but the "
+                    f"Coverage field here is '{self.coverage_field()}'. Set it back to '{COVERAGE_FIELD}' "
+                    "and Apply Coverage first.")
+                return
+            if self._needs_apply(mbi):
+                if QtWidgets.QMessageBox.question(
+                        self, DIALOG_TITLE,
+                        "The choices in the viewer are not in the MBI layer yet.\n"
+                        "Apply Coverage first, then open the MBI EA Selector?",
+                        QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel) != QtWidgets.QMessageBox.Yes:
+                    return
+                if not self._write_coverage(mbi):
+                    return
+            n = self._status_counts()
+            if not n["covered"] + n["partial"]:
+                QtWidgets.QMessageBox.warning(
+                    self, DIALOG_TITLE, "No MBI has a covering barangay yet — tick the covering "
+                                        "barangays (or Auto-Assign) and Apply Coverage first.")
+                return
+            import runpy
+            folder = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else \
+                os.path.join(QgsApplication.qgisSettingsDirPath(), "python", "plugins",
+                             "GMD_COProcessing", "gmd_processing_tools")
+            path = os.path.join(folder, "mbi_ea_selector.py")
+            if not os.path.exists(path):
+                QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, f"MBI EA Selector not found:\n{path}")
+                return
+            try:
+                scope = runpy.run_path(path, init_globals={"iface": self.iface}, run_name="__main__")
+                dialog = scope.get("_DIALOG") or scope["show_dialog"]()
+                dialog.mbi_combo.setLayer(mbi)
+                # Barangay layers that are really EA layers (they carry ea_geocode) are pre-ticked.
+                ea_ids = {l.id() for l in self.bgy_layers() if _pick_field(l, ["ea_geocode"])}
+                for item in dialog._ea_items():
+                    if item.data(Qt.UserRole) in ea_ids:
+                        item.setCheckState(Qt.Checked)
+                if self.bldg_combo.currentLayer() is not None:
+                    dialog.bldg_combo.setLayer(self.bldg_combo.currentLayer())
+                dialog.validate_inputs()
+                self.log(f"Opened the MBI EA Selector with '{mbi.name()}' — tick the EA layers of the "
+                         "covering barangays there, then Load MBI Cases.")
+            except Exception as e:
+                self.log(traceback.format_exc().rstrip())
+                QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, f"Could not open the MBI EA Selector: {e}")
 
         def apply_coverage(self):
             layer = self.mbi_layer
