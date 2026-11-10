@@ -8,3 +8,6 @@ __pycache__/
 
 # context-mem
 .context-mem/
+
+# temporary local backups
+*.bak*
