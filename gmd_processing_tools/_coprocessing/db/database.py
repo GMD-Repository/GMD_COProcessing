@@ -515,6 +515,89 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
     return records
 
 
+def filter_pcd_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Filters records for the PCD deliverable (<pppmm>_earf2026_PCD.xlsx):
+      - RETAINED: 100% kept.
+      - DELINEATED / SPLIT (treated as equivalent): 100% kept (all subdivided parts).
+      - MERGED: Absorbed merged partner rows are filtered out so that only the surviving
+        primary / consolidated EA record is kept.
+    """
+    if not records:
+        return []
+
+    # First ensure recoded_ean is populated across records
+    records = compute_recoded_enumeration_areas(records)
+
+    by_brgy = collections.defaultdict(list)
+    for r in records:
+        if is_summary_header_record(r):
+            continue
+        gc = str(r.get("geocode", "") or "").strip()
+        brgy_code = str(r.get("barangay_code", "") or "").strip()
+        prov = str(r.get("province_code", "") or "").strip()
+        mun = str(r.get("city_mun_code", "") or "").strip()
+
+        if prov and mun and brgy_code:
+            brgy_key = f"{prov.zfill(3)}{mun.zfill(2)}{brgy_code.zfill(3)}"
+        elif len(gc) >= 8:
+            brgy_key = gc[2:10] if len(gc) == 16 else gc[:8]
+        else:
+            brgy_key = str(r.get("areaname", "") or r.get("geographic_name") or "UNKNOWN")
+        by_brgy[brgy_key].append(r)
+
+    filtered_records: List[Dict[str, Any]] = []
+
+    for brgy_key, b_records in by_brgy.items():
+        # Identify absorbed merged partner rows within the barangay
+        merged_groups = collections.defaultdict(list)
+        for r in b_records:
+            ea_t = str(r.get("ea_type") or r.get("ea_lifecycle") or "").strip().upper()
+            rem = str(r.get("remarks") or r.get("earf_remarks") or r.get("popcen_remarks") or "").strip()
+            is_merged = ("MERG" in ea_t) or ("MERG" in rem.upper())
+            if is_merged:
+                # Group by recoded_ean (the target consolidated EA code)
+                rec_ean = str(r.get("recoded_ean") or "").strip()
+                merged_groups[rec_ean].append(r)
+
+        absorbed_set = set()
+        for rec_ean, m_recs in merged_groups.items():
+            if len(m_recs) <= 1:
+                # If only one record marked as merged in this group, check if it's explicitly an absorbed row
+                r = m_recs[0]
+                rem = str(r.get("remarks") or r.get("earf_remarks") or r.get("popcen_remarks") or "").lower()
+                if any(k in rem for k in ("merged to", "merged with", "merged into")) and not (r.get("in_gpkg") or r.get("has_geometry")):
+                    absorbed_set.add(id(r))
+                continue
+
+            # In a group of merged EAs sharing the same recoded_ean, pick the primary survivor
+            # 1st priority: Active geometry in GeoPackage
+            # 2nd priority: Does NOT contain "merged to" in remarks
+            # 3rd priority: Base EAN matches target code or lowest ean
+            def survivor_score(rec):
+                score = 0
+                if rec.get("in_gpkg") or rec.get("has_geometry"):
+                    score += 100
+                rem_low = str(rec.get("remarks") or rec.get("earf_remarks") or rec.get("popcen_remarks") or "").lower()
+                if not any(k in rem_low for k in ("merged to", "merged with", "merged into")):
+                    score += 50
+                orig_ean = str(rec.get("ean") or "").strip()
+                if orig_ean and rec_ean and orig_ean.zfill(6) == rec_ean.zfill(6):
+                    score += 25
+                return score
+
+            sorted_m = sorted(m_recs, key=survivor_score, reverse=True)
+            # The top-scoring record is the primary survivor; all other partner records are absorbed
+            for partner in sorted_m[1:]:
+                absorbed_set.add(id(partner))
+
+        for r in b_records:
+            if id(r) not in absorbed_set:
+                filtered_records.append(r)
+
+    return filtered_records
+
+
 def audit_matched_flags(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Evaluates 5 critical PSA cartography validation flags across reconciled records:
@@ -5050,6 +5133,43 @@ class POPCENDatabase:
         df = pd.DataFrame(data, columns=headers)
         df.to_csv(out_csv, index=False, encoding="utf-8")
 
+    def export_filtered_matched_to_pcd_excel(
+        self,
+        out_excel: str,
+        search: Optional[str] = None,
+        status: Optional[str] = None,
+        ea_lifecycle: Optional[str] = None,
+        discrepancy_only: bool = False,
+        city_mun: Optional[str] = None,
+    ):
+        """
+        Exports filtered matched records to the PCD deliverable (<pppmm>_earf2026_PCD.xlsx).
+        - RETAINED: 100% kept.
+        - DELINEATED / SPLIT: 100% kept (all subdivided parts).
+        - MERGED: Absorbed partner rows are excluded, retaining only the primary survivor.
+        """
+        rows, _ = self.query_matched_records(
+            search=search,
+            status=status,
+            ea_lifecycle=ea_lifecycle,
+            discrepancy_only=discrepancy_only,
+            city_mun=city_mun,
+            limit=1000000,
+            offset=0,
+        )
+        if not rows:
+            return
+
+        pcd_rows = filter_pcd_records(rows)
+        if not pcd_rows:
+            return
+
+        meta = None
+        if city_mun and city_mun not in ("All Records", "All City/Mun", "All Uploaded City/Mun", ""):
+            meta = self.get_citymun_hierarchy(city_mun)
+
+        export_matched_to_excel(pcd_rows, out_excel, metadata=meta)
+
     @staticmethod
     def is_summary_header_record(r: Dict[str, Any]) -> bool:
         return is_summary_header_record(r)
@@ -5057,6 +5177,10 @@ class POPCENDatabase:
     @staticmethod
     def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return compute_recoded_enumeration_areas(records)
+
+    @staticmethod
+    def filter_pcd_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return filter_pcd_records(records)
 
     @staticmethod
     def audit_matched_flags(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
