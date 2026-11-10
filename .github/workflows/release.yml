@@ -39,13 +39,13 @@ jobs:
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Check Python syntax
-        run: python -m compileall -q .
+        run: python -m compileall -q "${PLUGIN_DIR}"
 
       - name: Export plugin files
         run: |
           mkdir -p build
-          # Respects export-ignore entries in .gitattributes
-          git archive --format=tar --prefix="${PLUGIN_DIR}/" HEAD | tar -x -C build
+          # Only the plugin package folder; respects export-ignore entries in .gitattributes
+          git archive --format=tar --prefix="${PLUGIN_DIR}/" "HEAD:${PLUGIN_DIR}" | tar -x -C build
 
       - name: Stamp version and links into metadata.txt
         env:
@@ -62,9 +62,9 @@ jobs:
       - name: Build zip
         run: |
           cd build
-          zip -r "../${PLUGIN_DIR}-${VERSION}.zip" "${PLUGIN_DIR}"
+          zip -r "../${PLUGIN_DIR}.${VERSION}.zip" "${PLUGIN_DIR}"
           cd ..
-          unzip -l "${PLUGIN_DIR}-${VERSION}.zip"
+          unzip -l "${PLUGIN_DIR}.${VERSION}.zip"
 
       - name: Build plugins.xml (QGIS plugin repository file)
         env:
@@ -73,8 +73,8 @@ jobs:
           python .github/scripts/make_plugins_xml.py \
             --metadata "build/${PLUGIN_DIR}/metadata.txt" \
             --version "${VERSION}" \
-            --zip-name "${PLUGIN_DIR}-${VERSION}.zip" \
-            --download-url "${RAW}/${REPO_BRANCH}/${PLUGIN_DIR}-${VERSION}.zip" \
+            --zip-name "${PLUGIN_DIR}.${VERSION}.zip" \
+            --download-url "${RAW}/${REPO_BRANCH}/${PLUGIN_DIR}.${VERSION}.zip" \
             --icon-url "${RAW}/${REPO_BRANCH}/icon.svg" \
             --out plugins.xml
 
@@ -82,7 +82,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$TAG" "${PLUGIN_DIR}-${VERSION}.zip" plugins.xml --clobber
+        run: gh release upload "$TAG" "${PLUGIN_DIR}.${VERSION}.zip" plugins.xml --clobber
 
       - name: Publish to the plugin-repo branch (raw.githubusercontent.com)
         env:
@@ -90,8 +90,8 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           mkdir site
-          cp "${PLUGIN_DIR}-${VERSION}.zip" plugins.xml site/
-          cp icon.svg site/
+          cp "${PLUGIN_DIR}.${VERSION}.zip" plugins.xml site/
+          cp "${PLUGIN_DIR}/icon.svg" site/
           cd site
           git init -q -b "${REPO_BRANCH}"
           git config user.name "github-actions[bot]"

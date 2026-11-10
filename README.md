@@ -5,10 +5,11 @@ QGIS plugin for EA Post-Processing of GMD.
 - QGIS 3.22 or later
 
 ## Installation (development)
-This repository is already cloned into the QGIS plugins folder:
+The plugin package is the `GMD_COProcessing/` folder of this repository. Link it into the
+QGIS plugins folder (run in an elevated `cmd`, from the repository root):
 
 ```
-%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\GMD_COProcessing
+mklink /J "%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\GMD_COProcessing" "%CD%\GMD_COProcessing"
 ```
 
 1. Restart QGIS (or use **Plugin Reloader**).
@@ -20,22 +21,28 @@ This repository is already cloned into the QGIS plugins folder:
    - *New Script…*, *Open Scripts Folder*
 
 ## Structure
+Repository root (not shipped) plus the plugin package, laid out as in the
+[PyQGIS Developer Cookbook](https://docs.qgis.org/3.44/en/docs/pyqgis_developer_cookbook/plugins/plugins.html):
 ```
-__init__.py                      # classFactory entry point
-metadata.txt                     # plugin metadata
-plugin.py                        # menu bar menu, toolbar button and dock panel
-icon.svg
-gmd_processing_tools/            # YOUR SCRIPTS GO HERE (listed and run from the panel)
-    _template.py                 # template used by "New..."
-    example_ea_summary.py
-ui/
-    dock_widget.ui               # panel layout (Qt Designer)
-    dock_widget.py               # panel logic
+.github/                         # release workflow + plugins.xml generator
+README.md
+GMD_COProcessing/                # plugin package = folder name QGIS installs
+    __init__.py                  # classFactory entry point
+    metadata.txt                 # plugin metadata
+    plugin.py                    # menu bar menu, toolbar button and dock panel
+    script_registry.py           # finds scripts and their menu metadata
+    icon.svg
+    LICENSE                      # GPL-2.0 (required by the QGIS Plugins Directory)
+    gmd_processing_tools/        # YOUR SCRIPTS GO HERE (listed and run from the panel)
+        icons/  styles/
+    ui/
+        dock_widget.ui           # panel layout (Qt Designer)
+        dock_widget.py           # panel logic
 ```
 
-## Scripts (`gmd_processing_tools/`)
-Drop `.py` files into [gmd_processing_tools/](gmd_processing_tools/); they appear in the panel
-automatically. See [gmd_processing_tools/README.md](gmd_processing_tools/README.md) for the
+## Scripts (`GMD_COProcessing/gmd_processing_tools/`)
+Drop `.py` files into [gmd_processing_tools/](GMD_COProcessing/gmd_processing_tools/); they appear in the panel
+automatically. See [gmd_processing_tools/README.md](GMD_COProcessing/gmd_processing_tools/README.md) for the
 variables available to scripts (`iface`, `ea_layer`).
 
 ## UI (dock panel)
@@ -48,12 +55,12 @@ variables available to scripts (`iface`, `ea_layer`).
 - **New...**: creates a script from `_template.py` and opens it.
 - **Folder**: opens `gmd_processing_tools/` in Explorer.
 
-Edit the layout in `ui/dock_widget.ui` with Qt Designer (`qgis-ltr-designer.bat`
+Edit the layout in `GMD_COProcessing/ui/dock_widget.ui` with Qt Designer (`qgis-ltr-designer.bat`
 in the QGIS `bin` folder, which includes the QGIS widgets).
 
 ## Releasing
 Publishing a GitHub release runs [.github/workflows/release.yml](.github/workflows/release.yml), which
-builds `GMD_COProcessing-<version>.zip` and attaches it to the release.
+builds `GMD_COProcessing.<version>.zip` and attaches it to the release.
 
 - The tag must be a version number and sets the plugin version: tag `v0.2.0` → `version=0.2.0`.
 - The zip and `plugins.xml` are also published to the `plugin-repo` branch. QGIS repository URL
@@ -67,5 +74,5 @@ Zip the `GMD_COProcessing` folder (excluding `.git` and `__pycache__`) and insta
 *Plugins > Manage and Install Plugins > Install from ZIP*:
 
 ```
-git archive --format=zip --prefix=GMD_COProcessing/ -o GMD_COProcessing.zip HEAD
+git archive --format=zip --prefix=GMD_COProcessing/ -o GMD_COProcessing.zip HEAD:GMD_COProcessing
 ```

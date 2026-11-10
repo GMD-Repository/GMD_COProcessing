@@ -12,11 +12,12 @@ Menu layout:
 
 from qgis.PyQt.QtCore import Qt, QUrl
 from qgis.PyQt.QtGui import QDesktopServices
-from qgis.PyQt.QtWidgets import QMenu
+from qgis.PyQt.QtWidgets import QAction, QMenu
 
 from .script_registry import SCRIPTS_DIR, group_icon, grouped_scripts, plugin_icon, theme_icon
 
 MENU_TITLE = "&GMD CO Processing"
+HELP_URL = "https://github.com/GMD-Repository/GMD_COProcessing#readme"
 
 
 class GMDCOProcessingPlugin:
@@ -25,6 +26,7 @@ class GMDCOProcessingPlugin:
         self.dock = None
         self.menu = None
         self.panel_action = None
+        self.help_action = None
         self._tools_end = None       # separator after the tool groups
         self._tool_actions = []      # group submenus, rebuilt every time the menu opens
 
@@ -70,6 +72,12 @@ class GMDCOProcessingPlugin:
         # ---- toolbar button toggles the panel
         self.iface.addToolBarIcon(self.panel_action)
 
+        # ---- help entry under Help > Plugins (PyQGIS cookbook convention)
+        self.help_action = QAction(plugin_icon(), "GMD CO Processing Help", main_window)
+        self.help_action.setObjectName("GMDCOProcessingHelp")
+        self.help_action.triggered.connect(lambda: QDesktopServices.openUrl(QUrl(HELP_URL)))
+        self.iface.pluginHelpMenu().addAction(self.help_action)
+
     # ------------------------------------------------------------ tool menus
     def _rebuild_tool_menus(self):
         """One submenu per group, rebuilt on open so new or edited scripts show up immediately."""
@@ -111,6 +119,11 @@ class GMDCOProcessingPlugin:
         self.dock.new_script()
 
     def unload(self):
+        if self.help_action is not None:
+            self.iface.pluginHelpMenu().removeAction(self.help_action)
+            self.help_action.deleteLater()
+            self.help_action = None
+
         if self.panel_action is not None:
             self.iface.removeToolBarIcon(self.panel_action)
             self.panel_action = None

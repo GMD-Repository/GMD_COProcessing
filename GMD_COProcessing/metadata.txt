@@ -17,7 +17,7 @@ changelog=
 
 tags=enumeration area,EA,GMD
 homepage=https://github.com/GMD-Repository/GMD_COProcessing
-category=Analysis
+category=Vector
 icon=icon.svg
 experimental=True
 deprecated=False
