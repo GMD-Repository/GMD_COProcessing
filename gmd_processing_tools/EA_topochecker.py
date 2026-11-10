@@ -3,6 +3,9 @@
 Identifies boundary discrepancies between Barangay polygons:
   - Overlaps: overlapping boundary areas between adjacent barangays
   - Gaps: missing areas/slivers between adjacent barangays
+  - Each contiguous overlap / gap is ONE case (case_uuid), even when it runs
+    across more than two EAs: involved_areas / involved_eas / involved_bgys /
+    count_involved_areas then list every EA involved (used by the MBI EA Selector)
   - Assigns MBI levels (Inter-Region, Inter-Province, Inter-City/Mun, Inter-Barangay, Within-Barangay)
   - Counts building points inside each discrepancy piece
 
@@ -112,6 +115,71 @@ def area_attrs(feat):
 
 def piece_attrs(feat):
     return {k: _val(feat, k) for k in ('gmd_uuid', 'mbi_area', 'num_bldg_pts')}
+
+
+def area_key(a):
+    """Identity of an area (a multipart EA's parts share it)."""
+    return tuple(a[k] for k in AREA_KEYS)
+
+
+def unique_areas(areas):
+    """Drop repeated areas (e.g. two parts of one multipart EA), sorted by geocode."""
+    seen = {}
+    for a in areas:
+        seen.setdefault(area_key(a), a)
+    return sorted(seen.values(), key=lambda a: (a['geocode'] or '', a['ea_geocode'] or '', a['ea_name'] or ''))
+
+
+def merge_overlap_pieces(pieces, feedback=None):
+    """Group pairwise overlap pieces into one MBI case per contiguous overlap region.
+
+    pieces: [(QgsGeometry, fid1, fid2)] - one piece per intersection of two areas.
+    An overlap that runs across 3+ areas (e.g. A∩B touching A∩C, or a triple
+    overlap A∩B∩C) comes out of the pairwise check as several pieces; here they are
+    unioned so the whole region becomes ONE case listing every involved area.
+    Pieces that only touch at a corner stay separate cases.
+
+    Returns [{'geom': QgsGeometry, 'fids': set, 'links': set((fid1, fid2))}]."""
+    if not pieces:
+        return []
+
+    def per_piece():
+        return [{'geom': g, 'fids': {a, b}, 'links': {(a, b)}} for g, a, b in pieces]
+
+    union = QgsGeometry.unaryUnion([g for g, _, _ in pieces])
+    if union is None or union.isNull() or union.isEmpty():
+        union = QgsGeometry.unaryUnion([g.makeValid() for g, _, _ in pieces])
+    if union is None or union.isNull() or union.isEmpty():
+        if feedback:
+            feedback.pushWarning("Could not merge overlap pieces; each overlap pair is kept as its own case.")
+        return per_piece()
+
+    parts = [QgsGeometry(p) for p in (union.asGeometryCollection() if union.isMultipart() else [union])
+             if p.type() == QgsWkbTypes.PolygonGeometry and not p.isEmpty()]
+    if not parts:
+        return per_piece()
+
+    index = QgsSpatialIndex()
+    for i, part in enumerate(parts):
+        f = QgsFeature(i)
+        f.setGeometry(part)
+        index.addFeature(f)
+
+    cases = [{'geom': part, 'fids': set(), 'links': set()} for part in parts]
+    for g, a, b in pieces:
+        pt = g.pointOnSurface()
+        candidates = index.intersects(g.boundingBox())
+        best = next((i for i in candidates if parts[i].intersects(pt)), None)
+        if best is None and candidates:
+            best = max(candidates, key=lambda i: parts[i].intersection(g).area())
+        if best is None:
+            nearest = index.nearestNeighbor(pt.asPoint(), 1)
+            best = nearest[0] if nearest else None
+        if best is None:
+            continue
+        cases[best]['fids'].update((a, b))
+        cases[best]['links'].add((a, b))
+    return [c for c in cases if c['fids']]
 
 
 def pair_level(a, b):
@@ -358,10 +426,14 @@ class GapsOverlaps(QgsProcessingAlgorithm):
                 feedback.reportError(f"Unexpected type for {layer_name}: {type(target)}")
 
         def build_pair_layer(groups, src_crs):
-            """groups: [(geometry in src_crs, piece_attrs, [area_attrs, ...])].
-            Writes one row per ordered pair of involved areas (A->B and B->A):
-            "this area" and the "other area" the overlap/gap is shared with.
-            A piece with a single involved area gets one row with no other area."""
+            """groups: [(geometry in src_crs, piece_attrs, [area_attrs, ...], links)].
+            One MBI case per group (any number of involved areas), written as one
+            row per ordered pair of areas (A->B and B->A): "this area" and the
+            "other area" the overlap/gap is shared with.
+            links: [(area_attrs, area_attrs)] pairs that really touch (overlaps:
+            the pairs that intersect), or None to pair every involved area (gaps:
+            all of them border the same hole). An area with no pair gets one row
+            with no other area."""
             xform = QgsCoordinateTransform(src_crs,
                                            QgsCoordinateReferenceSystem('EPSG:4326'),
                                            context.transformContext())
@@ -371,12 +443,12 @@ class GapsOverlaps(QgsProcessingAlgorithm):
             out.updateFields()
 
             feats = []
-            for geom, piece, areas in groups:
+            for geom, piece, areas, links in groups:
                 area, bldg = piece['mbi_area'], piece['num_bldg_pts']
                 # Drop slivers (<= 0.1 sq.m. with no buildings)
                 if area is not None and bldg is not None and 0 <= area <= 0.1 and bldg == 0:
                     continue
-                areas = [a for a in areas if a['geocode'] is not None]
+                areas = unique_areas(a for a in areas if a['geocode'] is not None)
                 if not areas:
                     continue
                 g = QgsGeometry(geom)
@@ -389,11 +461,19 @@ class GapsOverlaps(QgsProcessingAlgorithm):
                     'count_involved_areas': len(areas),
                     'num_bldg_pts': bldg,
                 }
-                pairs = []
-                for a, b in combinations(areas, 2):
-                    pairs += [(a, b), (b, a)]
-                if not pairs:
-                    pairs = [(areas[0], None)]
+                if links is None:
+                    links = combinations(areas, 2)
+                by_key = {area_key(a): a for a in areas}
+                pair_keys = set()
+                for a, b in links:
+                    ka, kb = area_key(a), area_key(b)
+                    if ka != kb and ka in by_key and kb in by_key:
+                        pair_keys.update(((ka, kb), (kb, ka)))
+                pairs = [(a, b) for a in areas for b in areas
+                         if (area_key(a), area_key(b)) in pair_keys]
+                paired = {ka for ka, _ in pair_keys}
+                # e.g. two parts of one EA overlapping each other inside a larger case
+                pairs += [(a, None) for a in areas if area_key(a) not in paired]
                 for a, b in pairs:
                     row = dict(case, **a)
                     row['mbi_level'] = pair_level(a, b)
@@ -434,18 +514,18 @@ class GapsOverlaps(QgsProcessingAlgorithm):
 
             update_overlap_progress(20)
 
-            # Reconstructed LF Tools' Overlapping Polygon
+            # Reconstructed LF Tools' Overlapping Polygon: pairwise pieces first,
+            # merged afterwards into one case per contiguous overlap region.
             Fields = QgsFields()
-            itens = {
-                'ID1': QVariant.Int,
-                'ID2': QVariant.Int,
-            }
-            for item in itens:
-                Fields.append(QgsField(item, itens[item]))
+            Fields.append(QgsField('case_idx', QVariant.Int))
 
             index = QgsSpatialIndex(singlepart_sf.getFeatures())
 
-            overlap_features_to_add = []
+            overlap_pieces = []      # (geometry, ID1, ID2)
+            overlap_cases = []       # merge_overlap_pieces() result, indexed by case_idx
+            overlapping_sf = QgsVectorLayer("Polygon?crs=EPSG:3857", "temporary_overlaps", "memory")
+            overlapping_sf.dataProvider().addAttributes(Fields)
+            overlapping_sf.updateFields()
             sobreposicoes = set()
 
             total_features = singlepart_sf.featureCount()
@@ -464,7 +544,6 @@ class GapsOverlaps(QgsProcessingAlgorithm):
                 for current, feat1 in enumerate(singlepart_sf.getFeatures()):
                     ID1 = feat1.id()
                     geom1 = feat1.geometry()
-                    linha1 = QgsGeometry.fromPolylineXY(geom1.asPolygon()[0])
                     bbox1 = geom1.boundingBox()
                     feat_ids = index.intersects(bbox1)
 
@@ -484,32 +563,31 @@ class GapsOverlaps(QgsProcessingAlgorithm):
                                     for item in inter.asGeometryCollection():
                                         if item.type() == 2:  # polygon
                                             if item.isMultipart():
-                                                coords = item.asMultiPolygon()
-                                                for coord in coords:
-                                                    feature = QgsFeature(Fields)
-                                                    feature.setGeometry(QgsGeometry.fromPolygonXY(coord))
-                                                    feature.setAttributes([ID1, ID2])
-                                                    overlap_features_to_add.append(feature)
+                                                for coord in item.asMultiPolygon():
+                                                    overlap_pieces.append(
+                                                        (QgsGeometry.fromPolygonXY(coord), ID1, ID2))
                                             else:
-                                                feature = QgsFeature(Fields)
-                                                feature.setGeometry(item)
-                                                feature.setAttributes([ID1, ID2])
-                                                overlap_features_to_add.append(feature)
+                                                overlap_pieces.append((QgsGeometry(item), ID1, ID2))
                     if feedback.isCanceled():
                         break
 
                 if feedback.isCanceled():
                     return {}
 
-                # --- Create the output layer from the list of features using the data provider ---
-                overlapping_sf = QgsVectorLayer(
-                    "Polygon?crs=EPSG:3857",
-                    "temporary_overlaps",
-                    "memory"
-                )
-                overlapping_sf.dataProvider().addAttributes(Fields)
-                overlapping_sf.updateFields()
+                # One case per contiguous overlap region, however many areas it
+                # crosses (A∩B + A∩C + B∩C ... -> one case with A, B, C).
+                feedback.pushInfo(f"Merging {len(overlap_pieces):,} pairwise overlap piece(s) into cases...")
+                overlap_cases = merge_overlap_pieces(overlap_pieces, feedback)
+                multi = sum(1 for c in overlap_cases if len(c['fids']) > 2)
+                feedback.pushInfo(f"  {len(overlap_cases):,} overlap case(s), "
+                                  f"{multi:,} involving more than two polygons")
 
+                overlap_features_to_add = []
+                for case_idx, case in enumerate(overlap_cases):
+                    feature = QgsFeature(Fields)
+                    feature.setGeometry(case['geom'])
+                    feature.setAttributes([case_idx])
+                    overlap_features_to_add.append(feature)
                 if overlap_features_to_add:
                     overlapping_sf.dataProvider().addFeatures(overlap_features_to_add)
 
@@ -529,10 +607,8 @@ class GapsOverlaps(QgsProcessingAlgorithm):
 
             overlapping_sf_with_uuid_res = processing.run("native:refactorfields", {
                 'FIELDS_MAPPING': [
-                    {'alias': '', 'comment': '', 'expression': '"ID1"', 'length': 0, 'name': 'ID1', 'precision': 0,
-                     'sub_type': 0, 'type': 2, 'type_name': 'integer'},
-                    {'alias': '', 'comment': '', 'expression': '"ID2"', 'length': 0, 'name': 'ID2', 'precision': 0,
-                     'sub_type': 0, 'type': 2, 'type_name': 'integer'},
+                    {'alias': '', 'comment': '', 'expression': '"case_idx"', 'length': 0, 'name': 'case_idx',
+                     'precision': 0, 'sub_type': 0, 'type': 2, 'type_name': 'integer'},
                     {'alias': '', 'comment': '', 'expression': 'substr($uuid, 2,36)', 'length': 0, 'name': 'gmd_uuid',
                      'precision': 0, 'sub_type': 0, 'type': 10, 'type_name': 'text'},
                     {'alias': '', 'comment': '', 'expression': ' round($area , 2)', 'length': 0, 'name': 'mbi_area',
@@ -580,10 +656,8 @@ class GapsOverlaps(QgsProcessingAlgorithm):
 
             overlap_joined_refactored_res = processing.run("native:refactorfields", {
                 'FIELDS_MAPPING': [
-                    {'alias': '', 'comment': '', 'expression': '"ID1"', 'length': 0, 'name': 'ID1', 'precision': 0,
-                     'sub_type': 0, 'type': 2, 'type_name': 'integer'},
-                    {'alias': '', 'comment': '', 'expression': '"ID2"', 'length': 0, 'name': 'ID2', 'precision': 0,
-                     'sub_type': 0, 'type': 2, 'type_name': 'integer'},
+                    {'alias': '', 'comment': '', 'expression': '"case_idx"', 'length': 0, 'name': 'case_idx',
+                     'precision': 0, 'sub_type': 0, 'type': 2, 'type_name': 'integer'},
                     {'alias': '', 'comment': '', 'expression': '"gmd_uuid"', 'length': 0, 'name': 'gmd_uuid',
                      'precision': 0, 'sub_type': 0, 'type': 10, 'type_name': 'text'},
                     {'alias': '', 'comment': '', 'expression': '"mbi_area"', 'length': 0, 'name': 'mbi_area',
@@ -617,13 +691,18 @@ class GapsOverlaps(QgsProcessingAlgorithm):
 
             update_overlap_progress(42)
 
-            # Each overlap piece is the intersection of exactly two polygons
-            # (ID1, ID2), so take those two areas directly - no spatial join.
+            # Each case knows the polygons whose pairwise overlaps formed it, so
+            # take those areas (and the pairs that really overlap) directly - no
+            # spatial join.
             area_by_fid = {f.id(): area_attrs(f) for f in singlepart_sf.getFeatures()}
-            overlap_groups = [
-                (f.geometry(), piece_attrs(f), [area_by_fid[f['ID1']], area_by_fid[f['ID2']]])
-                for f in count_bldg_sf.getFeatures()
-            ]
+            overlap_groups = []
+            for f in count_bldg_sf.getFeatures():
+                case = overlap_cases[f['case_idx']]
+                overlap_groups.append((
+                    f.geometry(), piece_attrs(f),
+                    [area_by_fid[i] for i in sorted(case['fids'])],
+                    [(area_by_fid[a], area_by_fid[b]) for a, b in sorted(case['links'])],
+                ))
 
             update_overlap_progress(48)
 
@@ -833,7 +912,7 @@ class GapsOverlaps(QgsProcessingAlgorithm):
                     if shared.length() > SHARED_EDGE_MIN_M:
                         sharing_edge.append(attrs)
                 # Fall back to every touching area if rounding left no clean shared edge.
-                gap_groups.append((gap_geom, piece_attrs(gap), sharing_edge or touching))
+                gap_groups.append((gap_geom, piece_attrs(gap), sharing_edge or touching, None))
 
             update_gaps_progress(98)
 
