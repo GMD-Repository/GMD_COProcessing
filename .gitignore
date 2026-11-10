@@ -6,5 +6,8 @@ __pycache__/
 *.qgs~
 *.qgz~
 
+# context-mem
+.context-mem/
+
 # temporary local backups
 *.bak*
