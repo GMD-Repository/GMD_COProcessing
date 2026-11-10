@@ -592,8 +592,13 @@ def filter_pcd_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 absorbed_set.add(id(partner))
 
         for r in b_records:
-            if id(r) not in absorbed_set:
-                filtered_records.append(r)
+            # Must be a valid physical record that belongs to the GeoPackage
+            # (or has geometry / is in_gpkg) and is not an absorbed merged partner
+            if id(r) in absorbed_set:
+                continue
+            if not (r.get("in_gpkg") or r.get("has_geometry")):
+                continue
+            filtered_records.append(r)
 
     return filtered_records
 
