@@ -1,8 +1,9 @@
 r"""MBI Barangay Coverage — counter-check the remaining MBIs, then choose the covering barangay.
 
 The remaining MBIs (the gaps / overlaps the PSOs declared pending, e.g. the 'remaining_cases'
-layer of GEMMA's MBI Validator GeoPackage) are counter-checked with a fresh run of GEMMA's
-MBI Checker on the barangay layers:
+layer of GEMMA's MBI Validator GeoPackage, Disputed cases included) are counter-checked with a
+fresh run of the built-in MBI Checker (a copy of GEMMA's MBI Checker v13 — GEMMA does not need
+to be installed) on the barangay layers:
 
   • Still detected     — the check still finds the remaining MBI (shares area with it).
   • Newly detected     — the check finds an MBI that is not in the remaining layer
@@ -27,7 +28,7 @@ Workflow:
   Step 3  Pick the building point layer (and its geocode field): the MBI Checker counts the
           buildings inside each MBI, and per involved barangay the ones tagged to it are
           counted (the field may hold the barangay geocode or an EA geocode that starts with it).
-  Step 4  Click Run Check & Counter-Check — runs GEMMA's MBI Checker on the selected barangay
+  Step 4  Click Run Check & Counter-Check — runs the built-in MBI Checker on the selected barangay
           layers, compares each detection with the remaining MBIs, adds one "MBI Counter-Check"
           layer ('detection', 'ref_case_uuid', 'ref_status', 'ref_remarks') and lists its cases.
           Or pick an existing MBI layer (needs 'case_uuid') and click Load MBI Cases.
@@ -42,13 +43,17 @@ Workflow:
           Step 3); shared overlaps go to every barangay with tagged buildings, most first.
           No-longer-detected MBIs have nothing to cover and cannot be ticked.
   Step 6  Apply Coverage writes 'assigned_bgy' (covering barangay geocodes, comma-separated),
-          'bgy_role' (Covers / Releases, per row — empty for one-row-per-MBI layers such as
-          GEMMA's) and 'coverage_status' (1_Covered / 2_Not Covered / 3_Partially Covered, per
+          'bgy_role' (Covers / Releases, per row — empty for one-row-per-MBI layers such as the
+          MBI Checker's) and 'coverage_status' (1_Covered / 2_Not Covered / 3_Partially Covered, per
           case) into the MBI layer as unsaved, undoable edits, and refreshes the 'MBI Barangay
           Coverage Parts' layer (the part of each MBI every covering barangay keeps, plus any
           unassigned part). No-longer-detected MBIs are left untouched.
-  Step 7  Export GPKG + CSV writes the processed MBI layer, the coverage parts and a decision
-          log CSV into the Export folder (applying any pending choices first).
+  Step 7  Join MBI to Barangays makes a 'Barangays + MBI' layer: the ticked barangay layers with
+          every kept MBI part added as its own feature carrying the covering barangay's attributes,
+          flagged 'bgy_part' = 'MBI' / 'is_mbi' = 1 and drawn hatched magenta (kept parts are cut
+          out of the barangay features, so released overlaps leave the other barangays).
+  Step 8  Export GPKG + CSV writes the processed MBI layer, the coverage parts, the joined
+          barangays and a decision log CSV into the Export folder (applying pending choices first).
 """
 # Menu / panel entry (read by the GMD CO Processing plugin)
 TOOL_NAME = "MBI Barangay Selector"
@@ -74,14 +79,14 @@ MBI_PROVINCE = "province"
 MBI_INVOLVED_AREAS = "involved_areas"   # comma-separated geocodes of every involved area
 MBI_INVOLVED_BGYS = "involved_bgys"     # 'barangay, city;barangay, city' in the same order
 
-# ===== Counter-check (GEMMA MBI Checker run vs the remaining MBI layer) =====
-GEMMA_ALG_ID = "gmd_pipeline:mbi_checker_for_GEOTAGS"   # GEMMA plugin > 1Map > MBI Checker
-RUN_MODES = ["Gaps and Overlaps", "Overlaps Only", "Gaps Only"]   # GEMMA's RUN_MODE options
+# ===== Counter-check (built-in MBI Checker run vs the remaining MBI layer) =====
+RUN_MODES = ["Gaps, Overlaps and Disputed", "Overlaps Only", "Gaps Only", "Disputed Only"]
 DETECT_FIELD = "detection"
 DETECT_STILL = "Still detected"        # the check still finds this remaining MBI
 DETECT_NEW = "Newly detected"          # found by the check, not in the remaining layer
 DETECT_GONE = "No longer detected"     # remaining MBI the check no longer finds
 REF_UUID_FIELD = "ref_case_uuid"       # matched remaining MBI case_uuid(s)
+REF_KIND_FIELD = "ref_mbi_type"        # their mbi_type (a Disputed case can match a gap / overlap)
 REF_STATUS_FIELD = "ref_status"
 REF_REMARKS_FIELD = "ref_remarks"
 # The remaining layer is GEMMA's ref_mbi_cases or an MBI Validator output layer
@@ -96,7 +101,7 @@ GPKG_REMAINING_LAYERS = ["remaining_cases", "pending_cases", "ref_mbi_cases"]   
 # A detection matches a remaining MBI when they share more than this area (m²) — touching
 # along an edge only is not a match (as in GEMMA's MBI Validator).
 MATCH_MIN_M2 = 0.01
-# Output schema of GEMMA's MBI Checker (Gaps / Overlaps), kept in the counter-check layer
+# Output schema of the MBI Checker (Gaps / Overlaps / Disputed), kept in the counter-check layer
 CHECKER_SCHEMA = [("case_uuid", "str"), ("geocode", "str"), ("region", "str"),
                   ("province", "str"), ("city_mun", "str"), ("barangay", "str"),
                   ("source", "str"), ("mbi_level", "str"), ("involved_areas", "str"),
@@ -117,6 +122,13 @@ ROLE_RELEASES = "Releases"
 # Split overlaps: each covering barangay keeps only its own part of the MBI (MBI clipped to it)
 PARTS_LAYER_NAME = "MBI Barangay Coverage Parts"
 PARTS_EXPORT_NAME = "mbi_bgy_coverage_parts"
+# Join MBI to Barangays: barangay layers + each kept MBI part as its own, flagged feature
+JOIN_LAYER_NAME = "Barangays + MBI"
+JOIN_EXPORT_NAME = "mbi_bgy_joined"
+JOIN_KIND_FIELD = "bgy_part"       # 'Barangay' (original area) / 'MBI' (joined MBI part)
+JOIN_FLAG_FIELD = "is_mbi"         # 0 / 1, for filtering ("is_mbi" = 1)
+JOIN_KIND_BGY = "Barangay"
+JOIN_KIND_MBI = "MBI"
 PART_KEPT = "Kept"
 PART_UNASSIGNED = "Unassigned"
 # MBI area left over after the chosen barangays' parts that still counts as covered (geometry
@@ -140,6 +152,8 @@ COLOUR_PARTIAL = "#fff59d"     # yellow
 COLOUR_NEW = "#dcedc8"         # light green: newly detected MBI (case row)
 COLOUR_NEW_CHILD = "#f1f8e9"   # paler green: its barangay rows
 COLOUR_GONE = "#e0e0e0"        # grey: remaining MBI no longer detected
+COLOUR_JOINED = "#c51162"            # magenta hatch + dashed outline: MBI joined to a barangay
+COLOUR_JOINED_FILL = "236,64,122,90"
 LEVEL_COLOURS = {
     "1_": "#ef9a9a", "2_": "#ef9a9a",   # inter-region / inter-province
     "3_": "#ffcc80",                    # inter-city/municipality
@@ -298,6 +312,7 @@ class MBICase:
         self.unassigned = None   # part of the MBI no covering barangay keeps yet
         self.detection = ""      # counter-check: Still / Newly / No longer detected ('' = none)
         self.ref_uuids = ""      # matched remaining MBI case_uuid(s)
+        self.ref_kind = ""      # their mbi_type
         self.ref_status = ""
         self.ref_remarks = ""
 
@@ -316,6 +331,7 @@ class MBICase:
             self.mbi_type = mbi_type
         self.detection = self.detection or _text(feat, DETECT_FIELD)
         self.ref_uuids = self.ref_uuids or _text(feat, REF_UUID_FIELD)
+        self.ref_kind = self.ref_kind or _text(feat, REF_KIND_FIELD)
         self.ref_status = self.ref_status or _text(feat, REF_STATUS_FIELD)
         self.ref_remarks = self.ref_remarks or _text(feat, REF_REMARKS_FIELD)
         bldg = _field_value(feat, MBI_NUM_BLDG)
@@ -555,8 +571,8 @@ def match_bldg_code(value, by_key):
     return best[1] if best else None
 
 
-# Fields GEMMA's MBI Checker reads from each barangay layer ('geocode' is required: areas
-# without it cannot be matched to a barangay).
+# Fields the MBI Checker reads from each barangay layer ('geocode' is required: areas
+# without it cannot be matched to a barangay; 'boundary' = Contested marks disputed areas).
 CHECKER_REQUIRED_FIELDS = ["geocode"]
 # Child-algorithm chatter the checker's feedback receives; kept out of the log.
 _NOISY_LOG = ("Results:", "Packaging layer", "Using specified destination CRS",
@@ -564,10 +580,350 @@ _NOISY_LOG = ("Results:", "Packaging layer", "Using specified destination CRS",
               "Done setting layer style", "Exporting Overlap Layer")
 
 
-def gemma_checker_available():
-    """True when GEMMA's MBI Checker is registered in Processing (GEMMA plugin enabled)."""
-    from qgis.core import QgsApplication
-    return QgsApplication.processingRegistry().algorithmById(GEMMA_ALG_ID) is not None
+def mode_kinds(mode):
+    """MBI types a RUN_MODES index looks for."""
+    return {0: {"Gap", "Overlap", "Disputed"}, 1: {"Overlap"}, 2: {"Gap"}, 3: {"Disputed"}}[mode]
+
+
+# ─────────────── Built-in MBI Checker (copy of GEMMA's MBI Checker v13) ───────────────
+# Copied from GEMMA plugin > gmd_scripts/gaps_overlaps_checker.py (GapsOverlaps, v13) so this
+# tool works without GEMMA installed. Detection (merge > reproject to EPSG:3857 > fix >
+# singleparts; overlap pairs > 0.10 m², one entry per polygon; gaps = holes of the dissolved
+# barangays > 0.10 m², involved = polygons within 0.50 m; mbi_level from region / province /
+# city / barangay; one row per finding, output in EPSG:4326) is unchanged. Adjusted for the
+# counter-check:
+#   • Disputed Areas are reported again (mbi_type 3_Disputed): polygons whose 'boundary' is
+#     'Contested'. Their involved barangays are the contested polygon plus every polygon
+#     within 0.50 m, so a covering barangay can be chosen. As in GEMMA, their footprint is
+#     subtracted from the gaps.
+#   • Reference MBI cases are NOT subtracted from the gaps (GEMMA auto-detects any loaded
+#     layer with 'mbi_type' and drops its Disputed footprints) — that would hide the very
+#     remaining Disputed MBIs being counter-checked.
+#   • Building points are optional (counts are 0 without them).
+#   • The Gaps / Overlaps / Disputed layers are returned instead of loaded into the project.
+CHECKER_VERSION = "v13 (GEMMA) + counter-check adjustments"
+CHECKER_MIN_M2 = 0.10        # findings this small (m², EPSG:3857) are slivers — not reported
+CHECKER_GAP_BUFFER = 0.50    # m: polygons this close to a gap / disputed area are involved
+
+
+def run_mbi_checker(polygon_layers, building_layers, mode, feedback=None):
+    """Detect gaps, overlaps and disputed areas of the polygon layers.
+
+    Returns {'Gap': layer, 'Overlap': layer, 'Disputed': layer} for the types the mode
+    (RUN_MODES index) looks for — always emitted, empty when nothing is found."""
+    import uuid as _uuid
+    import processing
+    from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeature,
+                           QgsFeatureRequest, QgsField, QgsFields, QgsGeometry,
+                           QgsProcessingContext, QgsProcessingFeedback, QgsProject,
+                           QgsSpatialIndex, QgsVectorLayer, QgsWkbTypes)
+    from qgis.PyQt.QtCore import QVariant
+
+    if not polygon_layers:
+        raise ValueError("Select at least one barangay layer.")
+    feedback = feedback or QgsProcessingFeedback()
+    context = QgsProcessingContext()
+    context.setProject(QgsProject.instance())
+    context.setFeedback(feedback)
+    context.setInvalidGeometryCheck(QgsFeatureRequest.GeometryNoCheck)   # invalid input expected
+    kinds = mode_kinds(mode)
+    keep = []   # memory layers must outlive processing.run()
+
+    target_crs = QgsCoordinateReferenceSystem("EPSG:3857")
+    output_crs = QgsCoordinateReferenceSystem("EPSG:4326")
+    to_out = QgsCoordinateTransform(target_crs, output_crs, QgsProject.instance())
+
+    def run(alg, params):
+        if feedback.isCanceled():
+            raise _Cancelled()
+        params["OUTPUT"] = "memory:"
+        out = processing.run(alg, params, context=context, feedback=feedback)["OUTPUT"]
+        if isinstance(out, str):
+            out = context.getMapLayer(out)
+        keep.append(out)
+        return out
+
+    def get_attr(feat, names):
+        lower = {f.name().lower(): f.name() for f in feat.fields()}
+        for n in names:
+            real = lower.get(n.lower())
+            if real:
+                v = feat[real]
+                if v is not None:
+                    return v
+        return None
+
+    def txt(v):
+        s = "" if v is None else str(v).strip()
+        return "" if s.upper() == "NULL" else s
+
+    def safe_area(geom):
+        if geom is None or geom.isEmpty():
+            return 0.0
+        try:
+            return float(geom.area())
+        except Exception:
+            return 0.0
+
+    def label_of(info):
+        brgy, city = txt(info.get("barangay")), txt(info.get("city_mun"))
+        return f"{brgy}, {city}" if brgy and city else (brgy or city or "Unknown")
+
+    def merge(layers):
+        refs = []
+        for layer in layers:
+            mapping = [{"alias": "", "comment": "", "expression": f'"{f.name()}"',
+                        "length": f.length(), "name": f.name(), "precision": f.precision(),
+                        "sub_type": 0, "type": f.type(), "type_name": f.typeName()}
+                       for f in layer.fields()]
+            refs.append(run("native:refactorfields", {"INPUT": layer, "FIELDS_MAPPING": mapping}))
+        return run("native:mergevectorlayers", {"LAYERS": refs, "CRS": layers[0].crs()})
+
+    def reproject_fix(layer):
+        reproj = run("native:reprojectlayer", {"INPUT": layer, "TARGET_CRS": target_crs,
+                                               "CONVERT_CURVED_GEOMETRIES": False})
+        return run("native:fixgeometries", {"INPUT": reproj, "METHOD": 1})
+
+    def singleparts(layer):
+        single = run("native:multiparttosingleparts", {"INPUT": layer})
+        return run("native:fixgeometries", {"INPUT": single, "METHOD": 1})
+
+    def output_layer(name):
+        fields = QgsFields()
+        for n, t in CHECKER_SCHEMA:
+            fields.append(QgsField(n, QVariant.Int if t == "int" else QVariant.String))
+        layer = QgsVectorLayer("Polygon?crs=EPSG:4326", name, "memory")
+        layer.dataProvider().addAttributes(fields)
+        layer.updateFields()
+        return layer
+
+    # ---- Prepare inputs ----
+    feedback.pushInfo("Merging and fixing barangay layers…")
+    feedback.setProgress(2)
+    poly_layer = singleparts(reproject_fix(merge(polygon_layers)))
+    infos, poly_index = {}, QgsSpatialIndex()
+    for feat in poly_layer.getFeatures():
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            continue
+        infos[feat.id()] = {
+            "geometry": QgsGeometry(geom),
+            "geocode": get_attr(feat, ["geocode"]),
+            "region": get_attr(feat, ["region"]),
+            "province": get_attr(feat, ["province"]),
+            "city_mun": get_attr(feat, ["city_mun", "city/mun"]),
+            "barangay": get_attr(feat, ["barangay", "brgy"]),
+            "source": get_attr(feat, ["source"]),
+            "boundary": get_attr(feat, ["boundary"]),
+        }
+        poly_index.addFeature(feat)
+    if not infos:
+        raise ValueError("No valid polygon features found in the barangay layers.")
+
+    bldg_geoms, bldg_index = {}, QgsSpatialIndex()
+    building_layers = [l for l in (building_layers or []) if l is not None]
+    if building_layers:
+        feedback.pushInfo("Merging and fixing building point layers…")
+        feedback.setProgress(8)
+        for feat in reproject_fix(merge(building_layers)).getFeatures():
+            if feat.hasGeometry() and not feat.geometry().isEmpty():
+                bldg_geoms[feat.id()] = QgsGeometry(feat.geometry())
+                bldg_index.addFeature(feat)
+
+    disputed_fids = {fid for fid, i in infos.items() if txt(i["boundary"]).lower() == "contested"}
+    feedback.pushInfo(f"  {len(disputed_fids):,} Disputed (boundary = Contested) polygon(s); "
+                      f"{len(infos) - len(disputed_fids):,} other polygon(s).")
+
+    def count_points(geom):
+        n = 0
+        for fid in bldg_index.intersects(geom.boundingBox()):
+            pt = bldg_geoms.get(fid)
+            try:
+                if pt is not None and geom.intersects(pt):
+                    n += 1
+            except Exception:
+                pass
+        return n
+
+    def get_involved(finding, near=False, by_feature=False):
+        """Polygons taking part in a finding. near=True (gaps, disputed): every polygon within
+        CHECKER_GAP_BUFFER, grouped by barangay label; otherwise polygons sharing > 0.01 m²
+        (by_feature keeps each polygon separate — overlaps inside one barangay)."""
+        search = finding.buffer(CHECKER_GAP_BUFFER, 5) if near else finding
+        grouped = {}
+        for fid in poly_index.intersects(search.boundingBox()):
+            info = infos.get(fid)
+            if not info:
+                continue
+            try:
+                if not search.intersects(info["geometry"]):
+                    continue
+                covered = 0.0 if near else safe_area(finding.intersection(info["geometry"]))
+                if not near and covered <= 0.01:
+                    continue
+            except Exception:
+                continue
+            label = label_of(info)
+            key = fid if by_feature else label
+            entry = grouped.setdefault(key, {"info": info, "label": label, "covered": 0.0})
+            entry["covered"] += covered
+        if near and grouped:
+            share = safe_area(finding) / len(grouped)
+            for entry in grouped.values():
+                entry["covered"] = share
+        return sorted(grouped.values(), key=lambda x: x["label"])
+
+    def mbi_level(involved):
+        for key, level in (("region", "1_Inter-Region"), ("province", "2_Inter-Province"),
+                           ("city_mun", "3_Inter-City/Municipality"), ("barangay", "4_Inter-Barangay")):
+            if len({txt(x["info"].get(key)) for x in involved}) > 1:
+                return level
+        return "5_Within-Barangay"
+
+    def overlap_reference(info1, info2):
+        s1, s2 = txt(info1.get("source")).upper(), txt(info2.get("source")).upper()
+        if "LGU" in s1 and "PSA" in s2:
+            return info1
+        if "LGU" in s2 and "PSA" in s1:
+            return info2
+        if s1 and not s2:
+            return info1
+        return info2
+
+    def build_feature(geom_3857, involved, mbi_type, fields, ref=None):
+        if not involved:
+            return None
+        g = QgsGeometry(geom_3857)
+        try:
+            g.transform(to_out)
+        except Exception:
+            pass
+        ref = ref if ref is not None else max(involved, key=lambda x: x["covered"])["info"]
+        f = QgsFeature(fields)
+        f.setGeometry(g)
+        f.setAttributes([str(_uuid.uuid4()), txt(ref.get("geocode")), txt(ref.get("region")),
+                         txt(ref.get("province")), txt(ref.get("city_mun")), txt(ref.get("barangay")),
+                         txt(ref.get("source")) or None, mbi_level(involved),
+                         ",".join(txt(x["info"].get("geocode")) for x in involved),
+                         ";".join(x["label"] for x in involved), len(involved), mbi_type,
+                         count_points(geom_3857)])
+        return f
+
+    def polygon_parts(geom):
+        if geom is None or geom.isEmpty():
+            return []
+        if QgsWkbTypes.geometryType(geom.wkbType()) == QgsWkbTypes.PolygonGeometry:
+            return geom.asGeometryCollection() if geom.isMultipart() else [geom]
+        if geom.isMultipart():
+            return [p for p in geom.asGeometryCollection()
+                    if QgsWkbTypes.geometryType(p.wkbType()) == QgsWkbTypes.PolygonGeometry]
+        return []
+
+    def finish(layer, feats, kind):
+        if feats:
+            layer.dataProvider().addFeatures(feats)
+            layer.updateExtents()
+        feedback.pushInfo(f"  {len(feats):,} {kind.lower()} finding(s).")
+        results[kind] = layer
+
+    results = {}
+
+    # ---- Disputed areas (boundary = Contested) ----
+    if "Disputed" in kinds:
+        feedback.pushInfo("Extracting disputed areas…")
+        feedback.setProgress(15)
+        out = output_layer("Disputed Areas")
+        feats = []
+        for fid in disputed_fids:
+            info = infos[fid]
+            involved = get_involved(info["geometry"], near=True)
+            if not any(x["info"] is info for x in involved):
+                involved.append({"info": info, "label": label_of(info), "covered": 0.0})
+            f = build_feature(info["geometry"], involved, "3_Disputed", out.fields(), ref=info)
+            if f:
+                feats.append(f)
+        finish(out, feats, "Disputed")
+
+    # ---- Overlaps (all polygons, Disputed included) ----
+    if "Overlap" in kinds:
+        feedback.pushInfo("Detecting overlaps…")
+        feedback.setProgress(20)
+        out = output_layer("Overlaps")
+        feats, checked = [], set()
+        ids = list(infos)
+        for i, fid1 in enumerate(ids):
+            if feedback.isCanceled():
+                raise _Cancelled()
+            info1 = infos[fid1]
+            geom1 = info1["geometry"]
+            for fid2 in poly_index.intersects(geom1.boundingBox()):
+                pair = (min(fid1, fid2), max(fid1, fid2))
+                if fid1 == fid2 or pair in checked:
+                    continue
+                checked.add(pair)
+                info2 = infos.get(fid2)
+                if not info2:
+                    continue
+                try:
+                    if not geom1.intersects(info2["geometry"]):
+                        continue
+                    for part in polygon_parts(geom1.intersection(info2["geometry"])):
+                        if safe_area(part) <= CHECKER_MIN_M2:
+                            continue
+                        involved = get_involved(part, by_feature=True)
+                        if len(involved) < 2:
+                            continue
+                        f = build_feature(part, involved, "2_Overlap", out.fields(),
+                                          ref=overlap_reference(info1, info2))
+                        if f:
+                            feats.append(f)
+                except Exception:
+                    continue
+            if ids:
+                feedback.setProgress(20 + int(i / len(ids) * 35))
+        finish(out, feats, "Overlap")
+
+    # ---- Gaps (Disputed polygons left out of the dissolve, then subtracted) ----
+    if "Gap" in kinds:
+        feedback.pushInfo("Detecting gaps…")
+        feedback.setProgress(60)
+        others = QgsVectorLayer(f"Polygon?crs={target_crs.authid()}", "non_disputed", "memory")
+        others.dataProvider().addAttributes(poly_layer.fields().toList())
+        others.updateFields()
+        others.dataProvider().addFeatures([f for f in poly_layer.getFeatures()
+                                           if f.id() in infos and f.id() not in disputed_fids])
+        keep.append(others)
+        dissolved = run("native:dissolve", {"INPUT": others, "FIELD": [], "SEPARATE_DISJOINT": False})
+        no_holes = run("native:deleteholes", {"INPUT": dissolved, "MIN_AREA": 0})
+        cleaned = run("native:dissolve", {"INPUT": no_holes, "FIELD": [], "SEPARATE_DISJOINT": False})
+        diff = run("native:difference", {"INPUT": cleaned, "OVERLAY": dissolved, "GRID_SIZE": None})
+        gaps = singleparts(diff)
+        disputed_union = None
+        if disputed_fids:
+            disputed_union = QgsGeometry.unaryUnion([infos[fid]["geometry"] for fid in disputed_fids])
+        out = output_layer("Gaps")
+        feats = []
+        for feat in gaps.getFeatures():
+            geom = feat.geometry()
+            if geom is None or geom.isEmpty() or safe_area(geom) <= CHECKER_MIN_M2:
+                continue
+            if disputed_union is not None and not disputed_union.isEmpty():
+                try:
+                    geom = geom.difference(disputed_union)
+                except Exception:
+                    pass
+            for part in polygon_parts(geom):
+                if safe_area(part) <= CHECKER_MIN_M2:
+                    continue
+                involved = get_involved(part, near=True)
+                if involved:
+                    f = build_feature(part, involved, "1_Gap", out.fields())
+                    if f:
+                        feats.append(f)
+        finish(out, feats, "Gap")
+
+    feedback.setProgress(100)
+    return results
 
 
 def make_distance_area(crs):
@@ -582,15 +938,19 @@ def make_distance_area(crs):
 
 
 def build_counter_check(detected, remaining, checked_kinds, name):
-    """Compare GEMMA MBI Checker detections with the remaining MBI layer.
+    """Compare MBI Checker detections with the remaining MBI layer.
 
-    detected: [(layer, 'Gap' | 'Overlap')] (the checker's Gaps / Overlaps layers);
+    detected: [(layer, 'Gap' | 'Overlap' | 'Disputed')] (the checker's output layers);
     remaining: the remaining MBI layer, or None (plain check, no 'detection' fields);
     checked_kinds: MBI types the run looked for — a remaining MBI of another type is not
     reported as no longer detected.
 
-    A detection matches a remaining MBI of the same type when they share area (not just an
-    edge). Returns (MultiPolygon memory layer or None when empty, stats dict)."""
+    A detection matches a remaining MBI when they share area (not just an edge) and:
+      • the remaining MBI is a Gap / Overlap of the same type, or
+      • the remaining MBI is Disputed (or untyped): any detection matches — an open dispute
+        shows up as a contested polygon, a gap or an overlap. Such cases are only checked
+        when the run looks for all three types.
+    Returns (MultiPolygon memory layer or None when empty, stats dict)."""
     from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeature,
                            QgsField, QgsGeometry, QgsProject, QgsSpatialIndex, QgsVectorLayer)
     from qgis.PyQt.QtCore import QVariant
@@ -610,12 +970,14 @@ def build_counter_check(detected, remaining, checked_kinds, name):
     fields = [QgsField(n, qtype[t]) for n, t in CHECKER_SCHEMA]
     if remaining is not None:
         fields += [QgsField(n, QVariant.String)
-                   for n in (DETECT_FIELD, REF_UUID_FIELD, REF_STATUS_FIELD, REF_REMARKS_FIELD)]
+                   for n in (DETECT_FIELD, REF_UUID_FIELD, REF_KIND_FIELD, REF_STATUS_FIELD,
+                             REF_REMARKS_FIELD)]
     out.dataProvider().addAttributes(fields)
     out.updateFields()
     names = out.fields().names()
     int_fields = {n for n, t in CHECKER_SCHEMA if t == "int"}
     stats = {"still": 0, "new": 0, "gone": 0, "unchecked": 0, "disputed": 0, "remaining": 0,
+             "disputed_still": 0,
              "matched": 0, "multi": 0, "split": 0, "detected": 0}
     feats = []
 
@@ -644,15 +1006,13 @@ def build_counter_check(detected, remaining, checked_kinds, name):
                 seen.append(v)
         return sep.join(seen) or None
 
-    # Remaining MBIs (Disputed cases are not gaps / overlaps: GEMMA's checker skips them)
+    # Remaining MBIs (Disputed ones included)
     refs, index = {}, QgsSpatialIndex()
     if remaining is not None:
         xform = None if remaining.crs() == crs else QgsCoordinateTransform(remaining.crs(), crs, prj)
         for f in remaining.getFeatures():
             kind = _norm_type(_feat_text(f, REF_TYPE_FIELDS))
-            if kind == "Disputed":
-                stats["disputed"] += 1
-                continue
+            stats["disputed"] += kind == "Disputed"
             g = geom_of(f, xform)
             if g is None:
                 continue
@@ -684,7 +1044,7 @@ def build_counter_check(detected, remaining, checked_kinds, name):
                 hits = []
                 for rid in index.intersects(g.boundingBox()):
                     r = refs.get(rid)
-                    if r is None or (r["kind"] and r["kind"] != kind) \
+                    if r is None or r["kind"] not in ("", "Disputed", kind) \
                             or not engine.intersects(r["geom"].constGet()):
                         continue
                     if _area(_polygonal(g.intersection(r["geom"])), da) > MATCH_MIN_M2:
@@ -692,10 +1052,12 @@ def build_counter_check(detected, remaining, checked_kinds, name):
                 if hits:
                     stats["still"] += 1
                     stats["multi"] += len(hits) > 1
-                    for rid, _r in hits:
+                    for rid, r in hits:
+                        stats["disputed_still"] += rid not in hit_count and r["kind"] == "Disputed"
                         hit_count[rid] = hit_count.get(rid, 0) + 1
                     attrs.update({DETECT_FIELD: DETECT_STILL,
                                   REF_UUID_FIELD: join((r["uuid"] for _i, r in hits), ","),
+                                  REF_KIND_FIELD: join((r["kind"] for _i, r in hits), ", "),
                                   REF_STATUS_FIELD: join((r["status"] for _i, r in hits), ", "),
                                   REF_REMARKS_FIELD: join((r["remarks"] for _i, r in hits), " | ")})
                 else:
@@ -709,7 +1071,8 @@ def build_counter_check(detected, remaining, checked_kinds, name):
     for rid, r in refs.items():
         if rid in hit_count:
             continue
-        if (r["kind"] and r["kind"] not in checked_kinds) or (not r["kind"] and len(checked_kinds) < 2):
+        needs = {"Gap", "Overlap", "Disputed"} if r["kind"] in ("", "Disputed") else {r["kind"]}
+        if not needs <= set(checked_kinds):
             stats["unchecked"] += 1   # this run did not look for its type
             continue
         attrs = {}
@@ -723,6 +1086,7 @@ def build_counter_check(detected, remaining, checked_kinds, name):
             attrs[n] = value
         attrs.update({"case_uuid": r["uuid"], MBI_TYPE: attrs.get(MBI_TYPE) or r["kind"] or None,
                       DETECT_FIELD: DETECT_GONE, REF_UUID_FIELD: r["uuid"],
+                      REF_KIND_FIELD: r["kind"] or None,
                       REF_STATUS_FIELD: r["status"] or None, REF_REMARKS_FIELD: r["remarks"] or None})
         stats["gone"] += 1
         add(r["geom"], attrs)
@@ -747,7 +1111,7 @@ def infer_mbi_type(layer_name):
 
 DIALOG_NAME = "MBIBgyCoverageDialog"
 DIALOG_TITLE = "MBI Barangay Coverage"
-DIALOG_SUBTITLE = ("Counter-check the remaining MBIs with GEMMA's MBI Checker, review every "
+DIALOG_SUBTITLE = ("Counter-check the remaining MBIs with the built-in MBI Checker, review every "
                    "detected gap / overlap with its involved barangays, then choose the "
                    "barangay that covers it.")
 
@@ -846,9 +1210,10 @@ HELP_HTML = """
 <div style="font-family:'Segoe UI',Arial,sans-serif; color:#1f2937; font-size:12px; line-height:1.5;">
   <div style="border-bottom:2px solid #374151; padding-bottom:8px; margin-bottom:14px;">
     <h2 style="margin:0 0 4px 0; color:#111827; font-size:17px;">MBI Barangay Coverage</h2>
-    <div style="color:#4b5563;">Counter-check the remaining MBIs (the gaps / overlaps declared pending) with a fresh run of
-    <b>GEMMA's MBI Checker</b>, see which are still detected and which are new, then decide which involved barangay
-    covers each one and export the result.</div>
+    <div style="color:#4b5563;">Counter-check the remaining MBIs (the gaps, overlaps and disputed areas declared pending)
+    with a fresh run of the <b>built-in MBI Checker</b> — a copy of GEMMA's MBI Checker, so GEMMA does not need to be
+    installed — see which are still detected and which are new, then decide which involved barangay covers each one
+    and export the result.</div>
   </div>
 
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Quick Start</h3>
@@ -858,8 +1223,9 @@ HELP_HTML = """
         <i>remaining_cases</i> layer is added and picked for you.</li>
     <li><b>Tick your barangay layers</b> (<i>Barangay Layers</i>) — every layer the involved barangays come from.</li>
     <li>Pick the <i>Building Points</i> layer so the check counts the buildings inside each MBI.</li>
-    <li>Click <b>Run Check &amp; Counter-Check</b> (the <b style="color:#E65100;">orange</b> box). GEMMA's MBI Checker
-        runs on the barangay layers and every MBI it finds is compared with the remaining MBIs.</li>
+    <li>Click <b>Run Check &amp; Counter-Check</b> (the <b style="color:#E65100;">orange</b> box). The MBI Checker
+        runs on the barangay layers and every MBI it finds is compared with the remaining MBIs, Disputed ones
+        included.</li>
     <li>Read the <b>Detection</b> column: <b>Still detected</b>, <b>Newly detected</b> (the whole row is
         <b style="color:#558b2f;">light green</b>) or <b>No longer detected</b> (grey).</li>
     <li>In the list, <b>tick the Role / Status box of the barangay that covers</b> each detected MBI — or click
@@ -867,6 +1233,9 @@ HELP_HTML = """
         runs across several barangays can be <b>shared out</b>: tick more than one barangay and each keeps only
         its own part (see <i>Shared Overlaps</i> below).</li>
     <li>Click <b>Apply Coverage</b> to write your choices into the MBI Counter-Check layer.</li>
+    <li>Click <b>Join MBI to Barangays</b> for a copy of the barangay layers with each MBI joined to the barangay
+        it is assigned to — the joined MBI parts are drawn <b style="color:#c51162;">hatched magenta</b> and flagged
+        <i>bgy_part</i> = <b>MBI</b> / <i>is_mbi</i> = <b>1</b>.</li>
     <li>Click <b>Export GPKG + CSV</b> to save the processed layer and a decision log.</li>
   </ol>
 
@@ -883,7 +1252,9 @@ HELP_HTML = """
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">Still detected</td>
         <td>The check found an MBI that <b>shares area</b> with a remaining MBI of the same type (gap with gap, overlap
-        with overlap) — the discrepancy the PSO declared pending is still there. Hover the Detection cell for the
+        with overlap, disputed with disputed) — the discrepancy the PSO declared pending is still there. A remaining
+        <b>Disputed</b> MBI is still detected by <b>any</b> finding sharing its area: an open dispute shows up as a
+        contested polygon, a gap or an overlap (the tooltip then names the remaining MBI's type). Hover the Detection cell for the
         remaining MBI's <i>case_uuid</i>, its declared status and remarks.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Newly detected<br><span style="background:#dcedc8;">&nbsp;light green&nbsp;</span></td>
         <td>The check found an MBI that matches <b>no</b> remaining MBI — it is not in the remaining layer. The case row
@@ -895,14 +1266,26 @@ HELP_HTML = """
     <tr><td style="font-weight:bold; vertical-align:top;">Matching rule</td>
         <td>Same as GEMMA's MBI Validator: a detection and a remaining MBI only match when they overlap in <b>area</b>;
         merely touching along an edge does not count, so a genuinely new MBI next to an old one is reported as new.
-        Remaining MBIs typed <i>Disputed</i> are left out (the checker does not report disputed areas), and with
-        <i>Overlaps Only</i> / <i>Gaps Only</i> the remaining MBIs of the other type are not called "no longer detected".
+        Remaining MBIs of a type the run did not look for are not called "no longer detected" (e.g. gaps with
+        <i>Overlaps Only</i>); remaining <i>Disputed</i> MBIs are only checked by <i>Gaps, Overlaps and Disputed</i>,
+        since a dispute can show up as any of the three.
         One detection overlapping several remaining MBIs lists them all in <i>ref_case_uuid</i>; a remaining MBI now
         found as several pieces gives one case per piece.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Built-in MBI Checker</td>
+        <td>A copy of GEMMA's MBI Checker (v13) inside this tool: barangay layers are merged, reprojected to
+        EPSG:3857 and fixed; <b>overlaps</b> are intersecting polygon pairs over 0.10 m² (<i>2_Overlap</i>);
+        <b>gaps</b> are holes between the dissolved barangays over 0.10 m², involving every barangay within 0.50 m
+        (<i>1_Gap</i>); the MBI level comes from region / province / city / barangay. Adjusted for the counter-check:
+        <b>disputed areas</b> are reported again (<i>3_Disputed</i>: polygons whose <i>boundary</i> is
+        <i>Contested</i>, involving the contested polygon and every barangay within 0.50 m, so a covering barangay can
+        be chosen; their footprint is left out of the gaps, as in GEMMA); the remaining MBIs are <b>not</b> subtracted
+        from the gaps (GEMMA drops loaded Disputed cases from its gaps, which would hide the cases being checked); and
+        building points are optional.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">MBI Counter-Check layer</td>
         <td>Run Check adds one temporary layer, <i>MBI Counter-Check (&lt;date&gt;_&lt;time&gt;)</i>, holding every
-        detected MBI with GEMMA's fields (<i>case_uuid, geocode … involved_areas, involved_bgys, mbi_type,
-        num_bldg_pts</i>) plus <b>detection</b>, <b>ref_case_uuid</b>, <b>ref_status</b> and <b>ref_remarks</b>, and
+        detected MBI with the MBI Checker's fields (<i>case_uuid, geocode … involved_areas, involved_bgys, mbi_type,
+        num_bldg_pts</i>) plus <b>detection</b>, <b>ref_case_uuid</b>, <b>ref_mbi_type</b>, <b>ref_status</b> and
+        <b>ref_remarks</b>, and
         the no-longer-detected remaining MBIs. On the map it is coloured by detection (green = new, orange = still,
         grey dashed = no longer). Right-click &gt; <b>Make Permanent</b> to keep it. Without a remaining layer the run is
         a plain check: the layer is named <i>MBI Results</i> and has no detection fields.</td></tr>
@@ -911,7 +1294,7 @@ HELP_HTML = """
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">How Barangays Are Matched</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">Barangay geocode</td>
-        <td>GEMMA's MBI Checker writes <b>one row per MBI</b>: the involved barangays are the geocodes in
+        <td>The MBI Checker writes <b>one row per MBI</b>: the involved barangays are the geocodes in
         <i>involved_areas</i> (names from <i>involved_bgys</i>), plus the row's own <i>geocode</i>. In the barangay
         layers the tool looks for <i>geocode</i>, then <i>bgy_geocode</i>; the barangay name comes from
         <i>barangay</i> (or <i>bgy_name</i> / <i>name</i>).</td></tr>
@@ -931,7 +1314,7 @@ HELP_HTML = """
         status (<i>mbi_status</i> / <i>ref_status</i>) and remarks (<i>pso_remarks</i> / <i>ref_remarks</i>) are read.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Barangay Layers</td>
         <td>Click every barangay layer the involved barangays come from — an inter-municipal or inter-provincial
-        MBI can involve barangays stored in different layers. These are the layers GEMMA's MBI Checker checks. The log
+        MBI can involve barangays stored in different layers. These are the layers the MBI Checker checks. The log
         reports involved barangays that none of the selected layers contain (shown in red in the list). The barangay
         shapes are also what <b>shared overlaps</b> are clipped to. <i>Skip within-barangay cases</i> (on by default)
         leaves out cases that involve a single barangay.</td></tr>
@@ -941,11 +1324,12 @@ HELP_HTML = """
         ea_geocode) is the barangay's geocode <b>or starts with it</b>. Used by Auto-Assign. Without it the check
         still runs, with building counts of 0.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Run Check &amp; Counter-Check<br>(orange box)</td>
-        <td>Choose <i>Gaps and Overlaps</i>, <i>Overlaps Only</i> or <i>Gaps Only</i>, then click the button. It runs
-        <b>GEMMA's MBI Checker</b> (GEMMA plugin &gt; 1Map &gt; MBI Checker) on the ticked barangay layers, compares
-        every MBI it finds with the remaining MBI layer, adds the <i>MBI Counter-Check</i> layer and loads its cases.
-        GEMMA must be installed and enabled. Barangay layers need a <i>geocode</i> field (plus <i>region</i>,
-        <i>province</i>, <i>city_mun</i> and <i>barangay</i> for the MBI level).</td></tr>
+        <td>Choose <i>Gaps, Overlaps and Disputed</i> (checks every remaining MBI), <i>Overlaps Only</i>,
+        <i>Gaps Only</i> or <i>Disputed Only</i>, then click the button. It runs the <b>built-in MBI Checker</b> on the
+        ticked barangay layers, compares every MBI it finds with the remaining MBI layer, adds the <i>MBI
+        Counter-Check</i> layer and loads its cases. GEMMA is not needed. Barangay layers need a <i>geocode</i> field
+        (plus <i>region</i>, <i>province</i>, <i>city_mun</i> and <i>barangay</i> for the MBI level, and
+        <i>boundary</i> = <i>Contested</i> on disputed polygons).</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Or Load an Existing MBI Layer<br>(green button)</td>
         <td>Reopens a result without running the check again: pick an earlier <i>MBI Counter-Check</i> layer (e.g. one
         you made permanent) and click <b>Load MBI Cases</b> — its Detection column and colours come back. Tick <i>Only
@@ -1016,6 +1400,32 @@ HELP_HTML = """
         <i>Show: Partly covered</i>.</td></tr>
   </table>
 
+  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Join MBI to Barangays</h3>
+  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
+    <tr><td width="110" style="font-weight:bold; vertical-align:top;">What it makes</td>
+        <td>A new temporary layer <i>Barangays + MBI (&lt;date&gt;_&lt;time&gt;)</i>: every feature of the ticked
+        barangay layers, plus <b>one feature per MBI part a barangay keeps</b> (your ticks in the viewer — Apply
+        Coverage is not needed first). Each MBI part carries the <b>covering barangay's attributes</b> (geocode,
+        name, city …), so it belongs to that barangay. The barangay layers themselves are never edited.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">How to tell it is an MBI</td>
+        <td><b>bgy_part</b> = <i>MBI</i> (original areas: <i>Barangay</i>) and <b>is_mbi</b> = <i>1</i> (else 0) —
+        filter with <i>"is_mbi" = 1</i>. On the map the MBI parts are <b style="color:#c51162;">hatched magenta with a
+        dashed outline</b>. They also hold <i>mbi_case_uuid, mbi_type, mbi_level, mbi_detection, mbi_area_m2,
+        mbi_bldg_pts</i> and <i>mbi_released_by</i> (the barangays that gave the overlap up).</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Barangay features</td>
+        <td>Kept MBI parts are <b>cut out</b> of every barangay feature they lie in, so nothing is counted twice: an
+        overlap is removed from the barangays that released it (and stored once, as the MBI part, for the one that
+        keeps it); a disputed polygon wholly absorbed by its covering barangay is left out. Gaps simply add a new
+        part. To merge each MBI into its barangay, run <i>Vector &gt; Geoprocessing &gt; Dissolve</i> by
+        <i>geocode</i>.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Not joined</td>
+        <td>Pending cases, the uncovered part of partly covered overlaps, and no-longer-detected MBIs. An MBI assigned
+        to a barangay that is not in the ticked layers still gets its part, with only geocode / name / city filled
+        (the log counts them).</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Export</td>
+        <td><i>Export GPKG + CSV</i> also writes this layer into the GeoPackage as <i>mbi_bgy_joined</i>.</td></tr>
+  </table>
+
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Apply Coverage — Fields Written</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">Coverage field<br>(default <i>assigned_bgy</i>)</td>
@@ -1024,7 +1434,7 @@ HELP_HTML = """
     <tr><td style="font-weight:bold; vertical-align:top;">bgy_role</td>
         <td><b>Covers</b> on the covering barangays' rows (every EA row of that barangay, for an EA MBI layer),
         <b>Releases</b> on the others. Empty while Pending (and, in a shared overlap, for a barangay whose part
-        is not fully kept by the ticked barangays). Left <b>empty</b> in layers with one row per MBI (GEMMA's MBI
+        is not fully kept by the ticked barangays). Left <b>empty</b> in layers with one row per MBI (the MBI
         Checker / the MBI Counter-Check layer) — no barangay owns that row; the parts layer's <i>released_by</i>
         tells who clips what.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Status field<br>(default <i>coverage_status</i>)</td>
@@ -1048,9 +1458,11 @@ HELP_HTML = """
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">Export folder</td>
         <td>Where the files go. Leave it empty and you are asked for a folder when you click Export.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">GeoPackage</td>
-        <td><i>mbi_bgy_coverage_&lt;date&gt;_&lt;time&gt;.gpkg</i> with two layers: <i>mbi_bgy_coverage</i> — the whole
-        MBI layer including the coverage fields, even if you have not saved the layer's edits yet — and
-        <i>mbi_bgy_coverage_parts</i> — the kept / unassigned parts (as in the MBI Barangay Coverage Parts layer).</td></tr>
+        <td><i>mbi_bgy_coverage_&lt;date&gt;_&lt;time&gt;.gpkg</i> with: <i>mbi_bgy_coverage</i> — the whole
+        MBI layer including the coverage fields, even if you have not saved the layer's edits yet —
+        <i>mbi_bgy_coverage_parts</i> — the kept / unassigned parts (as in the MBI Barangay Coverage Parts layer) —
+        and <i>mbi_bgy_joined</i> — the barangays with their MBIs joined (as <i>Join MBI to Barangays</i>; only when
+        barangay layers are ticked and some MBI is covered).</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">CSV</td>
         <td><i>mbi_bgy_coverage_&lt;date&gt;_&lt;time&gt;.csv</i> — one row per case / barangay: case ID, detection,
         remaining MBI case ID and declared status, type, level, MBI
@@ -1065,18 +1477,21 @@ HELP_HTML = """
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">If Something Looks Wrong</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">Run Check is greyed out</td>
-        <td>"GEMMA's MBI Checker is not available": install / enable the GEMMA plugin (Plugins &gt; Manage and
-        Install Plugins), then reopen this window. Otherwise tick at least one barangay layer, and make sure each
-        has a <i>geocode</i> field.</td></tr>
+        <td>Tick at least one barangay layer, and make sure each has a <i>geocode</i> field.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">No Detection column</td>
         <td>No remaining MBI layer was picked, so nothing was counter-checked. Pick it (or Browse GPKG…) and run the
         check again.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Everything is Newly detected</td>
         <td>No detection shares area with a remaining MBI: check you picked the right remaining layer (the same
-        province / municipality) and that its <i>mbi_type</i> values say Gap / Overlap.</td></tr>
+        province / municipality) and that its <i>mbi_type</i> values say Gap / Overlap / Disputed.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">A remaining MBI is missing from the list</td>
-        <td>It is typed Disputed, or of a type this run did not look for (<i>Overlaps Only</i> / <i>Gaps Only</i>) —
-        the log counts them. Run <i>Gaps and Overlaps</i> to check everything.</td></tr>
+        <td>It is of a type this run did not look for (e.g. a gap with <i>Overlaps Only</i>, or a Disputed case with
+        anything but <i>Gaps, Overlaps and Disputed</i>) — the log counts them. Run <i>Gaps, Overlaps and Disputed</i>
+        to check everything.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">No disputed areas found</td>
+        <td>The checker reports a disputed area only for a barangay polygon whose <i>boundary</i> field is
+        <i>Contested</i>. Without that field, a remaining Disputed MBI can still be found as a gap or overlap
+        sharing its area.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Load MBI Cases is greyed out</td>
         <td>The picked MBI layer has no <i>case_uuid</i> field — use Run Check to create a proper one.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">No cases after loading</td>
@@ -1114,7 +1529,8 @@ def make_dialog_class():
     from qgis.core import (QgsApplication, QgsCategorizedSymbolRenderer, QgsCoordinateTransform,
                            QgsFeature, QgsFeatureRequest, QgsField, QgsFillSymbol,
                            QgsGeometry, QgsProcessingContext, QgsProcessingFeedback, QgsProject,
-                           QgsRendererCategory, QgsVectorFileWriter, QgsVectorLayer, QgsWkbTypes)
+                           QgsRendererCategory, QgsSimpleFillSymbolLayer, QgsVectorFileWriter,
+                           QgsVectorLayer, QgsWkbTypes)
     from qgis.gui import QgsFieldComboBox, QgsFileWidget, QgsMapLayerComboBox, QgsRubberBand
     from qgis.PyQt import QtWidgets
     from qgis.PyQt.QtCore import QEvent, Qt, QVariant
@@ -1389,22 +1805,25 @@ def make_dialog_class():
             lay.addWidget(self.bldg_hint)
             ll.addWidget(box)
 
-            box, lay = group("Run MBI Check && Counter-Check (GEMMA)")
+            box, lay = group("Run MBI Check && Counter-Check")
             self.run_box = box
             box.setObjectName("runBox")
             self.run_note = QtWidgets.QLabel(
-                "Runs GEMMA's MBI Checker on the ticked barangay layers, then compares every MBI "
-                "it finds with the Remaining MBI layer.")
+                "Runs the built-in MBI Checker (a copy of GEMMA's — GEMMA is not needed) on the "
+                "ticked barangay layers, then compares every MBI it finds with the Remaining MBI "
+                "layer, Disputed cases included.")
             self.run_note.setWordWrap(True)
             lay.addWidget(self.run_note)
             self.mode_combo = QtWidgets.QComboBox()
             self.mode_combo.addItems(RUN_MODES)
-            self.mode_combo.setToolTip("Which discrepancies GEMMA's MBI Checker looks for. Remaining MBIs\n"
-                                       "of a type that is not checked are not reported as no longer detected.")
+            self.mode_combo.setToolTip("Which discrepancies the MBI Checker looks for. Disputed areas are\n"
+                                       "polygons whose 'boundary' is Contested. Remaining MBIs of a type that\n"
+                                       "is not checked are not reported as no longer detected; remaining\n"
+                                       "Disputed MBIs are only checked with all three types.")
             lay.addWidget(self.mode_combo)
             self.run_btn = button("Run Check && Counter-Check")
             self.run_btn.setToolTip(
-                "Run GEMMA's MBI Checker on the ticked barangay layers (and Building Points),\n"
+                "Run the built-in MBI Checker on the ticked barangay layers (and Building Points),\n"
                 "compare each MBI found with the Remaining MBI layer (Still / Newly / No longer\n"
                 "detected), add the 'MBI Counter-Check' layer and list its cases in the viewer.")
             self.run_btn.setObjectName("runBtn")
@@ -1586,6 +2005,15 @@ def make_dialog_class():
                 "Changes are left UNSAVED (the layer enters edit mode) — use QGIS's\n"
                 "Save Edits to keep them, or Cancel Edits to discard and revert.")
             self.apply_btn.clicked.connect(self.apply_coverage)
+            self.join_btn = button("Join MBI to Barangays", 32)
+            self.join_btn.setToolTip(
+                f"Make a new layer '{JOIN_LAYER_NAME}': a copy of the ticked barangay layers with every\n"
+                "MBI joined to the barangay it is assigned to. Each joined MBI part is its own feature\n"
+                f"with the barangay's attributes, '{JOIN_KIND_FIELD}' = '{JOIN_KIND_MBI}' and "
+                f"'{JOIN_FLAG_FIELD}' = 1, drawn\n"
+                "hatched magenta; released overlaps are cut out of the other barangays. Dissolve by\n"
+                "geocode to merge them. Uses the ticks in the viewer; nothing is edited.")
+            self.join_btn.clicked.connect(self.join_mbi)
             self.export_btn = button("Export GPKG + CSV", 32, BTN_EXPORT)
             self.export_btn.setToolTip(
                 "Write the processed MBI layer (with the coverage fields) and the coverage parts\n"
@@ -1595,6 +2023,7 @@ def make_dialog_class():
             arow.addWidget(self.auto_btn, 1)
             arow.addWidget(self.reset_btn, 1)
             arow.addWidget(self.apply_btn, 2)
+            arow.addWidget(self.join_btn, 2)
             arow.addWidget(self.export_btn, 2)
             gf.addLayout(arow)
             self.apply_group.setEnabled(False)
@@ -1905,12 +2334,8 @@ def make_dialog_class():
             else:
                 self.set_hint(self.folder_hint, "Folder does not exist.", "error")
 
-            # Run Check: needs GEMMA's MBI Checker and barangay layers carrying its fields.
-            if not gemma_checker_available():
-                self._run_ok = False
-                self.set_hint(self.run_hint, "GEMMA's MBI Checker is not available — install / enable "
-                                             "the GEMMA plugin, then reopen this window.", "error")
-            elif not bgys:
+            # Run Check: needs barangay layers carrying the checker's fields.
+            if not bgys:
                 self._run_ok = False
                 self.set_hint(self.run_hint, "Tick the barangay layer(s) to check.")
             else:
@@ -2012,6 +2437,7 @@ def make_dialog_class():
             self.apply_group.setEnabled(idle and has_cases)
             self.apply_btn.setEnabled(self._field_ok)
             self.export_btn.setEnabled(self._field_ok)
+            self.join_btn.setEnabled(bool(self.bgy_layers()))
             self.zoom_btn.setEnabled(idle and bool(self.tree.selectedItems()))
 
         def update_summary(self):
@@ -2057,7 +2483,7 @@ def make_dialog_class():
                 QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel) == QtWidgets.QMessageBox.Yes
 
         def run_check(self, *_args):
-            """Run GEMMA's MBI Checker on the ticked barangay layers, counter-check every MBI it
+            """Run the built-in MBI Checker on the ticked barangay layers, counter-check every MBI it
             finds against the remaining MBI layer, add the MBI Counter-Check layer to the project
             and load its cases into the viewer."""
             if self.running:
@@ -2069,41 +2495,30 @@ def make_dialog_class():
             bldg = self.bldg_combo.currentLayer()
             remaining = self.remaining_combo.currentLayer()
             mode = self.mode_combo.currentIndex()
-            checked_kinds = {k for k, on in (("Overlap", mode in (0, 1)), ("Gap", mode in (0, 2))) if on}
+            checked_kinds = mode_kinds(mode)
 
             self.set_busy(True)
             self.log("=" * 50)
-            self.log(f"Running GEMMA MBI Checker ({RUN_MODES[mode]}) on {len(bgys)} barangay layer(s): "
+            self.log(f"Running MBI Checker {CHECKER_VERSION} ({RUN_MODES[mode]}) on {len(bgys)} "
+                     "barangay layer(s): "
                      + ", ".join(l.name() for l in bgys))
             if bldg is None:
                 self.log("  No Building Points layer — building counts will be 0.")
-            self.summary.setText("Running GEMMA's MBI Checker…")
+            self.summary.setText("Running the MBI Checker…")
             result = None
             start = datetime.now()
             try:
-                alg = QgsApplication.processingRegistry().createAlgorithmById(GEMMA_ALG_ID)
-                if alg is None:
-                    raise RuntimeError("GEMMA's MBI Checker is not available — enable the GEMMA plugin.")
-                # GEMMA requires a building layer: an empty one stands in when none is picked.
-                bldg_inputs = [bldg] if bldg is not None else [
-                    QgsVectorLayer(f"Point?crs={bgys[0].crs().authid() or 'EPSG:4326'}&field=id:integer",
-                                   "no_buildings", "memory")]
                 feedback = self._run_feedback = CheckFeedback(self)
-                context = QgsProcessingContext()
-                context.setProject(QgsProject.instance())
-                context.setFeedback(feedback)
-                alg.processAlgorithm({"INPUT1": bgys, "INPUT2": bldg_inputs, "RUN_MODE": mode},
-                                     context, feedback)
+                found = run_mbi_checker(bgys, [bldg] if bldg is not None else [], mode, feedback)
                 if feedback.isCanceled():
                     raise _Cancelled()
-                store = context.temporaryLayerStore()
                 detected = []
-                for ref, details in context.layersToLoadOnCompletion().items():
-                    layer = store.mapLayer(ref)
-                    kind = {"Overlaps": "Overlap", "Gaps": "Gap"}.get(details.name)
-                    if layer is not None and kind:
+                for kind in ("Disputed", "Overlap", "Gap"):
+                    layer = found.get(kind)
+                    if layer is not None:
                         detected.append((layer, kind))
-                        self.log(f"  {kind}s found: {layer.featureCount():,}")
+                        self.log(f"  {'Disputed areas' if kind == 'Disputed' else kind + 's'} found: "
+                                 f"{layer.featureCount():,}")
 
                 if remaining is not None:
                     self.summary.setText(f"Counter-checking against '{remaining.name()}'…")
@@ -2115,7 +2530,8 @@ def make_dialog_class():
                     self._log_counter_check(remaining, stats, checked_kinds)
                 elapsed = str(datetime.now() - start).split(".")[0]
                 if result is None:
-                    self.log(f"No gaps or overlaps found and no remaining MBI to list ({elapsed}).")
+                    self.log(f"No gaps, overlaps or disputed areas found and no remaining MBI to list "
+                             f"({elapsed}).")
                 else:
                     self._style_results(result)
                     QgsProject.instance().addMapLayer(result)
@@ -2142,15 +2558,19 @@ def make_dialog_class():
 
         def _log_counter_check(self, remaining, s, checked_kinds):
             self.log(f"Counter-check against '{remaining.name()}' ({s['remaining']:,} remaining MBI(s)"
-                     + (f"; {s['disputed']:,} Disputed case(s) left out" if s["disputed"] else "") + "):")
+                     + (f", {s['disputed']:,} of them Disputed" if s["disputed"] else "") + "):")
             self.log(f"  {DETECT_STILL}: {s['still']:,} MBI(s) found by the check, matching "
                      f"{s['matched']:,} remaining MBI(s)")
             self.log(f"  {DETECT_NEW}: {s['new']:,} MBI(s) not in the remaining layer "
                      "(light green in the list)")
             self.log(f"  {DETECT_GONE}: {s['gone']:,} remaining MBI(s) the check did not find")
+            if s["disputed"]:
+                self.log(f"  Disputed: {s['disputed_still']:,} of {s['disputed']:,} remaining Disputed MBI(s) "
+                         "still detected (as a contested polygon, gap or overlap sharing their area)")
             if s["unchecked"]:
                 self.log(f"  Not checked: {s['unchecked']:,} remaining MBI(s) of a type this run did not "
-                         f"look for (only {', '.join(sorted(checked_kinds)).lower()}s) — left out")
+                         f"look for (only {', '.join(sorted(checked_kinds)).lower()}; Disputed needs all "
+                         "three) — left out")
             if s["multi"]:
                 self.log(f"  {s['multi']:,} detection(s) overlap more than one remaining MBI "
                          f"('{REF_UUID_FIELD}' lists them all)")
@@ -2374,10 +2794,10 @@ def make_dialog_class():
                     split += 1
                 elif is_overlap and len(cands) > 1:
                     unsplit += 1
-            self.log(f"  {split:,} overlap case(s) can be shared out between their barangays "
+            self.log(f"  {split:,} overlap / disputed case(s) can be shared out between their barangays "
                      "(each covering barangay keeps only its part)")
             if unsplit:
-                self.log(f"  {unsplit:,} overlap case(s) have an involved barangay missing from the "
+                self.log(f"  {unsplit:,} overlap / disputed case(s) have an involved barangay missing from the "
                          "selected layers — one barangay covers the whole MBI there")
 
         def count_buildings(self, cases, mbi_layer, bldg_layer, gc_field=None):
@@ -2535,12 +2955,14 @@ def make_dialog_class():
         def _detection_tip(self, case):
             if not case.detection:
                 return ""
-            tip = {DETECT_NEW: "Found by GEMMA's MBI Checker but not in the remaining MBI layer.",
+            tip = {DETECT_NEW: "Found by the MBI Checker but not in the remaining MBI layer.",
                    DETECT_STILL: "The check still finds this remaining MBI.",
                    DETECT_GONE: "This remaining MBI was not found by the check — nothing to cover."
                    }.get(case.detection, case.detection)
             if case.ref_uuids and case.detection != DETECT_NEW:
                 tip += f"\nRemaining MBI case_uuid: {case.ref_uuids.replace(',', ', ')}"
+            if case.ref_kind and case.detection != DETECT_NEW and case.ref_kind != case.mbi_type:
+                tip += f"\nRemaining MBI type: {case.ref_kind}"
             if case.ref_status:
                 tip += f"\nDeclared status: {case.ref_status}"
             if case.ref_remarks:
@@ -2988,19 +3410,7 @@ def make_dialog_class():
                 if case.geom is None or case.gone:
                     continue
                 kept_bldg = 0
-                for code in case.assigned:
-                    cand = case.candidates[code]
-                    if cand.kept is None or (case.split and cand.kept_area <= SLIVER_M2):
-                        continue
-                    if case.split:
-                        released_by = [c.code for c in case.candidates.values()
-                                       if c is not cand and c.part is not None
-                                       and _area(_polygonal(c.part.intersection(cand.kept)),
-                                                 self.da) > SLIVER_M2]
-                        bldg = cand.kept_bldg
-                    else:
-                        released_by = [c for c in case.candidates if c != code]
-                        bldg = case.bldg_pts if cand.kept_bldg is None else cand.kept_bldg
+                for cand, released_by, bldg in self._kept_parts(case):
                     kept_bldg += bldg or 0
                     add(case, cand.kept, PART_KEPT, cand, released_by, cand.kept_area, bldg)
                 if case.status != "covered" and case.unassigned is not None:
@@ -3013,6 +3423,223 @@ def make_dialog_class():
             out.dataProvider().addFeatures(feats)
             out.updateExtents()
             return out
+
+        def _kept_parts(self, case):
+            """(cand, released_by codes, building count) for every covering barangay of the case
+            that keeps a part of the MBI with the current choices."""
+            if case.geom is None or case.gone:
+                return []
+            out = []
+            for code in case.assigned:
+                cand = case.candidates[code]
+                if cand.kept is None or (case.split and cand.kept_area <= SLIVER_M2):
+                    continue
+                if case.split:
+                    released_by = [c.code for c in case.candidates.values()
+                                   if c is not cand and c.part is not None
+                                   and _area(_polygonal(c.part.intersection(cand.kept)),
+                                             self.da) > SLIVER_M2]
+                    bldg = cand.kept_bldg
+                else:
+                    released_by = [c for c in case.candidates if c != code]
+                    bldg = case.bldg_pts if cand.kept_bldg is None else cand.kept_bldg
+                out.append((cand, released_by, bldg))
+            return out
+
+        # ---- Join MBI to Barangays ----
+        def build_joined_layer(self, mbi_crs):
+            """Copy of the ticked barangay layers with every kept MBI part joined to the barangay
+            that covers it. The MBI parts are their own features carrying the covering barangay's
+            attributes plus JOIN_KIND_FIELD = 'MBI' / JOIN_FLAG_FIELD = 1, so they stand out; the
+            barangay features have the kept MBI parts cut out (an overlap a barangay released is
+            removed from it, a disputed polygon absorbed by its covering barangay disappears).
+            Dissolving by geocode gives the corrected barangays. Returns (layer, stats)."""
+            from qgis.core import QgsSpatialIndex
+            prj = QgsProject.instance()
+            bgys = self.bgy_layers()
+            if not bgys:
+                raise RuntimeError("Tick the barangay layer(s) to join the MBIs into.")
+            crs = bgys[0].crs()
+            # Output schema: every barangay layer's fields (first one wins), then ours
+            ours = [(JOIN_KIND_FIELD, QVariant.String), (JOIN_FLAG_FIELD, QVariant.Int),
+                    ("mbi_case_uuid", QVariant.String), ("mbi_type", QVariant.String),
+                    ("mbi_level", QVariant.String), ("mbi_detection", QVariant.String),
+                    ("mbi_area_m2", QVariant.Double), ("mbi_bldg_pts", QVariant.Int),
+                    ("mbi_released_by", QVariant.String), ("src_layer", QVariant.String)]
+            reserved = {n.lower() for n, _t in ours} | {"fid"}
+            fields, seen = [], set()
+            for layer in bgys:
+                for f in layer.fields():
+                    if f.name().lower() not in reserved and f.name().lower() not in seen:
+                        seen.add(f.name().lower())
+                        fields.append(QgsField(f))
+            fields += [QgsField(n, t) for n, t in ours]
+            uri = "MultiPolygon" + (f"?crs={crs.authid()}" if crs.authid() else "")
+            out = QgsVectorLayer(uri, f"{JOIN_LAYER_NAME} ({datetime.now():%Y%m%d_%H%M%S})", "memory")
+            out.setCrs(crs)
+            out.dataProvider().addAttributes(fields)
+            out.updateFields()
+            names = out.fields().names()
+            stats = {"bgy": 0, "mbi": 0, "trimmed": 0, "absorbed": 0, "missing": 0, "cases": 0}
+
+            # Kept MBI parts, in the output CRS
+            pieces = []   # (case, cand, released_by, bldg, geometry)
+            to_out = QgsCoordinateTransform(mbi_crs, crs, prj)
+            for case in self.cases.values():
+                kept = self._kept_parts(case)
+                stats["cases"] += bool(kept)
+                for cand, released_by, bldg in kept:
+                    g = QgsGeometry(cand.kept)
+                    if mbi_crs != crs:
+                        g.transform(to_out)
+                    pieces.append((case, cand, released_by, bldg, g))
+            if not pieces:
+                raise RuntimeError("No MBI has a covering barangay yet — tick the covering barangays "
+                                   "(or Auto-Assign) first.")
+            index = QgsSpatialIndex()
+            for i, (_c, _d, _r, _b, g) in enumerate(pieces):
+                f = QgsFeature(i)
+                f.setGeometry(g)
+                index.addFeature(f)
+
+            def make(geom, values):
+                g = QgsGeometry(geom)
+                g.convertToMultiType()
+                nf = QgsFeature(out.fields())
+                nf.setGeometry(g)
+                nf.setAttributes([values.get(n) for n in names])
+                return nf
+
+            feats = []
+            first_attrs = {}   # barangay geocode -> attributes of its first feature
+            wanted_codes = {cand.code for _c, cand, _r, _b, _g in pieces}
+            total = max(sum(l.featureCount() for l in bgys), 1)
+            done = 0
+            for layer in bgys:
+                xform = QgsCoordinateTransform(layer.crs(), crs, prj)
+                gc_field = _pick_field(layer, BGY_GEOCODE_FIELDS)
+                lnames = [n for n in layer.fields().names() if n.lower() not in reserved]
+                for feat in layer.getFeatures():
+                    if done % 200 == 0:
+                        self.tick(done, total, f"Joining MBIs to barangays ({done:,}/{total:,})…")
+                    done += 1
+                    values = {n: feat[n] for n in lnames}
+                    values.update({JOIN_KIND_FIELD: JOIN_KIND_BGY, JOIN_FLAG_FIELD: 0,
+                                   "src_layer": layer.name()})
+                    code = _text(feat, gc_field) if gc_field else ""
+                    if code in wanted_codes and code not in first_attrs:
+                        first_attrs[code] = dict(values)
+                    if not feat.hasGeometry():
+                        continue
+                    g = QgsGeometry(feat.geometry())
+                    if layer.crs() != crs:
+                        g.transform(xform)
+                    if not g.isGeosValid():
+                        g = g.makeValid()
+                    hits = [pieces[i][4] for i in index.intersects(g.boundingBox())]
+                    hits = [h for h in hits if g.intersects(h)]
+                    if hits:
+                        cut = _polygonal(g.difference(hits[0] if len(hits) == 1
+                                                      else QgsGeometry.unaryUnion(hits)))
+                        if cut is None or _area(cut, self.da) <= SLIVER_M2:
+                            stats["absorbed"] += 1   # wholly taken by an MBI (e.g. a disputed polygon)
+                            continue
+                        if abs(_area(cut, self.da) - _area(g, self.da)) > SLIVER_M2:
+                            stats["trimmed"] += 1
+                        g = cut
+                    feats.append(make(g, values))
+                    stats["bgy"] += 1
+
+            for case, cand, released_by, bldg, g in pieces:
+                values = dict(first_attrs.get(cand.code) or {})
+                if not values:
+                    stats["missing"] += 1   # covering barangay not in the ticked layers
+                    gc_name = _pick_field(out, BGY_GEOCODE_FIELDS)
+                    for key, value in ((gc_name, cand.code),
+                                       (_pick_field(out, BGY_NAME_FIELDS), cand.name),
+                                       (_pick_field(out, BGY_CITY_FIELDS), cand.city_mun)):
+                        if key:
+                            values[key] = value or None
+                values.update({JOIN_KIND_FIELD: JOIN_KIND_MBI, JOIN_FLAG_FIELD: 1,
+                               "mbi_case_uuid": case.case_uuid, "mbi_type": case.mbi_type or None,
+                               "mbi_level": case.level or None, "mbi_detection": case.detection or None,
+                               "mbi_area_m2": round(cand.kept_area, 2), "mbi_bldg_pts": bldg,
+                               "mbi_released_by": ",".join(released_by) or None})
+                values.setdefault("src_layer", None)
+                feats.append(make(g, values))
+                stats["mbi"] += 1
+            out.dataProvider().addFeatures(feats)
+            out.updateExtents()
+            return out, stats
+
+        def _style_joined(self, layer):
+            """Barangays plain; joined MBI parts in a unique hatched magenta."""
+            bgy_sym = QgsFillSymbol.createSimple({"color": "255,255,255,40", "outline_color": "97,97,97,255",
+                                                  "outline_width": "0.4"})
+            mbi_sym = QgsFillSymbol.createSimple({"color": COLOUR_JOINED_FILL, "outline_color": COLOUR_JOINED,
+                                                  "outline_width": "0.8", "outline_style": "dash"})
+            mbi_sym.appendSymbolLayer(QgsSimpleFillSymbolLayer.create(
+                {"color": COLOUR_JOINED, "style": "b_diagonal", "outline_style": "no"}))
+            layer.setRenderer(QgsCategorizedSymbolRenderer(JOIN_KIND_FIELD, [
+                QgsRendererCategory(JOIN_KIND_BGY, bgy_sym, "Barangay"),
+                QgsRendererCategory(JOIN_KIND_MBI, mbi_sym, "MBI joined to the barangay")]))
+
+        def join_mbi(self):
+            if self.running or not self.cases:
+                return
+            mbi = self.mbi_layer
+            if mbi is None:
+                QtWidgets.QMessageBox.warning(
+                    self, DIALOG_TITLE, "The MBI layer is no longer in the project — load again.")
+                return
+            n = self._status_counts()
+            msg = (f"Join every MBI to the barangay it is assigned to, in a new layer "
+                   f"'{JOIN_LAYER_NAME}'?\n\n"
+                   f"The ticked barangay layers are copied; each kept MBI part becomes its own feature "
+                   f"with the covering barangay's attributes and {JOIN_KIND_FIELD} = '{JOIN_KIND_MBI}' "
+                   f"({JOIN_FLAG_FIELD} = 1), shown hatched magenta. The barangay layers are not edited.")
+            if n["pending"] or n["partial"]:
+                msg += (f"\n\n{n['pending']:,} pending and {n['partial']:,} partly covered case(s): "
+                        "their uncovered part is not joined.")
+            if QtWidgets.QMessageBox.question(
+                    self, DIALOG_TITLE, msg,
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel) != QtWidgets.QMessageBox.Yes:
+                return
+            self._join_mbi(mbi)
+
+        def _join_mbi(self, mbi):
+            self.set_busy(True)
+            self.log("-" * 50)
+            self.log("Joining MBIs to their covering barangays…")
+            try:
+                layer, s = self.build_joined_layer(mbi.crs())
+                self._style_joined(layer)
+                QgsProject.instance().addMapLayer(layer)
+                self.log(f"  {s['mbi']:,} MBI part(s) from {s['cases']:,} case(s) joined "
+                         f"({JOIN_KIND_FIELD} = '{JOIN_KIND_MBI}', {JOIN_FLAG_FIELD} = 1, hatched magenta)")
+                self.log(f"  {s['bgy']:,} barangay feature(s) copied; {s['trimmed']:,} had a kept MBI part "
+                         "cut out (released overlaps)")
+                if s["absorbed"]:
+                    self.log(f"  {s['absorbed']:,} barangay feature(s) wholly taken by an MBI part "
+                             "(e.g. a disputed polygon) — left out")
+                if s["missing"]:
+                    self.log(f"  {s['missing']:,} MBI part(s) go to a barangay missing from the ticked "
+                             "layers — only its geocode / name are filled")
+                self.log(f"Added layer '{layer.name()}' ({layer.featureCount():,} feature(s)). Dissolve by "
+                         "geocode to merge each MBI into its barangay; temporary layer — right-click > "
+                         "Make Permanent to keep it.")
+                self.progress.setValue(100)
+                return layer
+            except _Cancelled:
+                self.log("Join cancelled.")
+            except Exception as e:
+                self.log(traceback.format_exc().rstrip())
+                self.log(f"Join FAILED: {e}")
+                QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, f"Join failed: {e}")
+            finally:
+                self.set_busy(False)
+                self.update_summary()
+            return None
 
         def _style_parts(self, layer):
             cats = []
@@ -3209,6 +3836,20 @@ def make_dialog_class():
             if res[0] != QgsVectorFileWriter.NoError:
                 raise RuntimeError(f"GPKG export of the coverage parts failed: {res[1]}")
             self.log(f"    + layer '{PARTS_EXPORT_NAME}' ({parts.featureCount():,} part(s))")
+
+            if not self.bgy_layers() or not any(self._kept_parts(c) for c in self.cases.values()):
+                return
+            joined, _s = self.build_joined_layer(layer.crs())
+            options = QgsVectorFileWriter.SaveVectorOptions()
+            options.driverName = "GPKG"
+            options.layerName = JOIN_EXPORT_NAME
+            options.fileEncoding = "UTF-8"
+            options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteLayer
+            res = QgsVectorFileWriter.writeAsVectorFormatV3(joined, path, context, options)
+            if res[0] != QgsVectorFileWriter.NoError:
+                raise RuntimeError(f"GPKG export of the joined barangays failed: {res[1]}")
+            self.log(f"    + layer '{JOIN_EXPORT_NAME}' ({_s['mbi']:,} joined MBI part(s), "
+                     f"{_s['bgy']:,} barangay feature(s))")
 
         def export_csv(self, path):
             field, status_field = self.coverage_field(), self.status_field()
