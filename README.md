@@ -1,78 +1,31 @@
-# GMD_COProcessing
-QGIS plugin for EA Post-Processing of GMD.
+# GMD CO Processing
+QGIS plugin for EA post-processing of GMD. Requires QGIS 3.22 or later.
 
-## Requirements
-- QGIS 3.22 or later
+## Install (with automatic updates)
+1. In QGIS open **Plugins > Manage and Install Plugins > Settings**.
+2. Tick **Show also experimental plugins**.
+3. Click **Add…** and enter:
+   - Name: `GMD CO Processing`
+   - URL: **https://raw.githubusercontent.com/GMD-Repository/GMD_COProcessing/plugin-repo/plugins.xml**
+4. Go to **All**, search for **GMD CO Processing** and click **Install**.
 
-## Installation (development)
-The plugin package is the `GMD_COProcessing/` folder of this repository. Link it into the
-QGIS plugins folder (run in an elevated `cmd`, from the repository root):
+QGIS checks this link and offers an **Upgrade** when a new version is released.
 
+## Use
+A **GMD CO Processing** menu appears in the menu bar. The toolbar button opens the panel, where you
+pick the EA layer and run the scripts in [gmd_processing_tools/](GMD_COProcessing/gmd_processing_tools/).
+See [gmd_processing_tools/README.md](GMD_COProcessing/gmd_processing_tools/README.md) for writing scripts.
+
+## Release a new version
+Publish a GitHub release with a version tag, e.g. `v0.3.2`. The
+[release workflow](.github/workflows/release.yml) builds the plugin zip and updates the link above.
+Mark it *pre-release* to publish it as experimental.
+
+## Folder structure
 ```
-mklink /J "%APPDATA%\QGIS\QGIS3\profiles\default\python\plugins\GMD_COProcessing" "%CD%\GMD_COProcessing"
-```
-
-1. Restart QGIS (or use **Plugin Reloader**).
-2. Enable **GMD CO Processing** in *Plugins > Manage and Install Plugins > Installed*.
-   Because the plugin is marked experimental, tick *Show also experimental plugins* in *Settings* if it does not appear.
-3. A **GMD CO Processing** menu appears in the QGIS menu bar (before *Help*):
-   - *GMD CO Processing Panel*: show/hide the plugin panel (also the toolbar button)
-   - *Run Script*: run any script in `gmd_processing_tools/`
-   - *New Script…*, *Open Scripts Folder*
-
-## Structure
-Repository root (not shipped) plus the plugin package, laid out as in the
-[PyQGIS Developer Cookbook](https://docs.qgis.org/3.44/en/docs/pyqgis_developer_cookbook/plugins/plugins.html):
-```
-.github/                         # release workflow + plugins.xml generator
-README.md
-GMD_COProcessing/                # plugin package = folder name QGIS installs
-    __init__.py                  # classFactory entry point
-    metadata.txt                 # plugin metadata
-    plugin.py                    # menu bar menu, toolbar button and dock panel
-    script_registry.py           # finds scripts and their menu metadata
-    icon.svg
-    LICENSE                      # GPL-2.0 (required by the QGIS Plugins Directory)
-    gmd_processing_tools/        # YOUR SCRIPTS GO HERE (listed and run from the panel)
-        icons/  styles/
-    ui/
-        dock_widget.ui           # panel layout (Qt Designer)
-        dock_widget.py           # panel logic
-```
-
-## Scripts (`GMD_COProcessing/gmd_processing_tools/`)
-Drop `.py` files into [gmd_processing_tools/](GMD_COProcessing/gmd_processing_tools/); they appear in the panel
-automatically. See [gmd_processing_tools/README.md](GMD_COProcessing/gmd_processing_tools/README.md) for the
-variables available to scripts (`iface`, `ea_layer`).
-
-## UI (dock panel)
-*GMD CO Processing > GMD CO Processing Panel* (or the toolbar button) toggles the panel:
-
-- **EA layer**: available in scripts as `ea_layer`.
-- **Scripts**: every script in `gmd_processing_tools/`, with its docstring as description.
-- **Run** (or double-click): runs the script; `print()` output and errors go to the log.
-- **Open**: opens the script in the QGIS Python console editor.
-- **New...**: creates a script from `_template.py` and opens it.
-- **Folder**: opens `gmd_processing_tools/` in Explorer.
-
-Edit the layout in `GMD_COProcessing/ui/dock_widget.ui` with Qt Designer (`qgis-ltr-designer.bat`
-in the QGIS `bin` folder, which includes the QGIS widgets).
-
-## Releasing
-Publishing a GitHub release runs [.github/workflows/release.yml](.github/workflows/release.yml), which
-builds `GMD_COProcessing.<version>.zip` and attaches it to the release.
-
-- The tag must be a version number and sets the plugin version: tag `v0.2.0` → `version=0.2.0`.
-- The zip and `plugins.xml` are also published to the `plugin-repo` branch. QGIS repository URL
-  (*Plugins > Manage and Install Plugins > Settings > Add…*):
-  `https://raw.githubusercontent.com/GMD-Repository/GMD_COProcessing/plugin-repo/plugins.xml`
-- A release marked *pre-release* is packaged with `experimental=True`, otherwise `False`.
-- Files listed as `export-ignore` in `.gitattributes` are left out of the zip.
-
-## Packaging (manual)
-Zip the `GMD_COProcessing` folder (excluding `.git` and `__pycache__`) and install via
-*Plugins > Manage and Install Plugins > Install from ZIP*:
-
-```
-git archive --format=zip --prefix=GMD_COProcessing/ -o GMD_COProcessing.zip HEAD:GMD_COProcessing
+GMD_COProcessing/            # the plugin (what QGIS installs)
+    __init__.py  plugin.py  metadata.txt  icon.svg  LICENSE
+    gmd_processing_tools/    # scripts, icons, styles
+    ui/                      # panel
+.github/                     # release workflow
 ```
