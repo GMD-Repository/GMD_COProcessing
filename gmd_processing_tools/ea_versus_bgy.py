@@ -8,11 +8,10 @@ each feature is just the mismatched area, carrying the attributes of the EA that
   Short of BGY          the barangay land its EA does not reach (all EAs bordering it are listed)
   No matching barangay  the EA's barangay geocode is not in the barangay layer (the whole EA)
 
-The "Discrepancies" scratch layer and the panel's list show them, largest first. No layer means every
-EA is snapped. Barangays with no EA have nothing to list, so they are named in the log instead.
+The panel's list shows them, largest first. No layer is added to the project: the discrepancies
+are kept in memory by the panel, for zooming and snapping. Barangays with no EA have nothing to list, so they are named in the log instead.
 
-Snapping is done per discrepancy: select rows in the list (or features of the Discrepancies layer on
-the map) and press "Snap Selected". Only the EA named in the "Fix EA" column is changed:
+Snapping is done per discrepancy: select rows in the list and press "Snap Selected". Only the EA named in the "Fix EA" column is changed:
 
   - Outside BGY pieces are cut off the EA.
   - Short of BGY pieces are added to the EA sharing the longest border with them.
@@ -28,7 +27,7 @@ The EA layer is left in edit mode and nothing is written to its file until you s
   Revert  Toggle Editing > Discard, or Edit > Undo (one undo step per Snap Selected)
 
 Only the geometry is changed: attributes such as household counts stay as they are.
-Scratch layers are lost when QGIS closes; right-click > Make Permanent to keep one.
+Each scan also removes any "Discrepancies ..." scratch layers left in the project by older versions.
 
 Usage:
   1. Load the barangay layer and the EA layer into the project.
@@ -36,7 +35,7 @@ Usage:
   2. GMD CO Processing > EA Tools > EA vs Barangay Check.
      This opens the "EA vs Barangay Check" panel beside the map.
   3. Pick the two layers and press Scan. Progress, warnings and the summary appear in the Log.
-  4. The Discrepancies list shows every issue: click a row to select it on the map,
+  4. The Discrepancies list shows every issue: click a row to flash it on the map,
      double-click to zoom to it. Select the rows to fix and press Snap Selected.
 """
 # Menu / panel entry (read by the GMD CO Processing plugin)
@@ -68,7 +67,7 @@ TOUCH_TOL_M = 1.0   # a gap within this distance of an EA counts as bordering th
 MIN_OWNER_SHARE = 0.3  # a gap is added to one EA only if that EA has at least this share of its EA border
 GRID_DEG = 1e-9     # fallback precision grid (~0.1 mm) when an exact snap gives an invalid geometry
 
-# Layer-name patterns used to preselect layers in the dialog.
+# Layer-name patterns used, after the fields, to autodetect the layers in the panel.
 BGY_LAYER_HINT = r"bgy|barangay"
 EA_LAYER_HINT = r"(^|_)ea"
 
@@ -582,7 +581,7 @@ class Scan:
         self.ea_layer = ea_layer
         self.ea = ea                        # EAs as scanned (lat/lon); updated after each snap
         self.discrepancies = discrepancies  # one row per discrepancy; Status updated after each snap
-        self.layer = layer                  # the Discrepancies scratch layer (None if there are none)
+        self.layer = layer                  # in-memory Discrepancies layer, not in the project (None if none)
         self.fids = fids                    # its feature id for each discrepancy row
         self.min_area = min_area
         self.messages = {}                  # row -> why it failed / what changed
@@ -701,13 +700,6 @@ def categorize(lyr, field, colours):
         field, [QgsRendererCategory(value, fill(color), value) for value, color in colours]))
 
 
-def add_to_project(lyr):
-    from qgis.core import QgsProject
-
-    QgsProject.instance().addMapLayer(lyr, False)
-    QgsProject.instance().layerTreeRoot().insertLayer(0, lyr)
-
-
 def to_memory_layer(df, name):
     """GeoDataFrame -> styled MultiPolygon scratch layer (columns starting with "_" are left out)."""
     from qgis.PyQt.QtCore import QVariant
@@ -741,9 +733,13 @@ def to_memory_layer(df, name):
     return lyr, [f.id() for f in added]  # feature ids in the same order as the rows of df
 
 
+RESULT_LAYER_TAG = "gmd_ea_vs_bgy/discrepancies"
+RESULT_LAYER_NAME = re.compile(r"^Discrepancies \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
 # ================= RUN =================
 def run_check(bgy_layer, ea_layer, min_area, step=print):
-    """Finds the discrepancies, adds them to the project as a scratch layer and returns a Scan.
+    """Finds the discrepancies and returns a Scan (its layer is kept in memory, not added to the project).
 
     Nothing in the EA layer is changed: use snap_rows() on the discrepancies to fix.
     """
@@ -765,7 +761,6 @@ def run_check(bgy_layer, ea_layer, min_area, step=print):
     if len(discrepancies):
         step("Creating the output layer...")
         layer, fids = to_memory_layer(discrepancies, f"Discrepancies {datetime.now():%Y-%m-%d %H:%M:%S}")
-        add_to_project(layer)
     return Scan(ea_layer, ea, discrepancies, layer, fids, min_area)
 
 
@@ -832,14 +827,40 @@ def make_panel_class():
     issue_colours = {issue: QColor(*[int(v) for v in rgba.split(",")[:3]], 70) for issue, rgba in ISSUE_COLOURS}
     snappable = {STATUS_PENDING, STATUS_FAILED}
 
-    def layer_combo(hint):
+    def layer_combo():
         combo = QgsMapLayerComboBox()
         combo.setFilters(polygon_filter)
-        for i in range(combo.count()):
-            if combo.layer(i) is not None and re.search(hint, combo.layer(i).name(), re.I):
-                combo.setLayer(combo.layer(i))
-                break
+        combo.setAllowEmptyLayer(True)
         return combo
+
+    # Fields only an EA layer has; a barangay layer has a geocode but none of these.
+    ea_only = {"ea_geocode", "ean", "bgy_geo"}
+    bgy_geocode = {c.lower() for c in BGY_FIELDS["geocode"]}
+
+    def layer_scores(layer):
+        """(EA score, barangay score) from the layer's fields, with the layer name as a tie-breaker."""
+        try:
+            fields = {f.name().lower() for f in layer.fields()}
+        except Exception:  # noqa: BLE001 - not a vector layer
+            return 0, 0
+        is_ea = bool(fields & ea_only) or {"bgy_geocode", "geocode"} <= fields
+        name = layer.name()
+        ea = (4 if is_ea else 0) + (1 if re.search(EA_LAYER_HINT, name, re.I) else 0)
+        bgy = ((4 if fields & bgy_geocode and not is_ea else 0)
+               + (1 if re.search(BGY_LAYER_HINT, name, re.I) else 0)
+               + (1 if "barangay" in fields and not is_ea else 0))
+        return ea, bgy
+
+    def best_layer(combo, score_index, exclude=None):
+        best, best_score = None, 0
+        for i in range(combo.count()):
+            layer = combo.layer(i)
+            if layer is None or layer == exclude:
+                continue
+            score = layer_scores(layer)[score_index]
+            if score > best_score:
+                best, best_score = layer, score
+        return best
 
     class CheckPanel(QtWidgets.QDockWidget):
         def __init__(self, iface, parent=None):
@@ -848,7 +869,6 @@ def make_panel_class():
             self.iface = iface
             self.scan_result = None
             self.running = False
-            self._syncing = False  # guards the list <-> map selection sync
 
             body = QtWidgets.QWidget()
             self.setWidget(body)
@@ -857,13 +877,27 @@ def make_panel_class():
             # ---- inputs
             inputs = QtWidgets.QGroupBox("Input")
             form = QtWidgets.QFormLayout(inputs)
-            self.bgy = layer_combo(BGY_LAYER_HINT)
+            self.bgy = layer_combo()
             form.addRow("Barangay layer", self.bgy)
-            self.ea = layer_combo(EA_LAYER_HINT)
-            panel_layer = globals().get("ea_layer")  # set when run from the GMD CO Processing panel
-            if panel_layer is not None and self.ea.findText(panel_layer.name()) >= 0:
-                self.ea.setLayer(panel_layer)
+            self.ea = layer_combo()
             form.addRow("EA layer", self.ea)
+            # A combo the user has picked by hand is left alone by autodetection.
+            self.manual = {"bgy": False, "ea": False}
+            self._auto_setting = False
+            # Set when run from the GMD CO Processing panel. That combo often just holds the first
+            # layer, so it is used only if it looks at least as much like an EA layer as the best match.
+            panel_layer = globals().get("ea_layer")
+            if panel_layer is not None and self.ea.findText(panel_layer.name()) >= 0:
+                detected = best_layer(self.ea, 0)
+                best_score = layer_scores(detected)[0] if detected is not None else 0
+                if layer_scores(panel_layer)[0] >= max(best_score, 1):
+                    self.ea.setLayer(panel_layer)
+                    self.manual["ea"] = True
+            self.autodetect_layers()
+            self.bgy.layerChanged.connect(lambda _l: self.on_layer_picked("bgy"))
+            self.ea.layerChanged.connect(lambda _l: self.on_layer_picked("ea"))
+            # PyQt drops this connection when the panel is deleted (bound method of a QObject).
+            QgsProject.instance().layersAdded.connect(self.on_layers_added)
             self.min_area = QtWidgets.QDoubleSpinBox()
             self.min_area.setRange(0, 1e7)
             self.min_area.setDecimals(2)
@@ -952,6 +986,31 @@ def make_panel_class():
             layout.addWidget(splitter, 1)
             self.update_buttons()
 
+        # ----------------------------------------------------- autodetect
+        def autodetect_layers(self):
+            """Pick the EA and barangay layers from their fields (then their names), never the same
+            layer for both. Combos the user set by hand are kept."""
+            self._auto_setting = True
+            try:
+                if not self.manual["ea"]:
+                    exclude = self.bgy.currentLayer() if self.manual["bgy"] else None
+                    self.ea.setLayer(best_layer(self.ea, 0, exclude))
+                if not self.manual["bgy"]:
+                    self.bgy.setLayer(best_layer(self.bgy, 1, self.ea.currentLayer()))
+            finally:
+                self._auto_setting = False
+
+        def on_layer_picked(self, which):
+            if self._auto_setting:
+                return
+            self.manual[which] = self.ea.currentLayer() is not None if which == "ea" \
+                else self.bgy.currentLayer() is not None
+            self.autodetect_layers()  # re-pick the other combo if it was autodetected
+
+        def on_layers_added(self, _layers):
+            if not self.running:
+                self.autodetect_layers()
+
         # ------------------------------------------------------------ log
         def log(self, text):
             stamp = datetime.now().strftime("%H:%M:%S")
@@ -990,7 +1049,7 @@ def make_panel_class():
                 QtWidgets.QMessageBox.warning(self, PANEL_TITLE, "The barangay layer and the EA layer must be different.")
                 return
 
-            self.disconnect_result_layer()
+            self.remove_old_layers(keep=(bgy_layer, ea_layer))
             self.scan_result = None
             self.table.setRowCount(0)
             self.count_label.setText("Scanning…")
@@ -1016,18 +1075,21 @@ def make_panel_class():
             if WARNINGS:
                 self.log(f"{len(WARNINGS)} warning(s), see [WARNING] lines above.")
             self.scan_result = scan
-            if scan.layer is not None:
-                scan.layer.selectionChanged.connect(self.on_map_selection)
             self.show_results()
             self.log("Scan finished.")
 
-        def disconnect_result_layer(self):
-            layer = self.result_layer(quiet=True)
-            if layer is not None:
-                try:
-                    layer.selectionChanged.disconnect(self.on_map_selection)
-                except TypeError:
-                    pass
+        def remove_old_layers(self, keep=()):
+            """Remove "Discrepancies ..." scratch layers that older versions added to the project,
+            unless one was made permanent or is one of the input layers."""
+            keep_ids = {k.id() for k in keep}
+            old = [lyr for lyr in QgsProject.instance().mapLayers().values()
+                   if lyr.id() not in keep_ids and lyr.providerType() == "memory"
+                   and (lyr.customProperty(RESULT_LAYER_TAG) or RESULT_LAYER_NAME.match(lyr.name()))]
+            if not old:
+                return
+            names = [lyr.name() for lyr in old]
+            QgsProject.instance().removeMapLayers([lyr.id() for lyr in old])
+            self.log(f"Removed {len(names)} previous scratch layer(s): {', '.join(names)}")
 
         # -------------------------------------------------------- results
         def show_results(self):
@@ -1090,58 +1152,18 @@ def make_panel_class():
         def selected_rows(self):
             return sorted({i.row() for i in self.table.selectedItems() if not self.table.isRowHidden(i.row())})
 
-        def result_layer(self, quiet=False):
-            if self.scan_result is None or self.scan_result.layer is None:
-                return None
-            layer = self.scan_result.layer
-            try:
-                alive = QgsProject.instance().mapLayer(layer.id()) is not None
-            except RuntimeError:  # the layer object was deleted
-                alive = False
-            if not alive:
-                if not quiet:
-                    self.log("The Discrepancies layer was removed from the project. Scan again to recreate it.")
-                self.scan_result.layer = None
-                return None
-            return layer
+        def result_layer(self):
+            return self.scan_result.layer if self.scan_result is not None else None
 
         def fids_for_rows(self, rows):
             return [self.table.item(r, ISSUE_COL).data(FID_ROLE) for r in rows]
 
-        # ---------------------------------------------- selection list <-> map
+        # ------------------------------------------------- list -> map
         def on_table_selection(self):
             self.update_buttons()
-            if self._syncing:
-                return
-            layer = self.result_layer()
-            if layer is not None:
-                self._syncing = True
-                layer.selectByIds(self.fids_for_rows(self.selected_rows()))
-                self._syncing = False
-
-        def on_map_selection(self, *_):
-            """Features selected on the map (e.g. with the Select tool) are selected in the list too."""
-            if self._syncing:
-                return
-            layer = self.result_layer(quiet=True)
-            if layer is None:
-                return
-            wanted = set(layer.selectedFeatureIds())
-            self._syncing = True
-            self.table.clearSelection()
-            mode = self.table.selectionMode()
-            self.table.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
-            first = None
-            for r in range(self.table.rowCount()):
-                if self.table.item(r, ISSUE_COL).data(FID_ROLE) in wanted:
-                    self.table.setRowHidden(r, False)
-                    self.table.selectRow(r)
-                    first = r if first is None else first
-            self.table.setSelectionMode(mode)
-            if first is not None:
-                self.table.scrollToItem(self.table.item(first, ISSUE_COL))
-            self._syncing = False
-            self.update_buttons()
+            layer, rows = self.result_layer(), self.selected_rows()
+            if layer is not None and rows and self.iface is not None:
+                self.iface.mapCanvas().flashFeatureIds(layer, self.fids_for_rows(rows))
 
         # ----------------------------------------------------------- zoom
         def zoom_to_rows(self, rows):
@@ -1164,7 +1186,6 @@ def make_panel_class():
             extent.scale(1.5)  # a little context around the discrepancy
             canvas.setExtent(extent)
             canvas.refresh()
-            layer.selectByIds(fids)
             canvas.flashFeatureIds(layer, fids)
 
         # ----------------------------------------------------------- snap
@@ -1221,8 +1242,6 @@ def show_panel():
 
     if main is not None:
         for old in main.findChildren(QDockWidget, PANEL_NAME):
-            if hasattr(old, "disconnect_result_layer"):
-                old.disconnect_result_layer()
             qgis_iface.removeDockWidget(old)
             old.deleteLater()
 

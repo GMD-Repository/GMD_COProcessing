@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- MBI Checker: Gaps and overlaps between barangay boundaries with building points -->
+  <!-- Base polygon A -->
+  <path d="M3 4 L14 4 L13 19 L3 17 Z" fill="#e8f4e6" stroke="#1f5f8b" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- Base polygon B -->
+  <path d="M10 6 L21 5 L20 20 L11 18 Z" fill="#b8e3b4" stroke="#1f5f8b" stroke-width="1.5" stroke-linejoin="round"/>
+  <!-- Overlap area -->
+  <path d="M10 6 L14 5.7 L13 18.5 L11 18 Z" fill="#ff7f00" fill-opacity="0.9" stroke="#d96b00" stroke-width="1" stroke-linejoin="round"/>
+  <!-- Gap sliver -->
+  <path d="M4 17 L11 18 L8 21 L3 20 Z" fill="#e31a1c" fill-opacity="0.85" stroke="#b71517" stroke-width="0.8" stroke-linejoin="round"/>
+  <!-- Building points inside overlap -->
+  <circle cx="12" cy="10" r="1.2" fill="#d32f2f"/>
+  <circle cx="11.8" cy="14" r="1.2" fill="#d32f2f"/>
+  <circle cx="17" cy="11" r="1.2" fill="#1f5f8b"/>
+</svg>
+
