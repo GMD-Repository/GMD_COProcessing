@@ -5,3 +5,6 @@ __pycache__/
 .idea/
 *.qgs~
 *.qgz~
+
+# context-mem
+.context-mem/
