@@ -58,7 +58,7 @@ builds `GMD_COProcessing-<version>.zip` and attaches it to the release.
 - The tag must be a version number and sets the plugin version: tag `v0.2.0` → `version=0.2.0`.
 - The zip and `plugins.xml` are also published to the `plugin-repo` branch. QGIS repository URL
   (*Plugins > Manage and Install Plugins > Settings > Add…*):
-  `https://raw.githubusercontent.com/psacjperez/GMD_COProcessing/plugin-repo/plugins.xml`
+  `https://raw.githubusercontent.com/GMD-Repository/GMD_COProcessing/plugin-repo/plugins.xml`
 - A release marked *pre-release* is packaged with `experimental=True`, otherwise `False`.
 - Files listed as `export-ignore` in `.gitattributes` are left out of the zip.
 
