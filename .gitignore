@@ -5,3 +5,6 @@ __pycache__/
 .idea/
 *.qgs~
 *.qgz~
+
+# temporary local backups
+*.bak*

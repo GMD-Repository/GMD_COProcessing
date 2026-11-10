@@ -14,7 +14,7 @@ name: Release QGIS plugin
 on:
   push:
     branches: [main]
-    paths: ["GMD_COProcessing/**", ".github/workflows/release.yml", ".github/scripts/**"]
+    paths-ignore: ["README.md", ".gitignore", ".gitattributes"]
   release:
     types: [published]
 
@@ -71,13 +71,13 @@ jobs:
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Check Python syntax
-        run: python -m compileall -q "${PLUGIN_DIR}"
+        run: python -m compileall -q -x "/.github/" .
 
       - name: Export plugin files
         run: |
           mkdir -p build
-          # Only the plugin package folder; respects export-ignore entries in .gitattributes
-          git archive --format=tar --prefix="${PLUGIN_DIR}/" "HEAD:${PLUGIN_DIR}" | tar -x -C build
+          # The repo root is the plugin folder; respects export-ignore entries in .gitattributes
+          git archive --format=tar --prefix="${PLUGIN_DIR}/" HEAD | tar -x -C build
 
       - name: Stamp version and links into metadata.txt
         env:
@@ -126,7 +126,7 @@ jobs:
         run: |
           mkdir site
           cp "${PLUGIN_DIR}.${VERSION}.zip" plugins.xml site/
-          cp "${PLUGIN_DIR}/icon.svg" site/
+          cp icon.svg site/
           cd site
           git init -q -b "${REPO_BRANCH}"
           git config user.name "github-actions[bot]"
