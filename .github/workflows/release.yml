@@ -101,3 +101,49 @@ jobs:
           # The branch only ever holds the latest release, so it is replaced each time.
           git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "${REPO_BRANCH}"
           echo "Repository URL: https://raw.githubusercontent.com/${{ github.repository }}/${REPO_BRANCH}/plugins.xml"
+
+  # Emails the maintainer when a release finishes publishing (or fails to).
+  # One-time setup: repo Settings > Secrets and variables > Actions > Secrets:
+  #   MAIL_USERNAME  SMTP login (e.g. your Gmail address)
+  #   MAIL_PASSWORD  SMTP password (Gmail: an App Password, not the account password)
+  #   NOTIFY_EMAIL   address that receives the notification
+  # Optional: MAIL_SERVER (default smtp.gmail.com) and MAIL_PORT (default 465).
+  # Without these secrets the job is skipped and the release is unaffected.
+  notify:
+    needs: package
+    if: always()
+    runs-on: ubuntu-latest
+    env:
+      MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+      MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+      NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+    steps:
+      - name: Check email is configured
+        id: cfg
+        run: |
+          if [ -n "$MAIL_USERNAME" ] && [ -n "$MAIL_PASSWORD" ] && [ -n "$NOTIFY_EMAIL" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Email secrets not set - skipping notification."
+          fi
+
+      - name: Send email
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER || 'smtp.gmail.com' }}
+          server_port: ${{ secrets.MAIL_PORT || 465 }}
+          secure: true
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          to: ${{ secrets.NOTIFY_EMAIL }}
+          from: GMD CO Processing releases <${{ secrets.MAIL_USERNAME }}>
+          subject: "${{ needs.package.result == 'success' && 'Released' || 'FAILED release' }}: GMD CO Processing ${{ github.event.release.tag_name }}"
+          body: |
+            Release ${{ github.event.release.tag_name }} of ${{ github.repository }}: ${{ needs.package.result }}.
+
+            ${{ needs.package.result == 'success' && 'The QGIS plugin repository was updated. In QGIS: Plugins > Manage and Install Plugins > Settings > Reload Repositories, then upgrade GMD CO Processing.' || 'The plugin repository was NOT updated. Check the workflow run for the error.' }}
+
+            Release:  ${{ github.event.release.html_url }}
+            Run log:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            Repository URL: https://raw.githubusercontent.com/${{ github.repository }}/plugin-repo/plugins.xml
