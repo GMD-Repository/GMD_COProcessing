@@ -1,8 +1,8 @@
-"""MBI Checker (Gaps & Overlaps) - checks Barangay boundaries and building points.
+"""EA MBI Checker (Gaps & Overlaps) - checks EA boundaries and building points.
 
-Identifies boundary discrepancies between Barangay polygons:
-  - Overlaps: overlapping boundary areas between adjacent barangays
-  - Gaps: missing areas/slivers between adjacent barangays
+Identifies boundary discrepancies between EA polygons:
+  - Overlaps: overlapping boundary areas between adjacent EAs
+  - Gaps: missing areas/slivers between adjacent EAs
   - Each contiguous overlap / gap is ONE case (case_uuid), even when it runs
     across more than two EAs: involved_areas / involved_eas / involved_bgys /
     count_involved_areas then list every EA involved (used by the MBI EA Selector)
@@ -11,13 +11,15 @@ Identifies boundary discrepancies between Barangay polygons:
 
 How to run:
   - From the GMD CO Processing panel: select the script and click 'Run'.
-  - From the QGIS menu: GMD CO Processing > MBI Tools > MBI Checker (Gaps & Overlaps).
-  - Headless: fill in BGY_LAYER_NAMES and BLDG_LAYER_NAMES in CONFIG below.
+  - From the QGIS menu: GMD CO Processing > EA Tools > EA MBI Checker.
+  - Headless: fill in EA_LAYER_NAMES and BLDG_LAYER_NAMES in CONFIG below.
   - Console / drag-and-drop: drag onto QGIS or run via Python Console editor.
+
+The result layers are added to the project; nothing is exported to disk (the MBI EA Selector exports).
 """
 
 # Menu / panel entry (read by the GMD CO Processing plugin)
-TOOL_NAME = "EA Topology Checker"
+TOOL_NAME = "EA MBI Checker"
 TOOL_GROUP = "EA Tools"
 TOOL_ICON = "icons/mbi_checker.svg"
 
@@ -42,7 +44,6 @@ from qgis.core import (
     QgsProcessingException,
     QgsProcessingFeedback,
     QgsProcessingLayerPostProcessorInterface,
-    QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
     QgsProcessingParameterMultipleLayers,
     QgsProject,
@@ -57,15 +58,11 @@ import processing
 # ============================ CONFIG ============================
 # Layer names exactly as shown in the Layers panel. Leave both empty []
 # to choose the layers in the dialog instead.
-BGY_LAYER_NAMES = []      # e.g. ['Barangay_R1', 'Barangay_R2']
+EA_LAYER_NAMES = []       # e.g. ['EA_R1', 'EA_R2']
 BLDG_LAYER_NAMES = []     # e.g. ['BldgPts_R1', 'BldgPts_R2']
 
 # 0 = Overlaps and Gaps, 1 = Overlaps Only, 2 = Gaps Only
 RUN_MODE = 0
-
-# Export merged MBI layer as GPKG to C:\PSA-GIS\2026 1Map\Preliminary Output
-# (only applies when RUN_MODE = 0)
-EXPORT_MBI = False
 
 # Style (.qml) applied to the output layers. Set to '' to skip styling.
 _LOCAL_STYLE = os.path.join(os.path.dirname(__file__), "styles", "mbi_checker.qml")
@@ -248,58 +245,41 @@ class MBIStylePostProcessor(QgsProcessingLayerPostProcessorInterface):
             layer.triggerRepaint()
 
 
-class GapsOverlaps(QgsProcessingAlgorithm):
+class EAMBIChecker(QgsProcessingAlgorithm):
 
-    INPUT1 = 'INPUT1'
-    INPUT2 = 'INPUT2'
+    EA_LAYERS = 'EA_LAYERS'
+    BLDG_LAYERS = 'BLDG_LAYERS'
     RUN_MODE = 'RUN_MODE'
-    EXPORT_MBI = 'EXPORT_MBI'
 
     def __init__(self):
         super().__init__()
         self.post_processors = []
 
     def name(self):
-        return 'gaps_overlaps_checker'
+        return 'ea_mbi_checker'
 
     def displayName(self):
-        return 'MBI Checker'
+        return 'EA MBI Checker'
 
     def createInstance(self):
-        return GapsOverlaps()
+        return EAMBIChecker()
 
     def initAlgorithm(self, config=None):
         self.addParameter(QgsProcessingParameterMultipleLayers(
-            self.INPUT1, 'Select Barangay Polygon Layer(s)', QgsProcessing.TypeVectorPolygon))
+            self.EA_LAYERS, 'EA Polygon Layer(s)', QgsProcessing.TypeVectorPolygon))
         self.addParameter(QgsProcessingParameterMultipleLayers(
-            self.INPUT2, 'Select Building Point Layer(s)', QgsProcessing.TypeVectorPoint))
+            self.BLDG_LAYERS, 'Building Point Layer(s)', QgsProcessing.TypeVectorPoint))
         self.addParameter(QgsProcessingParameterEnum(
-            self.RUN_MODE, 'Analysis to Run',
+            self.RUN_MODE, 'Check to Run',
             options=['Overlaps and Gaps', 'Overlaps Only', 'Gaps Only'], defaultValue=0))
-        self.addParameter(QgsProcessingParameterBoolean(
-            self.EXPORT_MBI,
-            'Export MBI layers as GPKG to C:\\PSA-GIS\\2026 1Map\\Preliminary Output',
-            defaultValue=False))
 
     def processAlgorithm(self, parameters, context, feedback: QgsProcessingFeedback):
 
-        bgy_list = self.parameterAsLayerList(parameters, self.INPUT1, context)
-        bldg_list = self.parameterAsLayerList(parameters, self.INPUT2, context)
+        bgy_list = self.parameterAsLayerList(parameters, self.EA_LAYERS, context)
+        bldg_list = self.parameterAsLayerList(parameters, self.BLDG_LAYERS, context)
         run_mode = self.parameterAsEnum(parameters, self.RUN_MODE, context)  # Get the selected mode
-        export_folder = r"C:\PSA-GIS\2026 1Map\Preliminary Output"
         style_path = STYLE_PATH
-        export_enabled = self.parameterAsBool(parameters, self.EXPORT_MBI, context)
         self.post_processors = []
-
-        # Create directory if it doesn't exist and export is enabled
-        if export_enabled:
-            if not os.path.exists(export_folder):
-                try:
-                    os.makedirs(export_folder)
-                    feedback.pushInfo(f"Created directory: {export_folder}")
-                except Exception as e:
-                    feedback.reportError(f"Could not create directory {export_folder}: {str(e)}")
-                    export_enabled = False  # Disable export if folder creation fails
 
         run_overlaps = (run_mode == 0 or run_mode == 1)
         run_gaps = (run_mode == 0 or run_mode == 2)
@@ -308,7 +288,7 @@ class GapsOverlaps(QgsProcessingAlgorithm):
 
         # Check for empty lists (which means no layers were selected)
         if not bgy_list:
-            raise QgsProcessingException("Barangay Polygon Layer(s) must be selected.")
+            raise QgsProcessingException("EA Polygon Layer(s) must be selected.")
         if not bldg_list:
             raise QgsProcessingException("Building Point Layer(s) must be selected.")
 
@@ -391,7 +371,7 @@ class GapsOverlaps(QgsProcessingAlgorithm):
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        def export_layer(target, layer_name=f"Gaps and Overlap ({timestamp})", set_style=True):
+        def queue_layer(target, layer_name=f"Gaps and Overlap ({timestamp})", set_style=True):
             if target is None:
                 feedback.reportError(f"Skipping {layer_name}: Layer target is None.")
                 return
@@ -710,7 +690,7 @@ class GapsOverlaps(QgsProcessingAlgorithm):
             summary_final_status_filtered = build_pair_layer(overlap_groups, count_bldg_sf.crs())
 
             feedback.pushInfo("Exporting Overlap Layer")
-            export_layer(summary_final_status_filtered, r'Overlaps')
+            queue_layer(summary_final_status_filtered, r'Overlaps')
 
             # Final progress update for the Overlaps block
             feedback.setProgress(progress_end)
@@ -919,75 +899,7 @@ class GapsOverlaps(QgsProcessingAlgorithm):
             feedback.pushInfo("Writing Gaps Layer")
             gap_summary_final_status_filtered = build_pair_layer(gap_groups, gap_crs)
 
-            export_layer(gap_summary_final_status_filtered, r'Gaps')
-
-            export_file_path = os.path.join(export_folder, f"gaps_overlap_{timestamp}.gpkg")
-
-            def export_layer_final(overlap_layer, gap_layer, file_path):
-                if export_enabled and overlap_layer is not None and gap_layer is not None:
-                    def mbi_extras(mbi_type):
-                        return [
-                            ('mbi_type', f"'{mbi_type}'"),
-                            ('mbi_category', 'NULL'),
-                            ('mbi_status',
-                             "CASE WHEN \"mbi_level\" IN ('1_Inter-Region', '2_Inter-Province') THEN '2_Pending' END"),
-                            ('mbi_remarks', 'NULL'),
-                        ]
-
-                    overlap_layer_refactor = processing.run("native:refactorfields", {
-                        'INPUT': overlap_layer,
-                        'OUTPUT': 'memory:',
-                        'FIELDS_MAPPING': pair_field_mapping(mbi_extras('Overlap'))
-                    }, context=context, feedback=feedback)
-
-                    gap_layer_refactor = processing.run("native:refactorfields", {
-                        'INPUT': gap_layer,
-                        'OUTPUT': 'memory:',
-                        'FIELDS_MAPPING': pair_field_mapping(mbi_extras('Gap'))
-                    }, context=context, feedback=feedback)
-
-                    for_export_layer = processing.run("native:mergevectorlayers", {
-                        'CRS': QgsCoordinateReferenceSystem('EPSG:4326'),
-                        'LAYERS': [
-                            overlap_layer_refactor['OUTPUT'],
-                            gap_layer_refactor['OUTPUT']],
-                        'OUTPUT': 'memory:'
-                    }, context=context, feedback=feedback)
-
-                    # Check if file exists and delete it to allow overwriting
-                    if os.path.exists(file_path):
-                        try:
-                            os.remove(file_path)
-                            feedback.pushInfo(f"Existing file {file_path} found and removed for overwrite.")
-                        except Exception as e:
-                            feedback.reportError(f"Could not remove existing file: {str(e)}")
-
-                    # Also drops the 'layer'/'path' fields added by the merge.
-                    for_export_layer_refactor = processing.run("native:refactorfields", {
-                        'INPUT': for_export_layer['OUTPUT'],
-                        'OUTPUT': file_path,
-                        'FIELDS_MAPPING': pair_field_mapping(
-                            [(n, f'"{n}"') for n, _ in mbi_extras('')])
-                    }, context=context, feedback=feedback)
-
-                    layer_details = QgsProcessingContext.LayerDetails(
-                        f"Gaps and Overlap ({timestamp})",
-                        context.project(),
-                        "OUTPUT"
-                    )
-
-                    processor = MBIStylePostProcessor(style_path)
-                    self.post_processors.append(processor)
-                    layer_details.setPostProcessor(processor)
-
-                    context.addLayerToLoadOnCompletion(file_path, layer_details)
-                    feedback.pushInfo("Layer queued for native loading in group")
-
-            if run_mode == 0:  # Running both gaps and overlaps
-                if summary_final_status_filtered is not None and gap_summary_final_status_filtered is not None:
-                    export_layer_final(summary_final_status_filtered, gap_summary_final_status_filtered, export_file_path)
-                else:
-                    feedback.pushInfo("Skipping merged GPKG export: one or both discrepancy layers are empty or skipped.")
+            queue_layer(gap_summary_final_status_filtered, r'Gaps')
 
             feedback.pushInfo("Done setting layer style")
 
@@ -1038,15 +950,15 @@ def load_results(context):
         print(f"Loaded layer: {details.name} ({layer.featureCount()} features)")
 
 
-def run_mbi_checker():
-    bgy_layers = _resolve_layers(BGY_LAYER_NAMES, QgsWkbTypes.PolygonGeometry, 'Barangay polygon')
+def run_ea_mbi_checker():
+    ea_layers = _resolve_layers(EA_LAYER_NAMES, QgsWkbTypes.PolygonGeometry, 'EA polygon')
     bldg_layers = _resolve_layers(BLDG_LAYER_NAMES, QgsWkbTypes.PointGeometry, 'Building point')
-    print("Barangay layers: " + ", ".join(l.name() for l in bgy_layers))
+    print("EA layers: " + ", ".join(l.name() for l in ea_layers))
     print("Building layers: " + ", ".join(l.name() for l in bldg_layers))
     if STYLE_PATH and not os.path.exists(STYLE_PATH):
         print(f"WARNING: style file not found, outputs will not be styled: {STYLE_PATH}")
 
-    alg = GapsOverlaps()
+    alg = EAMBIChecker()
     alg.initAlgorithm()
 
     context = QgsProcessingContext()
@@ -1055,10 +967,9 @@ def run_mbi_checker():
     context.setFeedback(feedback)
 
     params = {
-        'INPUT1': bgy_layers,
-        'INPUT2': bldg_layers,
+        'EA_LAYERS': ea_layers,
+        'BLDG_LAYERS': bldg_layers,
         'RUN_MODE': RUN_MODE,
-        'EXPORT_MBI': EXPORT_MBI,
     }
 
     start = datetime.now()
@@ -1068,18 +979,18 @@ def run_mbi_checker():
         print(f"ERROR: {e}")
         return
     load_results(context)
-    print(f"MBI Checker finished in {datetime.now() - start}.")
+    print(f"EA MBI Checker finished in {datetime.now() - start}.")
 
 
-def open_mbi_dialog():
-    """Open the MBI Checker dialog."""
+def open_dialog():
+    """Open the EA MBI Checker dialog."""
     try:
         from qgis.utils import iface
         if iface is None or iface.mainWindow() is None:
-            print("MBI Checker dialog requires the QGIS graphical interface.")
+            print("EA MBI Checker dialog requires the QGIS graphical interface.")
             return
     except (ImportError, AttributeError):
-        print("MBI Checker dialog requires the QGIS graphical interface.")
+        print("EA MBI Checker dialog requires the QGIS graphical interface.")
         return
 
     # Restore wait cursor if opened from GMD CO Processing panel
@@ -1089,7 +1000,7 @@ def open_mbi_dialog():
     except Exception:
         pass
 
-    alg = GapsOverlaps()
+    alg = EAMBIChecker()
     provider = QgsApplication.processingRegistry().providerById("script")
     if provider is not None:
         alg.setProvider(provider)
@@ -1098,15 +1009,15 @@ def open_mbi_dialog():
 
 
 # When the file is dragged onto QGIS / run via "Run Script", QGIS itself execs
-# this file and then opens the dialog for the GapsOverlaps class it finds.
+# this file and then opens the dialog for the EAMBIChecker class it finds.
 # That runner execs without __name__, so we must not open a second dialog.
 _RUN_BY_QGIS_SCRIPT_RUNNER = "__name__" not in globals()
 
 if __name__ == "__main__" or _RUN_BY_QGIS_SCRIPT_RUNNER:
-    if BGY_LAYER_NAMES and BLDG_LAYER_NAMES:
-        run_mbi_checker()                 # headless, using the CONFIG layer names
+    if EA_LAYER_NAMES and BLDG_LAYER_NAMES:
+        run_ea_mbi_checker()                 # headless, using the CONFIG layer names
         if _RUN_BY_QGIS_SCRIPT_RUNNER:
-            del GapsOverlaps              # stop QGIS from also opening the dialog
+            del EAMBIChecker              # stop QGIS from also opening the dialog
     elif not _RUN_BY_QGIS_SCRIPT_RUNNER:
-        open_mbi_dialog()                 # pick layers in the dialog
+        open_dialog()                 # pick layers in the dialog
 

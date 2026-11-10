@@ -1,27 +1,37 @@
 r"""
-EA vs Barangay boundary check (QGIS).
+EA vs Barangay boundary check (QGIS), with three check modes chosen in the window:
 
-The barangay boundary is fixed; only the EA is snapped to it. The output is only the discrepancies:
-each feature is just the mismatched area, carrying the attributes of the EA that must be fixed.
+  EA vs BGY    each EA is compared to its barangay; the barangay is fixed, the EA is snapped to it.
+  BGY vs BGY   with a reference barangay layer: each barangay is snapped to the reference barangay with
+               the same geocode. Without one: the barangays are checked against each other.
+  EA vs EA     with a reference EA layer: each EA is snapped to the reference EA with the same ea_geocode.
+               Without one: the EAs are checked against each other.
 
-  Outside BGY           the part of the EA that falls outside its barangay
-  Short of BGY          the barangay land its EA does not reach (all EAs bordering it are listed)
-  No matching barangay  the EA's barangay geocode is not in the barangay layer (the whole EA)
+The output is only the discrepancies: each feature is just the mismatched area, carrying the attributes of
+the feature that must be fixed.
 
-The panel's list shows them, largest first. No layer is added to the project: the discrepancies
-are kept in memory by the panel, for zooming and snapping. Barangays with no EA have nothing to list, so they are named in the log instead.
+  Outside ...      the part of a feature outside its reference (cut off by a snap)
+  Short of ...     reference land the feature does not reach (added by a snap; all bordering features listed)
+  No matching ...  the feature's geocode is not in the reference layer (the whole feature; fix by hand)
+  Overlap          self check: land in two features (cut from the larger one; Switch Fix: the other)
+  Gap              self check: land enclosed by the features but in none (added to the feature with the
+                   longest border along it; Switch Fix: the next bordering feature)
 
-Snapping is done per discrepancy: select rows in the list and press "Snap Selected". Only the EA named in the "Fix EA" column is changed:
+The window's list shows them, largest first. No layer is added to the project: the discrepancies are kept in
+memory by the window, for zooming and snapping. Reference features with no match are named in the log.
 
-  - Outside BGY pieces are cut off the EA.
-  - Short of BGY pieces are added to the EA sharing the longest border with them.
+Snapping is done per discrepancy: select rows in the list and press "Snap Selected". Only the feature named
+in the "Fix" column is changed, and only in the checked layer (the reference is never edited):
+
+  - Outside / Overlap pieces are cut off the feature.
+  - Short / Gap pieces are added to the feature sharing the longest border with them.
   - Holes and parts smaller than the sliver setting that the edit leaves behind are removed.
 
-Before an EA is changed, the new geometry must be valid, not empty, have the expected area, still be valid
-in the EA layer's CRS, fit the layer (single-part layers cannot take several parts), and the EA must not
-have been edited since the scan. Otherwise the row is marked Failed with the reason and the EA is untouched.
+Before a feature is changed, the new geometry must be valid, not empty, have the expected area, still be valid
+in the layer's CRS, fit the layer (single-part layers cannot take several parts), and the feature must not
+have been edited since the scan. Otherwise the row is marked Failed with the reason and it is untouched.
 
-The EA layer is left in edit mode and nothing is written to its file until you save:
+The checked layer is left in edit mode and nothing is written to its file until you save:
 
   Keep    Save Layer Edits
   Revert  Toggle Editing > Discard, or Edit > Undo (one undo step per Snap Selected)
@@ -30,13 +40,13 @@ Only the geometry is changed: attributes such as household counts stay as they a
 Each scan also removes any "Discrepancies ..." scratch layers left in the project by older versions.
 
 Usage:
-  1. Load the barangay layer and the EA layer into the project.
-     To check only part of a layer, set a filter on it (right-click > Filter).
-  2. GMD CO Processing > EA Tools > EA vs Barangay Check.
-     This opens the "EA vs Barangay Check" panel beside the map.
-  3. Pick the two layers and press Scan. Progress, warnings and the summary appear in the Log.
-  4. The Discrepancies list shows every issue: click a row to flash it on the map,
-     double-click to zoom to it. Select the rows to fix and press Snap Selected.
+  1. Load the layers into the project. To check only part of a layer, set a filter on it (right-click > Filter).
+  2. GMD CO Processing > EA Tools > EA vs Barangay Check. This opens the "EA vs Barangay Check" window
+     (same layout as the MBI EA Selector, plus a Help and Information tab).
+  3. Choose the Check Mode, pick the layer to check and (optionally, except for EA vs BGY) the reference
+     layer, then press Scan. Progress, warnings and the summary appear in the Log.
+  4. The Discrepancies list shows every issue: click a row to flash it on the map, double-click to zoom to it.
+     Select the rows to fix (Switch Fix to change which feature takes them) and press Snap Selected.
 """
 # Menu / panel entry (read by the GMD CO Processing plugin)
 TOOL_NAME = "EA vs Barangay Check"
@@ -193,11 +203,18 @@ def clean_geometries(gdf, source):
     return gdf[~dropped]
 
 
+def ea_key(value):
+    """EA key: the full 14-digit EA geocode (None if missing)."""
+    return full_geocode(value) or None
+
+
+# Reference layers (fixed): key, Geocode, Label (name used in notes) and the admin names.
 def prepare_bgy(gdf):
     f = lambda k: pick(gdf, BGY_FIELDS[k])
     return gpd.GeoDataFrame({
         "key": f("geocode").map(bgy_key),
         "Geocode": f("geocode").map(full_geocode),
+        "Label": f("barangay"),
         "Region": f("region"),
         "Province": f("province"),
         "City/Municipality": f("city_mun"),
@@ -205,11 +222,29 @@ def prepare_bgy(gdf):
     }, geometry=gdf.geometry, crs=gdf.crs)
 
 
-def prepare_ea(gdf):
+def prepare_ea_ref(gdf):
+    f = lambda k: pick(gdf, EA_FIELDS[k])
+    code = f("ea_geocode")
+    return gpd.GeoDataFrame({
+        "key": code.map(ea_key),
+        "Geocode": code.map(full_geocode),
+        "Label": f("name").where(f("name").notna(), code.map(full_geocode)),
+        "Region": f("region"),
+        "Province": f("province"),
+        "City/Municipality": f("city_mun"),
+        "Barangay": f("barangay"),
+    }, geometry=gdf.geometry, crs=gdf.crs)
+
+
+# Target layers (snapped): key (what they are matched on), source ids, code / name and admin names.
+def prepare_ea(gdf, key="bgy"):
+    """key='bgy': matched to barangays (EA vs BGY); key='ea': matched by EA geocode (EA vs EA)."""
     f = lambda k: pick(gdf, EA_FIELDS[k])
     ea_code = f("ea_geocode")
+    keys = (f("bgy_geocode").map(bgy_key).fillna(ea_code.map(bgy_key)) if key == "bgy"
+            else ea_code.map(ea_key))
     return gpd.GeoDataFrame({
-        "key": f("bgy_geocode").map(bgy_key).fillna(ea_code.map(bgy_key)),
+        "key": keys,
         "src_fid": gdf["src_fid"],
         "src_hash": gdf["src_hash"],
         "EA Geocode": ea_code.map(full_geocode),
@@ -219,6 +254,49 @@ def prepare_ea(gdf):
         "ea_City/Municipality": f("city_mun"),
         "ea_Barangay": f("barangay"),
     }, geometry=gdf.geometry, crs=gdf.crs)
+
+
+def prepare_bgy_target(gdf):
+    """A barangay layer to be snapped, in the same columns as an EA target."""
+    f = lambda k: pick(gdf, BGY_FIELDS[k])
+    return gpd.GeoDataFrame({
+        "key": f("geocode").map(bgy_key),
+        "src_fid": gdf["src_fid"],
+        "src_hash": gdf["src_hash"],
+        "EA Geocode": f("geocode").map(full_geocode),
+        "EA": f("barangay"),
+        "ea_Region": f("region"),
+        "ea_Province": f("province"),
+        "ea_City/Municipality": f("city_mun"),
+        "ea_Barangay": f("barangay"),
+    }, geometry=gdf.geometry, crs=gdf.crs)
+
+
+# ================= CHECK MODES =================
+# kind: which fields the layer must have ('ea' or 'bgy'). The reference is fixed; the target is snapped.
+MODES = {
+    "ea_bgy": {"label": "EA vs BGY", "target": "ea", "ref": "bgy", "ref_required": True,
+               "unit": "EA", "ref_unit": "barangay",
+               "issues": ("Outside BGY", "Short of BGY", "No matching barangay")},
+    "bgy_bgy": {"label": "BGY vs BGY", "target": "bgy", "ref": "bgy", "ref_required": False,
+                "unit": "barangay", "ref_unit": "reference barangay",
+                "issues": ("Outside ref BGY", "Short of ref BGY", "No matching ref BGY")},
+    "ea_ea": {"label": "EA vs EA", "target": "ea", "ref": "ea", "ref_required": False,
+              "unit": "EA", "ref_unit": "reference EA",
+              "issues": ("Outside ref EA", "Short of ref EA", "No matching ref EA")},
+}
+SELF_ISSUES = ("Overlap", "Gap")
+# Map colours by what a snap does: cut (orange), add (red), nothing (grey); overlaps purple.
+KIND_COLOURS = {"cut": "255,127,0,210", "add": "227,26,28,210", "none": "158,158,158,210",
+                "overlap": "142,68,173,210"}
+
+
+def mode_issues(mode, self_check):
+    """[(issue label, rgba)] for a mode: the legend, filter and map style of its scan."""
+    if self_check:
+        return [(SELF_ISSUES[0], KIND_COLOURS["overlap"]), (SELF_ISSUES[1], KIND_COLOURS["add"])]
+    out, short, orphan = MODES[mode]["issues"]
+    return [(out, KIND_COLOURS["cut"]), (short, KIND_COLOURS["add"]), (orphan, KIND_COLOURS["none"])]
 
 
 def geometry_hash(geom):
@@ -272,15 +350,15 @@ def load_layer(layer, prepare, geocode_fields):
     if missing.all():
         raise RuntimeError(f"No usable geocodes in '{name}'. Expected a field named one of: {', '.join(geocode_fields)}")
     if missing.any():
-        warn(f"{name}: skipped {int(missing.sum())} feature(s) without a usable barangay geocode")
+        warn(f"{name}: skipped {int(missing.sum())} feature(s) without a usable geocode")
     return gpd.GeoDataFrame(out[~missing].reset_index(drop=True), geometry="geometry", crs=DATA_CRS)
 
 
-def merge_duplicate_barangays(bgy):
-    """One feature per barangay: features sharing a geocode are merged."""
+def merge_duplicate_barangays(bgy, what="barangay"):
+    """One feature per reference unit: features sharing a geocode are merged."""
     multi = bgy["key"].duplicated(keep=False)
     if multi.any():
-        warn(f"{bgy.loc[multi, 'key'].nunique():,} barangay geocode(s) appear more than once and were merged")
+        warn(f"{bgy.loc[multi, 'key'].nunique():,} {what} geocode(s) appear more than once and were merged")
         merged = bgy[multi].dissolve(by="key", aggfunc="first").reset_index()
         bgy = pd.concat([bgy[~multi], merged], ignore_index=True)
     return gpd.GeoDataFrame(bgy, geometry="geometry", crs=DATA_CRS).reset_index(drop=True)
@@ -325,21 +403,27 @@ STATUS_FAILED = "Failed"
 STATUS_MANUAL = "Fix manually"
 
 
-def find_discrepancies(ea, bgy, min_area):
-    """The barangay boundary is fixed, so every discrepancy is reported on the EA that must be snapped to it.
+def find_discrepancies(ea, bgy, min_area, mode="ea_bgy"):
+    """The reference is fixed, so every discrepancy is reported on the target feature that must be snapped to it.
 
-    Returns one row per discrepancy, largest first: only the mismatched area, with the EA's attributes.
-    Hidden columns (starting with "_") say which EA a snap changes. Also returns the barangays with no EA.
+    EA vs BGY: EAs matched to their barangay. BGY vs BGY / EA vs EA: each target feature matched to the
+    reference feature with the same geocode. Returns one row per discrepancy, largest first: only the
+    mismatched area, with the target's attributes. Hidden columns (starting with "_") say which feature a
+    snap changes, what it does (_kind: cut / add / none) and which features it could change instead
+    (_candidates, for Switch Fix). Also returns the reference features with no target.
     """
+    m = MODES[mode]
+    unit, ref = m["unit"], m["ref_unit"]
+    issue_out, issue_short, issue_orphan = m["issues"]
     ea = ea.reset_index(drop=True)
     ea["ea_area"] = area_sqm(ea)
     bgy_by_key = bgy.set_index("key")
-    for c in ADMIN:  # the EA's own names; the barangay layer only fills in what the EA layer lacks
+    for c in ADMIN:  # the target's own names; the reference only fills in what the target lacks
         ea[c] = ea[f"ea_{c}"].where(ea[f"ea_{c}"].notna(), ea["key"].map(bgy_by_key[c]))
     has_bgy = ea["key"].isin(bgy_by_key.index)
     inside = ea[has_bgy]
 
-    # ===== OUTSIDE: parts of each EA beyond its own barangay =====
+    # ===== OUTSIDE: parts of each target feature beyond its reference =====
     own_bgy = gpd.GeoSeries(bgy_by_key.geometry.reindex(inside["key"]).values, index=inside.index, crs=DATA_CRS)
     outside = explode_pieces(gpd.GeoDataFrame(
         {"ea_idx": inside.index}, geometry=inside.geometry.difference(own_bgy).values, crs=DATA_CRS), min_area)
@@ -347,26 +431,28 @@ def find_discrepancies(ea, bgy, min_area):
     into = pd.Series("", index=outside.index, dtype=object)
     if len(outside):
         pts = gpd.GeoDataFrame(geometry=outside.representative_point(), crs=DATA_CRS)
-        hit = gpd.sjoin(pts, bgy[["Geocode", "Barangay", "geometry"]], predicate="within", how="left")
+        hit = gpd.sjoin(pts, bgy[["Geocode", "Label", "geometry"]], predicate="within", how="left")
         hit = hit[~hit.index.duplicated()]
-        into = hit["Barangay"].astype(str) + " (" + hit["Geocode"].astype(str) + ")"
-        into = into.where(hit["Geocode"].notna(), "an area outside the barangay layer")
+        into = hit["Label"].astype(str) + " (" + hit["Geocode"].astype(str) + ")"
+        into = into.where(hit["Geocode"].notna(), f"an area outside the {ref} layer")
 
     src = ea.loc[outside["ea_idx"]].reset_index(drop=True)
     outside_out = gpd.GeoDataFrame({
-        "Issue": "Outside BGY",
+        "Issue": issue_out,
         "EA Geocode": src["EA Geocode"],
         **{c: src[c] for c in ADMIN},
         "EA": src["EA"],
         "Area (sqm)": outside["piece_area"],
         "Fix EA": src["EA Geocode"],
         "Status": STATUS_PENDING,
-        "Note": "EA extends into " + into,
+        "Note": f"{unit[0].upper() + unit[1:]} extends into " + into,
         "_ea_idx": outside["ea_idx"].values,
         "_snappable": True,
+        "_kind": "cut",
+        "_candidates": [[int(i)] for i in outside["ea_idx"].values],
     }, geometry=outside.geometry.values, crs=DATA_CRS)
 
-    # ===== SHORT: barangay land its EAs do not reach, named after the EA(s) that must reach it =====
+    # ===== SHORT: reference land its targets do not reach, named after the target(s) that must reach it =====
     gap = uncovered_land(inside, bgy, min_area)
     links = link_gaps_to_eas(gap, inside)
 
@@ -376,20 +462,22 @@ def find_discrepancies(ea, bgy, min_area):
 
     src = ea.loc[links.groupby("gap")["ea_idx"].first().reindex(gap.index).astype(int)].reset_index(drop=True)
     borders = links.groupby("gap")["borders"].first().reindex(gap.index).astype(bool)
-    owner, share = gap_owners(gap, links, inside)
-    owner = owner.reindex(gap.index).astype(int)  # the EA a snap extends
+    owner, share, ranked = gap_owners(gap, links, inside)
+    owner = owner.reindex(gap.index).astype(int)  # the feature a snap extends
     share = share.reindex(gap.index).fillna(1.0)
     n_eas = links.groupby("gap").size().reindex(gap.index).fillna(0).astype(int)
-    # A gap along several EAs, none of which has most of it (e.g. a long hairline strip), would wrap around
-    # the neighbours if it were added to one EA: that must be split by hand.
+    # A gap along several features, none of which has most of it (e.g. a long hairline strip), would wrap
+    # around the neighbours if it were added to one: that must be split by hand (or forced with Switch Fix).
     one_owner = share >= MIN_OWNER_SHARE
     snappable = borders & one_owner
-    note = pd.Series("EA does not reach its barangay boundary here", index=gap.index, dtype=object)
-    note = note.where(borders, "No EA reaches this part of the barangay; nearest EA listed")
+    note = pd.Series(f"{unit[0].upper() + unit[1:]} does not reach its {ref} boundary here", index=gap.index,
+                     dtype=object)
+    note = note.where(borders, f"No {unit} reaches this part of the {ref}; nearest {unit} listed")
     note = note.where(~borders | one_owner,
-                      "Borders " + n_eas.astype(str) + " EAs and none has most of it: split it between them by hand")
+                      "Borders " + n_eas.astype(str) + f" {unit}s and none has most of it: split it between "
+                      "them by hand, or pick one with Switch Fix")
     short_out = gpd.GeoDataFrame({
-        "Issue": "Short of BGY",
+        "Issue": issue_short,
         "EA Geocode": joined("EA Geocode"),
         **{c: src[c] for c in ADMIN},
         "EA": joined("EA"),
@@ -399,21 +487,26 @@ def find_discrepancies(ea, bgy, min_area):
         "Note": note,
         "_ea_idx": owner.values,
         "_snappable": snappable.values,
+        "_kind": "add",
+        "_candidates": [ranked.get(g, []) if b else [] for g, b in zip(gap.index, borders)],
     }, geometry=gap.geometry.values, crs=DATA_CRS)
 
-    # ===== EAs WITH NO BARANGAY: the whole EA is the discrepancy =====
+    # ===== TARGETS WITH NO REFERENCE: the whole feature is the discrepancy =====
     orphan = ea[~has_bgy].reset_index(drop=True)
     orphan_out = gpd.GeoDataFrame({
-        "Issue": "No matching barangay",
+        "Issue": issue_orphan,
         "EA Geocode": orphan["EA Geocode"],
         **{c: orphan[c] for c in ADMIN},
         "EA": orphan["EA"],
         "Area (sqm)": orphan["ea_area"],
         "Fix EA": "",
         "Status": STATUS_MANUAL,
-        "Note": "Barangay geocode " + orphan["key"] + "000000 is not in the barangay layer",
+        "Note": f"{ref[0].upper() + ref[1:]} geocode " + orphan["key"].map(full_geocode)
+                + f" is not in the {ref} layer",
         "_ea_idx": -1,
         "_snappable": False,
+        "_kind": "none",
+        "_candidates": [[] for _ in range(len(orphan))],
     }, geometry=orphan.geometry.values, crs=DATA_CRS)
 
     found = [f for f in (outside_out, short_out, orphan_out) if len(f)]
@@ -425,23 +518,124 @@ def find_discrepancies(ea, bgy, min_area):
 
 
 def gap_owners(gap, links, inside):
-    """The EA that receives each gap (the one sharing the longest border with it), and that EA's share
-    of the gap's border with all EAs (1.0 when a single EA borders it)."""
+    """The feature that receives each gap (the one sharing the longest border with it), that feature's share
+    of the gap's border with all bordering features (1.0 when only one borders it), and per gap every
+    bordering feature, longest shared border first (the Switch Fix order)."""
     gap_m, ea_m = gap.geometry.to_crs(AREA_CRS), inside.geometry.to_crs(AREA_CRS)
     links = links.assign(shared=0.0)
     tied = links["gap"].duplicated(keep=False)
     for row in links[tied].itertuples():
         links.at[row.Index, "shared"] = gap_m[row.gap].boundary.intersection(
             ea_m[row.ea_idx].buffer(TOUCH_TOL_M)).length
-    best = links.sort_values("shared", ascending=False, kind="stable").drop_duplicates("gap").set_index("gap")
+    ordered = links.sort_values("shared", ascending=False, kind="stable")
+    best = ordered.drop_duplicates("gap").set_index("gap")
     total = links.groupby("gap")["shared"].sum().reindex(best.index)
     share = (best["shared"] / total).where(total > 0, 1.0)
-    return best["ea_idx"], share
+    ranked = {int(g): [int(i) for i in grp["ea_idx"]] for g, grp in ordered.groupby("gap", sort=False)}
+    return best["ea_idx"], share, ranked
 
 
-def warn_bgy_overlaps(bgy, min_area):
-    """The barangay layer is taken as fixed, so where barangays overlap, EAs snapped to them overlap as well."""
-    named = gpd.GeoDataFrame({"Barangay": bgy["Barangay"].where(bgy["Barangay"].notna(), bgy["Geocode"])},
+def find_self_discrepancies(ea, min_area, mode="ea_ea"):
+    """One layer checked against itself: overlaps between its features and gaps enclosed by them.
+
+    Overlap: the shared area of two features; a snap cuts it from the larger one (Switch Fix: the other).
+    Gap: a hole in the union of the features; a snap adds it to the feature with the longest border along it.
+    """
+    unit = MODES[mode]["unit"]
+    ea = ea.reset_index(drop=True)
+    ea["ea_area"] = area_sqm(ea)
+    for c in ADMIN:
+        ea[c] = ea[f"ea_{c}"]
+    found = []
+
+    # ===== OVERLAPS (pairwise) =====
+    shapes = gpd.GeoDataFrame(geometry=ea.geometry, crs=DATA_CRS)
+    pairs = gpd.sjoin(shapes, shapes, predicate="intersects")
+    pairs = pairs[pairs.index < pairs["index_right"]]
+    if len(pairs):
+        a_idx, b_idx = pairs.index.values, pairs["index_right"].values
+        shared = shapely.intersection(ea.geometry.to_numpy()[a_idx], ea.geometry.to_numpy()[b_idx])
+        pieces = explode_pieces(gpd.GeoDataFrame({"a": a_idx, "b": b_idx}, geometry=shared, crs=DATA_CRS),
+                                min_area)
+        if len(pieces):
+            a, b = pieces["a"].astype(int).values, pieces["b"].astype(int).values
+            area = ea["ea_area"].values
+            fix = [x if area[x] >= area[y] else y for x, y in zip(a, b)]  # cut from the larger feature
+            keep = [y if f == x else x for x, y, f in zip(a, b, fix)]
+            src = ea.loc[fix].reset_index(drop=True)
+            codes = ea["EA Geocode"].astype(str).values
+            names = ea["EA"].where(ea["EA"].notna(), "").astype(str).values
+            found.append(gpd.GeoDataFrame({
+                "Issue": SELF_ISSUES[0],
+                "EA Geocode": [f"{codes[x]}, {codes[y]}" for x, y in zip(a, b)],
+                **{c: src[c] for c in ADMIN},
+                "EA": [", ".join(n for n in (names[x], names[y]) if n) for x, y in zip(a, b)],
+                "Area (sqm)": pieces["piece_area"].values,
+                "Fix EA": codes[fix],
+                "Status": STATUS_PENDING,
+                "Note": [f"{unit[0].upper() + unit[1:]}s {codes[x]} and {codes[y]} overlap: cut from {codes[f]} "
+                         f"(keep in {codes[k]})" for x, y, f, k in zip(a, b, fix, keep)],
+                "_ea_idx": fix,
+                "_snappable": True,
+                "_kind": "cut",
+                "_candidates": [[f, k] for f, k in zip(fix, keep)],
+            }, geometry=pieces.geometry.values, crs=DATA_CRS))
+
+    # ===== GAPS: holes enclosed by the features =====
+    union = shapely.union_all(ea.geometry.to_numpy())
+    holes = [shapely.Polygon(ring) for poly in shapely.get_parts(union) if poly.geom_type == "Polygon"
+             for ring in poly.interiors]
+    gap = explode_pieces(gpd.GeoDataFrame(geometry=holes, crs=DATA_CRS), min_area) if holes else \
+        gpd.GeoDataFrame({"piece_area": []}, geometry=[], crs=DATA_CRS)
+    if len(gap):
+        gap_m = gpd.GeoDataFrame(geometry=gap.geometry.to_crs(AREA_CRS).buffer(TOUCH_TOL_M).values, crs=AREA_CRS)
+        near = gpd.sjoin(gap_m, gpd.GeoDataFrame(geometry=ea.geometry.to_crs(AREA_CRS), crs=AREA_CRS),
+                         predicate="intersects")
+        links = pd.DataFrame({"gap": near.index.astype(int), "ea_idx": near["index_right"].astype(int).values,
+                              "borders": True})
+        owner, share, ranked = gap_owners(gap, links, ea)
+        owner = owner.reindex(gap.index).fillna(-1).astype(int)
+        share = share.reindex(gap.index).fillna(0.0)
+        n_eas = links.groupby("gap").size().reindex(gap.index).fillna(0).astype(int)
+        snappable = (owner >= 0) & (share >= MIN_OWNER_SHARE)
+        codes = ea["EA Geocode"].astype(str)
+        joined = links.assign(code=codes.reindex(links["ea_idx"]).values).groupby("gap")["code"].agg(
+            lambda s: ", ".join(sorted(set(s)))).reindex(gap.index).fillna("")
+        names = links.assign(n=ea["EA"].reindex(links["ea_idx"]).values).groupby("gap")["n"].agg(
+            lambda s: ", ".join(sorted(set(s.dropna().astype(str))))).reindex(gap.index).fillna("")
+        src = ea.loc[owner.clip(lower=0)].reset_index(drop=True)
+        note = pd.Series(f"Gap between {unit}s: added to the one with the longest border along it",
+                         index=gap.index, dtype=object)
+        note = note.where(snappable, "Borders " + n_eas.astype(str) + f" {unit}s and none has most of it: split it "
+                          "between them by hand, or pick one with Switch Fix")
+        found.append(gpd.GeoDataFrame({
+            "Issue": SELF_ISSUES[1],
+            "EA Geocode": joined.values,
+            **{c: src[c].values for c in ADMIN},
+            "EA": names.values,
+            "Area (sqm)": gap["piece_area"].values,
+            "Fix EA": pd.Series(codes.reindex(owner.values).values, index=gap.index).where(snappable, "").values,
+            "Status": pd.Series(STATUS_PENDING, index=gap.index, dtype=object).where(snappable, STATUS_MANUAL).values,
+            "Note": note.values,
+            "_ea_idx": owner.values,
+            "_snappable": snappable.values,
+            "_kind": "add",
+            "_candidates": [ranked.get(int(g), []) for g in gap.index],
+        }, geometry=gap.geometry.values, crs=DATA_CRS))
+
+    if not found:
+        return gpd.GeoDataFrame({c: [] for c in ["Issue", *TABLE_KEYS, "_ea_idx", "_snappable", "_kind",
+                                                  "_candidates"]}, geometry=[], crs=DATA_CRS)
+    out = pd.concat(found, ignore_index=True).sort_values("Area (sqm)", ascending=False, kind="stable")
+    return gpd.GeoDataFrame(out.reset_index(drop=True), geometry="geometry", crs=DATA_CRS)
+
+
+TABLE_KEYS = ["Status", "EA Geocode", "Fix EA", "EA", *ADMIN, "Area (sqm)", "Note"]
+
+
+def warn_bgy_overlaps(bgy, min_area, what="barangays"):
+    """The reference is taken as fixed, so where its features overlap, targets snapped to them overlap as well."""
+    named = gpd.GeoDataFrame({"Barangay": bgy["Label"].where(bgy["Label"].notna(), bgy["Geocode"])},
                              geometry=bgy.geometry, crs=DATA_CRS)
     pairs = gpd.sjoin(named, named, predicate="intersects")
     pairs = pairs[pairs.index < pairs["index_right"]]
@@ -454,7 +648,7 @@ def warn_bgy_overlaps(bgy, min_area):
     if len(pairs):
         names = [f"{r.Barangay_left} / {r.Barangay_right} ({r.area:,.0f} sqm)" for r in pairs.head(10).itertuples()]
         more = f" ... and {len(pairs) - 10:,} more" if len(pairs) > 10 else ""
-        warn(f"{len(pairs):,} pair(s) of barangays overlap in the barangay layer, so EAs snapped to them "
+        warn(f"{len(pairs):,} pair(s) of {what} overlap in the reference layer, so features snapped to them "
              f"overlap there too: {', '.join(names)}{more}")
 
 
@@ -577,25 +771,65 @@ def to_layer_geometry(geom, ea_layer):
 class Scan:
     """Everything a scan found, kept so that selected discrepancies can be snapped afterwards."""
 
-    def __init__(self, ea_layer, ea, discrepancies, layer, fids, min_area):
-        self.ea_layer = ea_layer
-        self.ea = ea                        # EAs as scanned (lat/lon); updated after each snap
+    def __init__(self, ea_layer, ea, discrepancies, layer, fids, min_area, mode="ea_bgy", self_check=False):
+        self.ea_layer = ea_layer            # the target layer (the one snapped)
+        self.ea = ea                        # target features as scanned (lat/lon); updated after each snap
         self.discrepancies = discrepancies  # one row per discrepancy; Status updated after each snap
         self.layer = layer                  # in-memory Discrepancies layer, not in the project (None if none)
         self.fids = fids                    # its feature id for each discrepancy row
         self.min_area = min_area
+        self.mode = mode
+        self.self_check = self_check        # True: one layer checked against itself (overlaps / gaps)
+        self.issues = mode_issues(mode, self_check)
+        self.unit = MODES[mode]["unit"]
         self.messages = {}                  # row -> why it failed / what changed
+
+
+def _set_layer_values(scan, rows, columns):
+    """Copy the given columns of the discrepancy rows into the scratch Discrepancies layer."""
+    if scan.layer is None:
+        return
+    idx = {c: scan.layer.fields().indexOf(c) for c in columns}
+    changes = {scan.fids[r]: {i: scan.discrepancies.at[r, c] for c, i in idx.items() if i >= 0} for r in rows}
+    if changes:
+        scan.layer.dataProvider().changeAttributeValues(changes)
+        scan.layer.triggerRepaint()
+
+
+def switch_fix(scan, row):
+    """Give a discrepancy to the next feature that could take it (overlap: cut it from the other feature;
+    gap: add it to the next bordering feature). Returns the new Fix code, or None if there is no other."""
+    d = scan.discrepancies
+    cands = list(d.at[row, "_candidates"] or [])
+    if d.at[row, "Status"] == STATUS_DONE or not cands or (len(cands) < 2 and bool(d.at[row, "_snappable"])):
+        return None
+    cur = int(d.at[row, "_ea_idx"])
+    nxt = cands[(cands.index(cur) + 1) % len(cands)] if cur in cands and bool(d.at[row, "_snappable"]) else cands[0]
+    code = scan.ea.at[nxt, "EA Geocode"]
+    d.at[row, "_ea_idx"] = nxt
+    d.at[row, "_snappable"] = True
+    d.at[row, "Fix EA"] = code
+    d.at[row, "Status"] = STATUS_PENDING
+    if d.at[row, "_kind"] == "cut" and len(cands) == 2:
+        other = scan.ea.at[cands[1 - cands.index(nxt)], "EA Geocode"]
+        d.at[row, "Note"] = f"Overlap: cut from {code} (keep in {other}). Chosen with Switch Fix"
+    else:
+        d.at[row, "Note"] = f"Add to {code}. Chosen with Switch Fix"
+    scan.messages.pop(row, None)
+    _set_layer_values(scan, [row], ["Fix EA", "Status", "Note"])
+    return code
 
 
 def snap_rows(scan, rows):
     """Snap the selected discrepancy rows. Returns {row: (status, message)} for the rows it handled.
 
-    Rows are grouped by the EA they change, so each EA is edited once. All changes go to the EA layer's
-    edit buffer as one undo step; nothing is saved.
+    Rows are grouped by the feature they change, so each feature is edited once. All changes go to the
+    target layer's edit buffer as one undo step; nothing is saved.
     """
     from qgis.core import QgsWkbTypes
 
-    d, ea, ea_layer = scan.discrepancies, scan.ea, scan.ea_layer
+    d, ea, ea_layer, unit = scan.discrepancies, scan.ea, scan.ea_layer, scan.unit
+    Unit = unit[0].upper() + unit[1:]
     outcome, todo = {}, {}
     for r in rows:
         status = d.at[r, "Status"]
@@ -612,7 +846,7 @@ def snap_rows(scan, rows):
         code = ea.at[idx, "EA Geocode"]
 
         def fail(message):
-            outcome.update({r: (STATUS_FAILED, f"EA {code} not changed: {message}") for r in ea_rows})
+            outcome.update({r: (STATUS_FAILED, f"{Unit} {code} not changed: {message}") for r in ea_rows})
 
         fid = int(ea.at[idx, "src_fid"])
         feature = ea_layer.getFeature(fid)
@@ -623,8 +857,8 @@ def snap_rows(scan, rows):
             fail("it was edited after the scan. Scan again")
             continue
 
-        cut_rows = [r for r in ea_rows if d.at[r, "Issue"] == "Outside BGY"]
-        add_rows = [r for r in ea_rows if d.at[r, "Issue"] == "Short of BGY"]
+        cut_rows = [r for r in ea_rows if d.at[r, "_kind"] == "cut"]
+        add_rows = [r for r in ea_rows if d.at[r, "_kind"] == "add"]
         old = ea.geometry[idx]
         new, why = snapped_geometry(old, [d.geometry[r] for r in cut_rows], [d.geometry[r] for r in add_rows],
                                     scan.min_area)
@@ -657,37 +891,31 @@ def snap_rows(scan, rows):
                 outcome.update({r: (STATUS_FAILED, f"'{ea_layer.name()}' cannot be edited") for r in ea_rows})
             edits = []
     if edits:
-        ea_layer.beginEditCommand(f"Snap {len(edits)} EA(s) to barangay boundaries")
+        what = "overlaps / gaps" if scan.self_check else f"{MODES[scan.mode]['ref_unit']} boundaries"
+        ea_layer.beginEditCommand(f"Snap {len(edits)} {unit}(s) to {what}")
         for idx, ea_rows, fid, geom, new, old_area, new_area in edits:
             code = ea.at[idx, "EA Geocode"]
             if ea_layer.changeGeometry(fid, geom):
                 ea.at[idx, "geometry"] = new
                 ea.at[idx, "src_hash"] = geometry_hash(ea_layer.getFeature(fid).geometry())
-                msg = f"EA {code} snapped: {old_area:,.0f} -> {new_area:,.0f} sqm"
+                msg = f"{Unit} {code} snapped: {old_area:,.0f} -> {new_area:,.0f} sqm"
                 outcome.update({r: (STATUS_DONE, msg) for r in ea_rows})
             else:
-                outcome.update({r: (STATUS_FAILED, f"EA {code} not changed: the layer refused the edit")
+                outcome.update({r: (STATUS_FAILED, f"{Unit} {code} not changed: the layer refused the edit")
                                 for r in ea_rows})
         ea_layer.endEditCommand()
         ea_layer.triggerRepaint()
 
     # Record the result in the scan, and in the Discrepancies layer's Status field.
-    changes = {}
-    status_field = scan.layer.fields().indexOf("Status") if scan.layer is not None else -1
     for r, (status, message) in outcome.items():
         d.at[r, "Status"] = status
         scan.messages[r] = message
-        if status_field >= 0:
-            changes[scan.fids[r]] = {status_field: status}
-    if changes:
-        scan.layer.dataProvider().changeAttributeValues(changes)
-        scan.layer.triggerRepaint()
+    _set_layer_values(scan, list(outcome), ["Status"])
     return outcome
 
 
 # ================= QGIS OUTPUT =================
-ISSUE_COLOURS = [("Outside BGY", "255,127,0,210"), ("Short of BGY", "227,26,28,210"),
-                 ("No matching barangay", "158,158,158,210")]
+ISSUE_COLOURS = mode_issues("ea_bgy", False)  # EA vs BGY (kept for older callers)
 
 
 def categorize(lyr, field, colours):
@@ -700,7 +928,7 @@ def categorize(lyr, field, colours):
         field, [QgsRendererCategory(value, fill(color), value) for value, color in colours]))
 
 
-def to_memory_layer(df, name):
+def to_memory_layer(df, name, colours=None):
     """GeoDataFrame -> styled MultiPolygon scratch layer (columns starting with "_" are left out)."""
     from qgis.PyQt.QtCore import QVariant
     from qgis.core import QgsFeature, QgsField, QgsGeometry, QgsVectorLayer
@@ -729,7 +957,7 @@ def to_memory_layer(df, name):
     if not ok:
         raise RuntimeError(f"Could not write the features of '{name}'")
     lyr.updateExtents()
-    categorize(lyr, "Issue", ISSUE_COLOURS)
+    categorize(lyr, "Issue", colours or ISSUE_COLOURS)
     return lyr, [f.id() for f in added]  # feature ids in the same order as the rows of df
 
 
@@ -738,34 +966,61 @@ RESULT_LAYER_NAME = re.compile(r"^Discrepancies \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d
 
 
 # ================= RUN =================
-def run_check(bgy_layer, ea_layer, min_area, step=print):
+def _load_target(layer, mode):
+    kind = MODES[mode]["target"]
+    if kind == "bgy":
+        return load_layer(layer, prepare_bgy_target, BGY_FIELDS["geocode"])
+    if mode == "ea_bgy":
+        return load_layer(layer, prepare_ea, EA_FIELDS["bgy_geocode"] + EA_FIELDS["ea_geocode"])
+    return load_layer(layer, lambda g: prepare_ea(g, key="ea"), EA_FIELDS["ea_geocode"])
+
+
+def _load_reference(layer, mode):
+    if MODES[mode]["ref"] == "bgy":
+        return merge_duplicate_barangays(load_layer(layer, prepare_bgy, BGY_FIELDS["geocode"]))
+    return merge_duplicate_barangays(load_layer(layer, prepare_ea_ref, EA_FIELDS["ea_geocode"]), "EA")
+
+
+def run_check(bgy_layer, ea_layer, min_area, step=print, mode="ea_bgy"):
     """Finds the discrepancies and returns a Scan (its layer is kept in memory, not added to the project).
 
-    Nothing in the EA layer is changed: use snap_rows() on the discrepancies to fix.
+    bgy_layer is the fixed reference, ea_layer the target that gets snapped. In BGY vs BGY and EA vs EA
+    the reference is optional: without it (None) the target is checked against itself for overlaps and
+    gaps. Nothing is changed: use snap_rows() on the discrepancies to fix.
     """
+    m = MODES[mode]
+    unit = m["unit"]
     WARNINGS.clear()
-    step("Loading barangay layer...")
-    bgy = merge_duplicate_barangays(load_layer(bgy_layer, prepare_bgy, BGY_FIELDS["geocode"]))
-    step("Loading EA layer...")
-    ea = load_layer(ea_layer, prepare_ea, EA_FIELDS["bgy_geocode"] + EA_FIELDS["ea_geocode"])
-    step("Comparing EAs to barangays...")
-    discrepancies, no_ea = find_discrepancies(ea, bgy, min_area)
-    warn_bgy_overlaps(bgy, min_area)
-
-    if len(no_ea):
-        names = [f"{row['Barangay']} ({row['Geocode']})" for _, row in no_ea.head(10).iterrows()]
-        more = f" ... and {len(no_ea) - 10:,} more" if len(no_ea) > 10 else ""
-        warn(f"{len(no_ea):,} barangay(s) have no EA, so they are not in the output: {', '.join(names)}{more}")
+    self_check = bgy_layer is None
+    if self_check and m["ref_required"]:
+        raise ValueError(f"{m['label']} needs a {m['ref_unit']} layer")
+    step(f"Loading {unit} layer...")
+    ea = _load_target(ea_layer, mode)
+    if self_check:
+        step(f"Checking the {unit}s against each other (overlaps and gaps)...")
+        discrepancies = find_self_discrepancies(ea, min_area, mode)
+    else:
+        step(f"Loading {m['ref_unit']} layer...")
+        bgy = _load_reference(bgy_layer, mode)
+        step(f"Comparing {unit}s to the {m['ref_unit']}s...")
+        discrepancies, no_ea = find_discrepancies(ea, bgy, min_area, mode)
+        warn_bgy_overlaps(bgy, min_area, f"{m['ref_unit']}s")
+        if len(no_ea):
+            names = [f"{row['Label']} ({row['Geocode']})" for _, row in no_ea.head(10).iterrows()]
+            more = f" ... and {len(no_ea) - 10:,} more" if len(no_ea) > 10 else ""
+            warn(f"{len(no_ea):,} {m['ref_unit']}(s) have no {unit}, so they are not in the output: "
+                 f"{', '.join(names)}{more}")
 
     layer, fids = None, []
     if len(discrepancies):
         step("Creating the output layer...")
-        layer, fids = to_memory_layer(discrepancies, f"Discrepancies {datetime.now():%Y-%m-%d %H:%M:%S}")
-    return Scan(ea_layer, ea, discrepancies, layer, fids, min_area)
+        layer, fids = to_memory_layer(discrepancies, f"Discrepancies {datetime.now():%Y-%m-%d %H:%M:%S}",
+                                      mode_issues(mode, self_check))
+    return Scan(ea_layer, ea, discrepancies, layer, fids, min_area, mode, self_check)
 
 
 # ================= RESULT TEXT =================
-def result_message(discrepancies, include_warnings=True):
+def result_message(discrepancies, include_warnings=True, scan=None):
     if len(discrepancies):
         counts = discrepancies["Issue"].value_counts()
         msg = f"Discrepancies found: {len(discrepancies):,}\n"
@@ -774,6 +1029,10 @@ def result_message(discrepancies, include_warnings=True):
         if manual:
             msg += f"\n  ({manual:,} must be fixed by hand)"
         msg += "\n\nTo fix: select rows in the list and press Snap Selected."
+    elif scan is not None and scan.self_check:
+        msg = f"No overlaps or gaps between the {scan.unit}s."
+    elif scan is not None:
+        msg = f"All {scan.unit}s are snapped to their {MODES[scan.mode]['ref_unit']} boundaries."
     else:
         msg = "All EAs are snapped to their barangay boundaries."
     if include_warnings and WARNINGS:
@@ -781,15 +1040,204 @@ def result_message(discrepancies, include_warnings=True):
     return msg
 
 
-# ================= PANEL (UI) =================
-PANEL_NAME = "EAvsBarangayCheckDock"
-PANEL_TITLE = "EA vs Barangay Check"
+# ================= WINDOW (UI) =================
+# Same look as the MBI EA Selector: title, tabs (tool + Help and Information), inputs on the left,
+# results / actions / log on the right, light and dark themes.
+DIALOG_NAME = "EAvsBarangayCheckDialog"
+DIALOG_TITLE = "EA vs Barangay Check"
+DIALOG_SUBTITLE = ("Check EA and barangay boundaries (EA vs BGY, BGY vs BGY or EA vs EA), "
+                   "then snap the features that do not match.")
 TABLE_COLUMNS = ["Issue", "Status", "EA Geocode", "Fix EA", "EA", "Barangay", "City/Municipality", "Area (sqm)", "Note"]
+SEARCH_COLUMNS = ["EA Geocode", "Fix EA", "EA", "Barangay", "City/Municipality", "Note"]
+# Column headers shown per kind of target layer (the data columns keep their names).
+HEADER_LABELS = {"ea": {}, "bgy": {"EA Geocode": "BGY Geocode", "Fix EA": "Fix BGY", "EA": "Name"}}
 STATUS_COLOURS = {STATUS_DONE: "#2e7d32", STATUS_FAILED: "#c62828", STATUS_MANUAL: "#757575"}
+GRP_STYLE = ("QGroupBox { font-weight:600; margin-top:6px; } "
+             "QGroupBox::title { subcontrol-origin:margin; left:8px; }")
+LEFT_WIDTH = 315
+
+NO_RESULTS = "No scan yet. Choose a check mode and the layers on the left, then click Scan."
+
+# Per mode: titles of the two layer boxes, and what the mode does (shown under the radio buttons).
+MODE_TEXT = {
+    "ea_bgy": {"target": "EA Layer (snapped)", "ref": "Barangay Layer (fixed reference)",
+               "hint": "Each EA is compared to its barangay; the EA is snapped to the barangay boundary."},
+    "bgy_bgy": {"target": "Barangay Layer (checked and snapped)", "ref": "Reference Barangay Layer (optional)",
+                "hint": "With a reference: each barangay is snapped to the reference barangay with the same "
+                        "geocode. Without: the barangays are checked against each other for overlaps and gaps."},
+    "ea_ea": {"target": "EA Layer (checked and snapped)", "ref": "Reference EA Layer (optional)",
+              "hint": "With a reference: each EA is snapped to the reference EA with the same ea_geocode. "
+                      "Without: the EAs are checked against each other for overlaps and gaps."},
+}
+
+# Light / dark palettes (same values as the MBI EA Selector)
+THEMES = {
+    False: {
+        "title": "#2C3E50", "sub": "#7F8C8D", "line": "#BDC3C7", "hint": "#455a64",
+        "summary": "#37474f",
+        "log": ("background: #FFFFFF; color: #1F2937; font-family: Consolas, monospace; "
+                "font-size: 11px; border: 1px solid #BDC3C7;"),
+        "table": "",
+        "tabs": """
+            QTabBar::tab {
+                font-weight: bold; font-size: 12px; min-width: 180px; padding: 10px 24px;
+                margin-right: 2px; background-color: #EAEDED; color: #2C3E50;
+                border-top-left-radius: 4px; border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected { background-color: #FFFFFF; color: #2980B9;
+                                    border-bottom: 3px solid #3498DB; }
+            QTabBar::tab:hover:!selected { background-color: #D5D8DC; }
+            QTabWidget::pane { border: 1px solid #BDC3C7; }
+        """,
+        "help": ("QTextBrowser { background-color: #ffffff; color: #1f2937; font-size: 12px;"
+                 " border: 1px solid #d1d5db; border-radius: 4px; padding: 8px; }"),
+    },
+    True: {
+        "title": "#ECEFF1", "sub": "#B0BEC5", "line": "#455A64", "hint": "#B0BEC5",
+        "summary": "#ECEFF1",
+        "log": ("background: #1E2327; color: #ECEFF1; font-family: Consolas, monospace; "
+                "font-size: 11px; border: 1px solid #37474F;"),
+        "table": """
+            QTableWidget { background-color: #263238; alternate-background-color: #1E2327;
+                           color: #ECEFF1; selection-background-color: #1976D2;
+                           selection-color: white; gridline-color: #37474F; }
+            QHeaderView::section { background-color: #37474F; color: #ECEFF1;
+                                   border: 1px solid #455A64; padding: 4px; }
+            QTableCornerButton::section { background-color: #37474F; }
+        """,
+        "tabs": """
+            QTabBar::tab {
+                font-weight: bold; font-size: 12px; min-width: 180px; padding: 10px 24px;
+                margin-right: 2px; background-color: #263238; color: #B0BEC5;
+                border-top-left-radius: 4px; border-top-right-radius: 4px;
+            }
+            QTabBar::tab:selected { background-color: #37474F; color: #4FC3F7;
+                                    border-bottom: 3px solid #29B6F6; }
+            QTabBar::tab:hover:!selected { background-color: #324148; color: #ECEFF1; }
+            QTabWidget::pane { border: 1px solid #455A64; }
+        """,
+        "help": ("QTextBrowser { background-color: #263238; color: #ECEFF1; font-size: 12px;"
+                 " border: 1px solid #455A64; border-radius: 4px; padding: 8px; }"),
+    },
+}
+# Help HTML colour swaps for dark mode
+HELP_DARK_SWAPS = [("#111827", "#ECEFF1"), ("#1f2937", "#ECEFF1"), ("#374151", "#B0BEC5"),
+                   ("#4b5563", "#B0BEC5"), ("#f9fafb", "#1E2327"), ("#e5e7eb", "#455A64")]
+
+_ROW = '<tr{bg}><td style="border:1px solid #e5e7eb;"><b>{a}</b></td><td style="border:1px solid #e5e7eb;">{b}</td></tr>'
+
+
+def _help_table(rows):
+    body = "".join(_ROW.format(bg=' style="background:#f9fafb;"' if i % 2 == 0 else "", a=a, b=b)
+                   for i, (a, b) in enumerate(rows))
+    return f'<table cellspacing="0" cellpadding="4" style="border-collapse:collapse; width:100%;">{body}</table>'
+
+
+HELP_HTML = f"""
+<div style="font-family:'Segoe UI',Arial,sans-serif; color:#1f2937; font-size:12px; line-height:1.5;">
+  <div style="border-bottom:2px solid #374151; padding-bottom:8px; margin-bottom:14px;">
+    <h2 style="margin:0 0 4px 0; color:#111827; font-size:17px;">EA vs Barangay Check</h2>
+    <div style="color:#4b5563;">Find where EA or barangay boundaries do not match, then snap them</div>
+  </div>
+
+  <h3 style="color:#111827; margin:12px 0 4px 0;">Quick Start</h3>
+  <ol style="margin-top:0;">
+    <li>Load the layers into the project. To check only part of a layer, set a filter on it first
+        (right-click the layer &gt; Filter).</li>
+    <li>Under <b>Check Mode</b>, choose <b>EA vs BGY</b>, <b>BGY vs BGY</b> or <b>EA vs EA</b>.</li>
+    <li>Pick the layer to check (it is the one that gets snapped) and, if the mode uses one, the reference
+        layer (fixed, never changed). Layers are detected from their fields and names; pick them by hand if
+        the guess is wrong.</li>
+    <li>Click <b>Scan</b>. Progress and warnings appear in the Log.</li>
+    <li>Review the <b>Discrepancies</b> list: click a row to flash it on the map, double-click to zoom.</li>
+    <li>Select the rows to fix (Ctrl/Shift+click for several, or <b>Select Not Snapped</b>) and click
+        <b>Snap Selected</b>.</li>
+    <li>Check the result on the map, then keep it with <b>Save Layer Edits</b> in QGIS.</li>
+  </ol>
+
+  <h3 style="color:#111827; margin:12px 0 4px 0;">Check modes</h3>
+  {_help_table([
+      ("EA vs BGY", "Each EA is compared to its barangay (matched by <code>bgy_geocode</code>, else the first 8 "
+                    "digits of <code>ea_geocode</code>). The barangay layer is the fixed reference; the EAs are "
+                    "snapped to it. A barangay layer is required."),
+      ("BGY vs BGY", "<b>With a reference barangay layer:</b> each barangay is snapped to the reference barangay "
+                     "with the same <code>geocode</code> (e.g. your barangays vs the official boundary).<br>"
+                     "<b>Without a reference</b> (leave it empty): the barangays are checked against each other "
+                     "for overlaps and gaps."),
+      ("EA vs EA", "<b>With a reference EA layer:</b> each EA is snapped to the reference EA with the same "
+                   "<code>ea_geocode</code> (e.g. an updated EA layer vs the previous one).<br>"
+                   "<b>Without a reference</b> (leave it empty): the EAs are checked against each other for "
+                   "overlaps and gaps."),
+  ])}
+  <p style="margin:6px 0 0 0;"><b>Ignore slivers below</b>: differences smaller than this area (sqm) are treated
+     as slivers and not listed.</p>
+
+  <h3 style="color:#111827; margin:12px 0 4px 0;">Issues in the list</h3>
+  {_help_table([
+      ("Outside &hellip;", "The part of a feature outside its reference (<i>Outside BGY</i>, <i>Outside ref BGY</i>, "
+                           "<i>Outside ref EA</i>). Snapping cuts it off."),
+      ("Short of &hellip;", "Reference land the feature does not reach. Snapping adds it to the feature that shares "
+                            "the longest border with it (all bordering features are named)."),
+      ("No matching &hellip;", "The feature's geocode is not in the reference layer. Fix it by hand."),
+      ("Overlap", "<i>Self check.</i> Two features cover the same land. Snapping cuts it from the larger one; "
+                  "use <b>Switch Fix</b> to cut it from the other one instead."),
+      ("Gap", "<i>Self check.</i> Land enclosed by the features but in none of them. Snapping adds it to the "
+              "feature with the longest border along it; <b>Switch Fix</b> picks the next bordering feature."),
+  ])}
+  <p style="margin:6px 0 0 0;">Each row names the feature to change in <b>Fix EA</b> / <b>Fix BGY</b>. Use the
+     <b>Show</b> list to filter by issue or status, and the search box to find a name, geocode or barangay.
+     A self check only finds gaps <i>enclosed</i> by the features; land beyond the layer's outer edge is not
+     a gap.</p>
+
+  <h3 style="color:#111827; margin:12px 0 4px 0;">Buttons</h3>
+  {_help_table([
+      ("Select Not Snapped", "Selects every listed row that can still be snapped."),
+      ("Zoom to Selected", "Zooms the map to the selected discrepancies."),
+      ("Switch Fix", "For overlaps and gaps (and shortfalls bordering several features): gives the selected row "
+                     "to the next feature that could take it. Also lets you snap a row marked <i>Fix manually</i> "
+                     "because no feature had most of its border."),
+      ("Snap Selected", "Changes the features named in Fix for the selected rows. Unsaved, undoable edits."),
+      ("Clear", "Clears the list and the log."),
+  ])}
+
+  <h3 style="color:#111827; margin:12px 0 4px 0;">Status column</h3>
+  <ul style="margin-top:0;">
+    <li><b>Not snapped</b> &ndash; ready to snap.</li>
+    <li><b style="color:#2e7d32;">Snapped</b> &ndash; the feature was changed (unsaved edit).</li>
+    <li><b style="color:#c62828;">Failed</b> &ndash; the feature was left untouched. Hover the cell for the reason.</li>
+    <li><b style="color:#757575;">Fix manually</b> &ndash; cannot be snapped automatically.</li>
+  </ul>
+
+  <h3 style="color:#111827; margin:12px 0 4px 0;">Saving and undoing</h3>
+  <ul style="margin-top:0;">
+    <li>Only the checked layer is edited, and it is left in <b>edit mode</b>; nothing is written to its file
+        until you save. The reference layer is never changed.</li>
+    <li><b>Keep:</b> Save Layer Edits.</li>
+    <li><b>Revert:</b> Toggle Editing &gt; Discard, or Edit &gt; Undo (one undo step per Snap Selected).</li>
+    <li>Only the geometry changes; attributes such as household counts stay as they are.</li>
+    <li>Before a feature is changed, the new shape is checked (valid, not empty, expected area, fits the layer)
+        and the feature must not have been edited since the scan. Otherwise the row is marked Failed.</li>
+  </ul>
+
+  <h3 style="color:#111827; margin:12px 0 4px 0;">Troubleshooting</h3>
+  <ul style="margin-top:0;">
+    <li><b>Scan is disabled:</b> pick the layer to check (and, for EA vs BGY, the barangay layer), and make the
+        two layers different. The hint under each layer says what is missing.</li>
+    <li><b>"No usable geocodes":</b> the layer has no geocode field. Barangays need <code>geocode</code> (or
+        <code>bgy_geocode</code>); EAs need <code>ea_geocode</code> (EA vs BGY also accepts
+        <code>bgy_geocode</code>).</li>
+    <li><b>Nothing listed:</b> every difference is below the sliver size, or the boundaries already match.</li>
+    <li><b>Reference features with no match</b> have nothing to list; they are named in the Log instead.</li>
+    <li><b>A big Gap in a self check</b> may be land that is really outside the layer (e.g. a lake or a
+        neighbouring town that is not loaded). Leave it, or filter it out with the search box.</li>
+    <li><b>Edited the layer after scanning:</b> scan again before snapping, or the row is marked Failed.</li>
+  </ul>
+</div>
+"""
 
 
 class _LogStream:
-    """print() target during a scan: sends each line to the panel log."""
+    """print() target during a scan: sends each line to the window log."""
 
     def __init__(self, write_line):
         self._write_line = write_line
@@ -807,12 +1255,12 @@ class _LogStream:
             self._buffer = ""
 
 
-def make_panel_class():
+def make_dialog_class():
     from qgis.core import QgsApplication, QgsCoordinateTransform, QgsFeatureRequest, QgsProject
     from qgis.gui import QgsMapLayerComboBox
     from qgis.PyQt import QtWidgets
     from qgis.PyQt.QtCore import Qt
-    from qgis.PyQt.QtGui import QBrush, QColor, QFont, QFontDatabase
+    from qgis.PyQt.QtGui import QBrush, QColor, QFont
 
     try:
         from qgis.core import Qgis
@@ -823,25 +1271,59 @@ def make_panel_class():
 
     FID_ROLE = Qt.UserRole          # on the Issue cell: feature id in the Discrepancies layer
     ROW_ROLE = Qt.UserRole + 1      # on the Issue cell: row in scan.discrepancies
-    ISSUE_COL, STATUS_COL = TABLE_COLUMNS.index("Issue"), TABLE_COLUMNS.index("Status")
-    issue_colours = {issue: QColor(*[int(v) for v in rgba.split(",")[:3]], 70) for issue, rgba in ISSUE_COLOURS}
+    COL = {c: i for i, c in enumerate(TABLE_COLUMNS)}
+    ISSUE_COL, STATUS_COL = COL["Issue"], COL["Status"]
+    search_cols = [COL[c] for c in SEARCH_COLUMNS]
     snappable = {STATUS_PENDING, STATUS_FAILED}
+    DARK_TEXT = QBrush(QColor("#212121"))
+    SCORE = {"ea": 0, "bgy": 1}     # index into layer_scores()
+
+    def qcolour(rgba, alpha=70):
+        return QColor(*[int(v) for v in rgba.split(",")[:3]], alpha)
+
+    def group(title=""):
+        box = QtWidgets.QGroupBox(title)
+        box.setStyleSheet(GRP_STYLE)
+        return box, QtWidgets.QVBoxLayout(box)
+
+    def button(text, height=32, icon=None):
+        b = QtWidgets.QPushButton(text)
+        if icon:
+            b.setIcon(QgsApplication.getThemeIcon(icon))
+        b.setFixedHeight(height)
+        return b
 
     def layer_combo():
         combo = QgsMapLayerComboBox()
         combo.setFilters(polygon_filter)
         combo.setAllowEmptyLayer(True)
+        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(12)
         return combo
 
     # Fields only an EA layer has; a barangay layer has a geocode but none of these.
     ea_only = {"ea_geocode", "ean", "bgy_geo"}
     bgy_geocode = {c.lower() for c in BGY_FIELDS["geocode"]}
 
+    def needed_fields(mode, role):
+        """Field names (any one of them) a layer needs in this role ('target' / 'ref') of the mode."""
+        kind = MODES[mode][role]
+        if kind == "bgy":
+            return BGY_FIELDS["geocode"]
+        if mode == "ea_bgy":
+            return EA_FIELDS["bgy_geocode"] + EA_FIELDS["ea_geocode"]
+        return EA_FIELDS["ea_geocode"]
+
+    def layer_fields(layer):
+        try:
+            return {f.name().lower() for f in layer.fields()}
+        except Exception:  # noqa: BLE001 - not a vector layer
+            return set()
+
     def layer_scores(layer):
         """(EA score, barangay score) from the layer's fields, with the layer name as a tie-breaker."""
-        try:
-            fields = {f.name().lower() for f in layer.fields()}
-        except Exception:  # noqa: BLE001 - not a vector layer
+        fields = layer_fields(layer)
+        if not fields:
             return 0, 0
         is_ea = bool(fields & ea_only) or {"bgy_geocode", "geocode"} <= fields
         name = layer.name()
@@ -862,82 +1344,184 @@ def make_panel_class():
                 best, best_score = layer, score
         return best
 
-    class CheckPanel(QtWidgets.QDockWidget):
+    class CheckDialog(QtWidgets.QDialog):
         def __init__(self, iface, parent=None):
-            super().__init__(PANEL_TITLE, parent)
-            self.setObjectName(PANEL_NAME)
+            super().__init__(parent)
+            self.setObjectName(DIALOG_NAME)
+            self.setWindowTitle(f"{DIALOG_TITLE} — EA Tools")
+            icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), TOOL_ICON) \
+                if "__file__" in globals() else ""
+            if icon and os.path.exists(icon):
+                from qgis.PyQt.QtGui import QIcon
+                self.setWindowIcon(QIcon(icon))
+            self.setWindowFlags(self.windowFlags()
+                                | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint)
+            self.setAttribute(Qt.WA_DeleteOnClose, True)
+            self.setMinimumSize(860, 600)
+            self.resize(1100, 760)
+
             self.iface = iface
             self.scan_result = None
             self.running = False
-
-            body = QtWidgets.QWidget()
-            self.setWidget(body)
-            layout = QtWidgets.QVBoxLayout(body)
-
-            # ---- inputs
-            inputs = QtWidgets.QGroupBox("Input")
-            form = QtWidgets.QFormLayout(inputs)
-            self.bgy = layer_combo()
-            form.addRow("Barangay layer", self.bgy)
-            self.ea = layer_combo()
-            form.addRow("EA layer", self.ea)
+            self._inputs_ok = False
+            self.is_dark = self.palette().color(self.palette().Window).lightness() < 128
             # A combo the user has picked by hand is left alone by autodetection.
-            self.manual = {"bgy": False, "ea": False}
+            self.manual = {"ref": False, "target": False}
             self._auto_setting = False
+
+            root = QtWidgets.QVBoxLayout(self)
+            root.setContentsMargins(12, 12, 12, 12)
+            root.setSpacing(8)
+            self.title_label = QtWidgets.QLabel(DIALOG_TITLE)
+            self.title_label.setWordWrap(True)
+            root.addWidget(self.title_label)
+            self.sub_label = QtWidgets.QLabel(DIALOG_SUBTITLE)
+            self.sub_label.setWordWrap(True)
+            root.addWidget(self.sub_label)
+            self.sep_line = QtWidgets.QFrame()
+            self.sep_line.setFrameShape(QtWidgets.QFrame.HLine)
+            root.addWidget(self.sep_line)
+
+            self.tabs = QtWidgets.QTabWidget()
+            self.tabs.addTab(self._build_main_tab(), "EA vs Barangay Check")
+            self.tabs.addTab(self._build_help_tab(), "Help and Information")
+            root.addWidget(self.tabs, 1)
+
+            close_row = QtWidgets.QHBoxLayout()
+            close_row.addStretch()
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.setMinimumWidth(100)
+            close_btn.clicked.connect(self.close)
+            close_row.addWidget(close_btn)
+            root.addLayout(close_row)
+
+            self.apply_mode(reset=False)
             # Set when run from the GMD CO Processing panel. That combo often just holds the first
             # layer, so it is used only if it looks at least as much like an EA layer as the best match.
             panel_layer = globals().get("ea_layer")
-            if panel_layer is not None and self.ea.findText(panel_layer.name()) >= 0:
-                detected = best_layer(self.ea, 0)
+            if panel_layer is not None and self.target.findText(panel_layer.name()) >= 0:
+                detected = best_layer(self.target, 0)
                 best_score = layer_scores(detected)[0] if detected is not None else 0
                 if layer_scores(panel_layer)[0] >= max(best_score, 1):
-                    self.ea.setLayer(panel_layer)
-                    self.manual["ea"] = True
+                    self.target.setLayer(panel_layer)
+                    self.manual["target"] = True
             self.autodetect_layers()
-            self.bgy.layerChanged.connect(lambda _l: self.on_layer_picked("bgy"))
-            self.ea.layerChanged.connect(lambda _l: self.on_layer_picked("ea"))
-            # PyQt drops this connection when the panel is deleted (bound method of a QObject).
+            self.ref.layerChanged.connect(lambda _l: self.on_layer_picked("ref"))
+            self.target.layerChanged.connect(lambda _l: self.on_layer_picked("target"))
             QgsProject.instance().layersAdded.connect(self.on_layers_added)
+            QgsProject.instance().layersRemoved.connect(self.on_layers_added)
+            self.apply_theme()
+            self.validate_inputs()
+            self.update_summary()
+
+        # ──────────────── construction ────────────────
+        def _build_main_tab(self):
+            tab = QtWidgets.QWidget()
+            root = QtWidgets.QHBoxLayout(tab)
+            root.setContentsMargins(6, 6, 6, 6)
+            root.setSpacing(8)
+
+            # ── LEFT: mode, inputs and run controls ──
+            left = QtWidgets.QWidget()
+            left.setFixedWidth(LEFT_WIDTH)
+            ll = QtWidgets.QVBoxLayout(left)
+            ll.setContentsMargins(0, 0, 0, 0)
+            ll.setSpacing(6)
+
+            box, lay = group("Check Mode")
+            self.mode_group = QtWidgets.QButtonGroup(self)
+            self.mode_buttons = {}
+            mrow = QtWidgets.QHBoxLayout()
+            for key, m in MODES.items():
+                rb = QtWidgets.QRadioButton(m["label"])
+                rb.setToolTip(MODE_TEXT[key]["hint"])
+                self.mode_group.addButton(rb)
+                self.mode_buttons[key] = rb
+                mrow.addWidget(rb)
+            self.mode_buttons["ea_bgy"].setChecked(True)
+            self.mode_group.buttonToggled.connect(self.on_mode_toggled)
+            lay.addLayout(mrow)
+            self.mode_hint = self._hint()
+            lay.addWidget(self.mode_hint)
+            ll.addWidget(box)
+
+            self.target_box, lay = group()
+            self.target = layer_combo()
+            self.target.setToolTip("The layer that is checked. Only this layer is edited by Snap Selected.")
+            lay.addWidget(self.target)
+            self.target_hint = self._hint()
+            lay.addWidget(self.target_hint)
+            ll.addWidget(self.target_box)
+
+            self.ref_box, lay = group()
+            self.ref = layer_combo()
+            self.ref.setToolTip("The fixed reference boundary. It is never changed.")
+            lay.addWidget(self.ref)
+            self.ref_hint = self._hint()
+            lay.addWidget(self.ref_hint)
+            ll.addWidget(self.ref_box)
+
+            box, lay = group("Settings")
+            srow = QtWidgets.QHBoxLayout()
+            srow.addWidget(QtWidgets.QLabel("Ignore slivers below:"))
             self.min_area = QtWidgets.QDoubleSpinBox()
             self.min_area.setRange(0, 1e7)
             self.min_area.setDecimals(2)
             self.min_area.setValue(MIN_AREA_SQM)
             self.min_area.setSuffix(" sqm")
-            form.addRow("Ignore slivers below", self.min_area)
-            layout.addWidget(inputs)
+            self.min_area.setToolTip("Differences smaller than this area are treated as slivers and not listed.")
+            srow.addWidget(self.min_area, 1)
+            lay.addLayout(srow)
+            ll.addWidget(box)
 
-            # ---- scan button + busy bar
-            row = QtWidgets.QHBoxLayout()
-            self.scan_button = QtWidgets.QPushButton(QgsApplication.getThemeIcon("/mActionStart.svg"), "Scan")
+            box, lay = group("Run Check")
+            self.scan_button = button("Scan", 32, "/mActionStart.svg")
             self.scan_button.setDefault(True)
+            self.scan_button.setToolTip("Find the discrepancies of the chosen mode and list them.\n"
+                                        "Nothing is changed until you press Snap Selected.")
             self.scan_button.clicked.connect(self.scan)
+            lay.addWidget(self.scan_button)
+            self.run_hint = self._hint()
+            lay.addWidget(self.run_hint)
+            ll.addWidget(box)
+
+            self.clear_btn = button("Clear", 32)
+            self.clear_btn.setToolTip("Clear the discrepancy list and the log.")
+            self.clear_btn.clicked.connect(self.clear_all)
+            ll.addWidget(self.clear_btn)
             self.progress = QtWidgets.QProgressBar()
             self.progress.setTextVisible(False)
             self.progress.setRange(0, 1)
             self.progress.setValue(0)
-            row.addWidget(self.scan_button)
-            row.addWidget(self.progress, 1)
-            layout.addLayout(row)
+            self.progress.setFixedHeight(18)
+            ll.addWidget(self.progress)
+            ll.addStretch(1)
 
-            splitter = QtWidgets.QSplitter(Qt.Vertical)
+            # ── RIGHT: discrepancy list, snap panel, log ──
+            right = QtWidgets.QWidget()
+            rl = QtWidgets.QVBoxLayout(right)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(6)
 
-            # ---- results list
-            results = QtWidgets.QGroupBox("Discrepancies")
-            rl = QtWidgets.QVBoxLayout(results)
-            top = QtWidgets.QHBoxLayout()
-            top.addWidget(QtWidgets.QLabel("Show"))
+            self.summary = QtWidgets.QLabel(NO_RESULTS)
+            self.summary.setWordWrap(True)
+            rl.addWidget(self.summary)
+
+            filters = QtWidgets.QHBoxLayout()
+            self.search_edit = QtWidgets.QLineEdit()
+            self.search_edit.setPlaceholderText("Filter by name, Geocode, Barangay or City/Municipality…")
+            self.search_edit.setClearButtonEnabled(True)
+            self.search_edit.textChanged.connect(self.apply_filter)
+            filters.addWidget(self.search_edit, 1)
             self.filter = QtWidgets.QComboBox()
-            self.filter.addItem("All", None)
-            for issue, _ in ISSUE_COLOURS:
-                self.filter.addItem(issue, ("issue", issue))
-            for status in (STATUS_PENDING, STATUS_DONE, STATUS_FAILED, STATUS_MANUAL):
-                self.filter.addItem(status, ("status", status))
             self.filter.currentIndexChanged.connect(self.apply_filter)
-            top.addWidget(self.filter)
-            top.addStretch()
-            self.count_label = QtWidgets.QLabel("Not scanned yet")
-            top.addWidget(self.count_label)
-            rl.addLayout(top)
+            filters.addWidget(self.filter)
+            self.zoom_btn = QtWidgets.QToolButton()
+            self.zoom_btn.setIcon(QgsApplication.getThemeIcon("/mActionZoomToSelected.svg"))
+            self.zoom_btn.setToolTip("Zoom to the selected discrepancies")
+            self.zoom_btn.clicked.connect(lambda: self.zoom_to_rows(self.selected_rows()))
+            filters.addWidget(self.zoom_btn)
+            rl.addLayout(filters)
 
             self.table = QtWidgets.QTableWidget(0, len(TABLE_COLUMNS))
             self.table.setHorizontalHeaderLabels(TABLE_COLUMNS)
@@ -950,66 +1534,255 @@ def make_panel_class():
             self.table.horizontalHeader().setStretchLastSection(True)
             self.table.itemSelectionChanged.connect(self.on_table_selection)
             self.table.cellDoubleClicked.connect(lambda r, _c: self.zoom_to_rows([r]))
-            rl.addWidget(self.table)
+            rl.addWidget(self.table, 1)
 
-            hint = QtWidgets.QLabel("Click: select on map · Double-click: zoom · Ctrl/Shift+click: select several")
-            hint.setEnabled(False)
-            rl.addWidget(hint)
-            buttons = QtWidgets.QHBoxLayout()
-            self.zoom_button = QtWidgets.QPushButton(QgsApplication.getThemeIcon("/mActionZoomToSelected.svg"),
-                                                     "Zoom to Selected")
+            self.legend = QtWidgets.QLabel()
+            rl.addWidget(self.legend)
+
+            # Snap panel sits below the list: Scan -> Review & select -> Snap.
+            self.snap_group, gf = group("")
+            gf.setContentsMargins(10, 24, 10, 10)
+            gf.setSpacing(7)
+            arow = QtWidgets.QHBoxLayout()
+            self.select_btn = button("Select Not Snapped", 32)
+            self.select_btn.setToolTip("Select every listed row that has not been snapped yet.")
+            self.select_btn.clicked.connect(self.select_pending)
+            self.zoom_button = button("Zoom to Selected", 32, "/mActionZoomToSelected.svg")
             self.zoom_button.clicked.connect(lambda: self.zoom_to_rows(self.selected_rows()))
-            buttons.addWidget(self.zoom_button)
-            buttons.addStretch()
-            self.snap_button = QtWidgets.QPushButton(QgsApplication.getThemeIcon("/mIconSnapping.svg"), "Snap Selected")
-            self.snap_button.setToolTip("Snap the EAs of the selected discrepancies to their barangay boundary.\n"
-                                        "Changes are unsaved edits in the EA layer (Edit > Undo to take them back).")
+            self.switch_btn = button("Switch Fix", 32, "/mActionRefresh.svg")
+            self.switch_btn.setToolTip(
+                "Give the selected overlaps / gaps to the next feature that could take them\n"
+                "(overlap: cut it from the other feature; gap: add it to the next bordering one).\n"
+                "Also makes a 'Fix manually' gap snappable by choosing a feature for it.")
+            self.switch_btn.clicked.connect(self.switch_selected)
+            self.snap_button = button("Snap Selected", 32, "/mIconSnapping.svg")
+            self.snap_button.setToolTip("Snap the features named in Fix for the selected discrepancies.\n"
+                                        "Changes are unsaved edits in the checked layer (Edit > Undo to take "
+                                        "them back).")
             self.snap_button.clicked.connect(self.snap_selected)
-            buttons.addWidget(self.snap_button)
-            rl.addLayout(buttons)
-            splitter.addWidget(results)
+            arow.addWidget(self.select_btn, 1)
+            arow.addWidget(self.zoom_button, 1)
+            arow.addWidget(self.switch_btn, 1)
+            arow.addWidget(self.snap_button, 2)
+            gf.addLayout(arow)
+            self.snap_hint = self._hint("Snapping leaves the checked layer in edit mode: Save Layer Edits to keep "
+                                        "the changes, Edit > Undo to take them back.")
+            gf.addWidget(self.snap_hint)
+            self.snap_group.setEnabled(False)
+            rl.addWidget(self.snap_group)
 
-            # ---- log
-            log_box = QtWidgets.QGroupBox("Log")
-            ll = QtWidgets.QVBoxLayout(log_box)
+            rl.addWidget(QtWidgets.QLabel("Log"))
             self.log_view = QtWidgets.QPlainTextEdit()
             self.log_view.setReadOnly(True)
-            self.log_view.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
-            ll.addWidget(self.log_view)
-            clear = QtWidgets.QPushButton("Clear Log")
-            clear.clicked.connect(self.log_view.clear)
-            ll.addWidget(clear, 0, Qt.AlignRight)
-            splitter.addWidget(log_box)
+            self.log_view.setFixedHeight(150)
+            rl.addWidget(self.log_view)
 
-            splitter.setStretchFactor(0, 3)
-            splitter.setStretchFactor(1, 2)
-            layout.addWidget(splitter, 1)
-            self.update_buttons()
+            root.addWidget(left)
+            root.addWidget(right, 1)
+            return tab
 
-        # ----------------------------------------------------- autodetect
+        def _build_help_tab(self):
+            tab = QtWidgets.QWidget()
+            lay = QtWidgets.QVBoxLayout(tab)
+            lay.setContentsMargins(8, 8, 8, 8)
+            self.help_text = QtWidgets.QTextBrowser()
+            self.help_text.setOpenExternalLinks(True)
+            lay.addWidget(self.help_text)
+            return tab
+
+        def _hint(self, text=""):
+            lab = QtWidgets.QLabel(text)
+            lab.setWordWrap(True)
+            lab.setProperty("hintKind", "info")
+            return lab
+
+        def set_hint(self, label, text, kind="info"):
+            """kind: 'error' (red), 'ok' (green) or 'info' (theme hint grey)."""
+            label.setText(text)
+            label.setProperty("hintKind", kind)
+            colour = {"error": "#e57373" if self.is_dark else "#c62828",
+                      "ok": "#81c784" if self.is_dark else "#2e7d32"}.get(
+                kind, THEMES[self.is_dark]["hint"])
+            label.setStyleSheet(f"color:{colour}; font-size:11px;")
+
+        # ──────────────── mode ────────────────
+        def mode(self):
+            for key, rb in self.mode_buttons.items():
+                if rb.isChecked():
+                    return key
+            return "ea_bgy"
+
+        def self_check(self):
+            """True when the chosen mode runs on the checked layer alone (no reference picked)."""
+            return not MODES[self.mode()]["ref_required"] and self.ref.currentLayer() is None
+
+        def current_issues(self):
+            if self.scan_result is not None:
+                return self.scan_result.issues
+            return mode_issues(self.mode(), self.self_check())
+
+        def on_mode_toggled(self, _button, checked):
+            if checked and not self.running:
+                self.apply_mode(reset=True)
+
+        def apply_mode(self, reset=True):
+            """Relabel the layer boxes and table for the chosen mode; old results do not apply to it."""
+            mode = self.mode()
+            text = MODE_TEXT[mode]
+            self.target_box.setTitle(text["target"])
+            self.ref_box.setTitle(text["ref"])
+            self.set_hint(self.mode_hint, text["hint"])
+            labels = HEADER_LABELS[MODES[mode]["target"]]
+            self.table.setHorizontalHeaderLabels([labels.get(c, c) for c in TABLE_COLUMNS])
+            fix_col = COL["Fix EA"]
+            self.table.horizontalHeaderItem(fix_col).setToolTip("The feature that Snap Selected changes for this row.")
+            if reset:
+                if self.scan_result is not None or self.table.rowCount():
+                    self.log(f"Check mode changed to {MODES[mode]['label']}: previous results cleared.")
+                self.scan_result = None
+                self.table.setRowCount(0)
+                self.manual = {"ref": False, "target": False}
+                self.autodetect_layers()
+                self.validate_inputs()
+                self.update_summary()
+            self.refresh_issue_widgets()
+
+        def refresh_issue_widgets(self):
+            """Rebuild the Show filter and the colour legend for the current issues."""
+            issues = self.current_issues()
+            current = self.filter.currentData()
+            self.filter.blockSignals(True)
+            self.filter.clear()
+            self.filter.addItem("All issues", None)
+            for issue, _ in issues:
+                self.filter.addItem(issue, ("issue", issue))
+            for status in (STATUS_PENDING, STATUS_DONE, STATUS_FAILED, STATUS_MANUAL):
+                self.filter.addItem(status, ("status", status))
+            self.filter.setCurrentIndex(max(self.filter.findData(current), 0))
+            self.filter.blockSignals(False)
+            swatch = '<span style="background-color:rgb({}); border:1px solid #999;">&nbsp;&nbsp;&nbsp;</span> {}'
+            parts = [swatch.format(",".join(rgba.split(",")[:3]), issue) for issue, rgba in issues]
+            self.legend.setText(" &nbsp;&nbsp;".join(parts)
+                                + " &nbsp;&nbsp;·&nbsp; Click: select on map · Double-click: zoom")
+
+        # ──────────────── theme ────────────────
+        def apply_theme(self):
+            t = THEMES[self.is_dark]
+            self.title_label.setStyleSheet(
+                f"font-size: 15px; font-weight: bold; color: {t['title']}; padding: 2px 0;")
+            self.sub_label.setStyleSheet(f"color: {t['sub']}; font-size: 11px; margin-bottom: 4px;")
+            self.sep_line.setStyleSheet(f"color: {t['line']};")
+            self.tabs.setStyleSheet(t["tabs"])
+            self.summary.setStyleSheet(f"font-size:13px; font-weight:600; color:{t['summary']};")
+            self.log_view.setStyleSheet(t["log"])
+            self.table.setStyleSheet(t["table"])
+            self.legend.setStyleSheet(f"font-size:11px; color:{t['hint']}; padding:2px 0;")
+            html = HELP_HTML
+            if self.is_dark:
+                for a, b in HELP_DARK_SWAPS:
+                    html = html.replace(a, b)
+            self.help_text.setStyleSheet(t["help"])
+            self.help_text.setHtml(html)
+            for lab in (self.mode_hint, self.target_hint, self.ref_hint, self.run_hint, self.snap_hint):
+                self.set_hint(lab, lab.text(), lab.property("hintKind") or "info")
+
+        def showEvent(self, event):
+            super().showEvent(event)
+            dark = self.palette().color(self.palette().Window).lightness() < 128
+            if dark != self.is_dark:
+                self.is_dark = dark
+                self.apply_theme()
+
+        # ──────────────── teardown ────────────────
+        def _teardown(self):
+            prj = QgsProject.instance()
+            for sig in (prj.layersAdded, prj.layersRemoved):
+                try:
+                    sig.disconnect(self.on_layers_added)
+                except (TypeError, RuntimeError):
+                    pass
+
+        def done(self, result):
+            self._teardown()
+            super().done(result)
+
+        def closeEvent(self, event):
+            self._teardown()
+            super().closeEvent(event)
+
+        # ──────────────── layers ────────────────
         def autodetect_layers(self):
-            """Pick the EA and barangay layers from their fields (then their names), never the same
-            layer for both. Combos the user set by hand are kept."""
+            """Pick the layers from their fields (then their names), never the same layer for both.
+            Combos the user set by hand are kept. An optional reference is left empty (self check)."""
+            m = MODES[self.mode()]
             self._auto_setting = True
             try:
-                if not self.manual["ea"]:
-                    exclude = self.bgy.currentLayer() if self.manual["bgy"] else None
-                    self.ea.setLayer(best_layer(self.ea, 0, exclude))
-                if not self.manual["bgy"]:
-                    self.bgy.setLayer(best_layer(self.bgy, 1, self.ea.currentLayer()))
+                if not self.manual["target"]:
+                    exclude = self.ref.currentLayer() if self.manual["ref"] else None
+                    self.target.setLayer(best_layer(self.target, SCORE[m["target"]], exclude))
+                if not self.manual["ref"]:
+                    self.ref.setLayer(best_layer(self.ref, SCORE[m["ref"]], self.target.currentLayer())
+                                      if m["ref_required"] else None)
             finally:
                 self._auto_setting = False
 
         def on_layer_picked(self, which):
             if self._auto_setting:
                 return
-            self.manual[which] = self.ea.currentLayer() is not None if which == "ea" \
-                else self.bgy.currentLayer() is not None
+            combo = self.target if which == "target" else self.ref
+            self.manual[which] = combo.currentLayer() is not None
             self.autodetect_layers()  # re-pick the other combo if it was autodetected
+            self.validate_inputs()
+            if self.scan_result is None:
+                self.refresh_issue_widgets()  # self check <-> reference changes the issue names
 
-        def on_layers_added(self, _layers):
+        def on_layers_added(self, *_args):
             if not self.running:
                 self.autodetect_layers()
+                self.validate_inputs()
+
+        def validate_inputs(self):
+            """Hints under the layer pickers; Scan is enabled only when the layers are usable."""
+            mode = self.mode()
+            m = MODES[mode]
+            target, ref = self.target.currentLayer(), self.ref.currentLayer()
+            ok = True
+
+            def check(layer, role, hint):
+                fields = needed_fields(mode, role)
+                if not layer_fields(layer) & {f.lower() for f in fields}:
+                    self.set_hint(hint, f"No geocode field. Expected one of: {', '.join(fields)}.", "error")
+                    return False
+                self.set_hint(hint, f"{layer.featureCount():,} feature(s).", "ok")
+                return True
+
+            if target is None:
+                self.set_hint(self.target_hint, f"Pick the {m['unit']} layer to check.")
+                ok = False
+            else:
+                ok = check(target, "target", self.target_hint) and ok
+
+            if ref is None:
+                if m["ref_required"]:
+                    self.set_hint(self.ref_hint, f"Pick the {m['ref_unit']} layer.")
+                    ok = False
+                else:
+                    self.set_hint(self.ref_hint, f"None: the {m['unit']}s are checked against each other "
+                                                 "(overlaps and gaps). Pick a layer to compare with it instead.")
+            else:
+                ok = check(ref, "ref", self.ref_hint) and ok
+
+            if ref is not None and ref == target:
+                self.set_hint(self.run_hint, "The checked layer and the reference layer must be different.", "error")
+                ok = False
+            elif ok:
+                what = (f"overlaps and gaps between the {m['unit']}s" if ref is None
+                        else f"{m['unit']}s vs '{ref.name()}'")
+                self.set_hint(self.run_hint, f"Ready: {m['label']}, {what}. Click Scan.", "ok")
+            else:
+                self.set_hint(self.run_hint, "Choose the layers to enable Scan.")
+            self._inputs_ok = ok
+            self.update_buttons()
 
         # ------------------------------------------------------------ log
         def log(self, text):
@@ -1018,10 +1791,21 @@ def make_panel_class():
                 self.log_view.appendPlainText(f"[{stamp}] {line}")
             QtWidgets.QApplication.processEvents()  # show progress while the scan runs
 
+        def clear_all(self):
+            if self.running:
+                return
+            self.scan_result = None
+            self.table.setRowCount(0)
+            self.log_view.clear()
+            self.refresh_issue_widgets()
+            self.update_summary()
+            self.update_buttons()
+
         # ----------------------------------------------------------- busy
         def set_busy(self, busy):
             self.running = busy
-            for w in (self.scan_button, self.bgy, self.ea, self.min_area, self.table, self.filter):
+            for w in [self.target, self.ref, self.min_area, self.table, self.filter, self.search_edit,
+                      self.clear_btn, *self.mode_buttons.values()]:
                 w.setEnabled(not busy)
             self.progress.setRange(0, 0 if busy else 1)
             self.progress.setValue(0 if busy else 1)
@@ -1031,50 +1815,79 @@ def make_panel_class():
                 QtWidgets.QApplication.restoreOverrideCursor()
             self.update_buttons()
 
+        def df_row(self, table_row):
+            return self.table.item(table_row, ISSUE_COL).data(ROW_ROLE)
+
+        def can_switch(self, table_row):
+            d = self.scan_result.discrepancies
+            r = self.df_row(table_row)
+            cands = d.at[r, "_candidates"] or []
+            return d.at[r, "Status"] != STATUS_DONE and (len(cands) > 1 or (cands and not d.at[r, "_snappable"]))
+
         def update_buttons(self):
             rows = self.selected_rows()
-            self.zoom_button.setEnabled(bool(rows) and not self.running)
             statuses = {self.table.item(r, STATUS_COL).text() for r in rows}
-            self.snap_button.setEnabled(bool(statuses & snappable) and not self.running)
+            has_rows = self.table.rowCount() > 0
+            idle = not self.running
+            self.scan_button.setEnabled(self._inputs_ok and idle)
+            self.snap_group.setEnabled(has_rows and idle)
+            self.zoom_btn.setEnabled(bool(rows) and idle)
+            self.zoom_button.setEnabled(bool(rows) and idle)
+            self.snap_button.setEnabled(bool(statuses & snappable) and idle)
+            self.select_btn.setEnabled(has_rows and idle)
+            self.switch_btn.setEnabled(idle and self.scan_result is not None
+                                       and any(self.can_switch(r) for r in rows))
+
+        def update_summary(self):
+            """One-line state above the list."""
+            if self.scan_result is None:
+                self.summary.setText(NO_RESULTS)
+                return
+            total = self.table.rowCount()
+            if total == 0:
+                self.summary.setText(result_message(self.scan_result.discrepancies, False, self.scan_result))
+                return
+            shown = sum(not self.table.isRowHidden(r) for r in range(total))
+            done = int((self.scan_result.discrepancies["Status"] == STATUS_DONE).sum())
+            noun = "discrepancy" if total == 1 else "discrepancies"
+            text = f"{shown:,} of {total:,} {noun} shown" if shown != total else f"{total:,} {noun} found"
+            self.summary.setText(text + (f" · {done:,} snapped" if done else ""))
 
         # ----------------------------------------------------------- scan
         def scan(self):
-            if self.running:
+            if self.running or not self._inputs_ok:
                 return
-            bgy_layer, ea_layer = self.bgy.currentLayer(), self.ea.currentLayer()
-            if bgy_layer is None or ea_layer is None:
-                QtWidgets.QMessageBox.warning(self, PANEL_TITLE, "Choose the barangay layer and the EA layer.")
-                return
-            if bgy_layer == ea_layer:
-                QtWidgets.QMessageBox.warning(self, PANEL_TITLE, "The barangay layer and the EA layer must be different.")
-                return
+            mode = self.mode()
+            m = MODES[mode]
+            target, ref = self.target.currentLayer(), self.ref.currentLayer()
 
-            self.remove_old_layers(keep=(bgy_layer, ea_layer))
+            self.remove_old_layers(keep=[lyr for lyr in (target, ref) if lyr is not None])
             self.scan_result = None
             self.table.setRowCount(0)
-            self.count_label.setText("Scanning…")
+            self.summary.setText("Scanning…")
             self.log("=" * 50)
-            self.log(f"Scan: barangays '{bgy_layer.name()}', EAs '{ea_layer.name()}', "
-                     f"slivers < {self.min_area.value():g} sqm")
+            against = f"reference '{ref.name()}'" if ref is not None else "itself (overlaps and gaps)"
+            self.log(f"Scan {m['label']}: '{target.name()}' vs {against}, slivers < {self.min_area.value():g} sqm")
             self.set_busy(True)
             stream = _LogStream(self.log)
             try:
                 with redirect_stdout(stream), redirect_stderr(stream):
-                    scan = run_check(bgy_layer, ea_layer, self.min_area.value())
+                    scan = run_check(ref, target, self.min_area.value(), mode=mode)
                 stream.flush()
             except Exception as e:  # noqa: BLE001 - report every failure in the log
                 stream.flush()
                 self.log(traceback.format_exc().rstrip())
                 self.log(f"Scan FAILED: {e}")
-                self.count_label.setText("Scan failed")
+                self.summary.setText("Scan failed. See the Log.")
                 return
             finally:
                 self.set_busy(False)
 
-            self.log(result_message(scan.discrepancies, include_warnings=False))
+            self.log(result_message(scan.discrepancies, include_warnings=False, scan=scan))
             if WARNINGS:
                 self.log(f"{len(WARNINGS)} warning(s), see [WARNING] lines above.")
             self.scan_result = scan
+            self.refresh_issue_widgets()
             self.show_results()
             self.log("Scan finished.")
 
@@ -1094,6 +1907,7 @@ def make_panel_class():
         # -------------------------------------------------------- results
         def show_results(self):
             df = self.scan_result.discrepancies
+            colours = {issue: qcolour(rgba) for issue, rgba in self.scan_result.issues}
             self.table.setSortingEnabled(False)  # fill first, sort after
             records = df.drop(columns="geometry").to_dict("records")
             self.table.setRowCount(len(records))
@@ -1109,21 +1923,22 @@ def make_panel_class():
                     if col == "Issue":
                         item.setData(FID_ROLE, fid)
                         item.setData(ROW_ROLE, r)
-                        if value in issue_colours:
-                            item.setBackground(issue_colours[value])
+                        if value in colours:
+                            item.setBackground(colours[value])
+                            item.setForeground(DARK_TEXT if not self.is_dark else QBrush(QColor("#ECEFF1")))
                     if col == "Note":
                         item.setToolTip(item.text())
                     self.table.setItem(r, c, item)
                 self.paint_status(r)
             self.table.setSortingEnabled(True)
-            self.table.sortItems(TABLE_COLUMNS.index("Area (sqm)"), Qt.DescendingOrder)
+            self.table.sortItems(COL["Area (sqm)"], Qt.DescendingOrder)
             self.table.resizeColumnsToContents()
             self.apply_filter()
 
         def paint_status(self, table_row):
             """Show a discrepancy's status (and why it failed) in its Status cell."""
             item = self.table.item(table_row, STATUS_COL)
-            df_row = self.table.item(table_row, ISSUE_COL).data(ROW_ROLE)
+            df_row = self.df_row(table_row)
             status = self.scan_result.discrepancies.at[df_row, "Status"]
             item.setText(status)
             item.setToolTip(self.scan_result.messages.get(df_row, ""))
@@ -1133,24 +1948,32 @@ def make_panel_class():
             item.setForeground(QBrush(QColor(STATUS_COLOURS[status])) if status in STATUS_COLOURS else QBrush())
 
         def apply_filter(self):
+            """Show only the rows matching the Show list and the search text."""
             wanted = self.filter.currentData()
             col = STATUS_COL if wanted and wanted[0] == "status" else ISSUE_COL
-            shown = 0
+            needle = self.search_edit.text().strip().lower()
             for r in range(self.table.rowCount()):
                 hide = wanted is not None and self.table.item(r, col).text() != wanted[1]
+                if not hide and needle:
+                    hide = not any(needle in self.table.item(r, c).text().lower() for c in search_cols)
                 self.table.setRowHidden(r, hide)
-                shown += not hide
-            if self.scan_result is None:
-                return
-            total = self.table.rowCount()
-            done = int((self.scan_result.discrepancies["Status"] == STATUS_DONE).sum()) if total else 0
-            text = "No discrepancies" if total == 0 else (
-                f"{shown:,} of {total:,}" if shown != total else f"{total:,} found")
-            self.count_label.setText(text + (f" · {done:,} snapped" if done else ""))
+            self.update_summary()
             self.update_buttons()
 
         def selected_rows(self):
             return sorted({i.row() for i in self.table.selectedItems() if not self.table.isRowHidden(i.row())})
+
+        def select_pending(self):
+            """Select every visible row that can still be snapped."""
+            self.table.clearSelection()
+            mode = self.table.selectionMode()
+            self.table.setSelectionMode(QtWidgets.QAbstractItemView.MultiSelection)
+            try:
+                for r in range(self.table.rowCount()):
+                    if not self.table.isRowHidden(r) and self.table.item(r, STATUS_COL).text() in snappable:
+                        self.table.selectRow(r)
+            finally:
+                self.table.setSelectionMode(mode)
 
         def result_layer(self):
             return self.scan_result.layer if self.scan_result is not None else None
@@ -1188,14 +2011,38 @@ def make_panel_class():
             canvas.refresh()
             canvas.flashFeatureIds(layer, fids)
 
+        # ----------------------------------------------------- switch fix
+        def switch_selected(self):
+            if self.running or self.scan_result is None:
+                return
+            d = self.scan_result.discrepancies
+            changed = 0
+            for r in self.selected_rows():
+                if not self.can_switch(r):
+                    continue
+                row = self.df_row(r)
+                code = switch_fix(self.scan_result, row)
+                if code is None:
+                    continue
+                changed += 1
+                self.table.item(r, COL["Fix EA"]).setText(str(code))
+                note = self.table.item(r, COL["Note"])
+                note.setText(str(d.at[row, "Note"]))
+                note.setToolTip(note.text())
+                self.paint_status(r)
+                self.log(f"  {d.at[row, 'Issue']} ({d.at[row, 'Area (sqm)']:,.0f} sqm): Fix is now {code}")
+            if changed:
+                self.log(f"Switched the Fix of {changed:,} row(s). Press Snap Selected to apply.")
+            self.apply_filter()
+
         # ----------------------------------------------------------- snap
         def snap_selected(self):
             if self.running or self.scan_result is None:
                 return
             table_rows = self.selected_rows()
-            by_df_row = {self.table.item(r, ISSUE_COL).data(ROW_ROLE): r for r in table_rows}
+            by_df_row = {self.df_row(r): r for r in table_rows}
             if QgsProject.instance().mapLayer(self.scan_result.ea_layer.id()) is None:
-                self.log("The EA layer was removed from the project. Scan again.")
+                self.log("The checked layer was removed from the project. Scan again.")
                 return
 
             self.log("-" * 50)
@@ -1205,12 +2052,12 @@ def make_panel_class():
                 outcome = snap_rows(self.scan_result, sorted(by_df_row))
             except Exception as e:  # noqa: BLE001 - report every failure in the log
                 self.log(traceback.format_exc().rstrip())
-                self.log(f"Snap FAILED: {e}. The EA layer was not changed by this step.")
+                self.log(f"Snap FAILED: {e}. The layer was not changed by this step.")
                 return
             finally:
                 self.set_busy(False)
 
-            # one log line per EA (rows of the same EA share their message)
+            # one log line per feature (rows of the same feature share their message)
             for message in dict.fromkeys(m for _, m in outcome.values()):
                 self.log(f"  {message}")
             for df_row, r in by_df_row.items():
@@ -1224,13 +2071,13 @@ def make_panel_class():
                          f"Keep: Save Layer Edits. Undo: Edit > Undo.")
             self.apply_filter()
 
-    return CheckPanel
+    return CheckDialog
 
 
-def show_panel():
-    """Open the EA vs Barangay panel docked beside the map. Running the script again replaces it."""
-    from qgis.PyQt.QtCore import Qt
-    from qgis.PyQt.QtWidgets import QDockWidget
+# ================= ENTRY POINT =================
+def show_dialog():
+    """Open the EA vs Barangay Check window (non-modal, so the map stays usable)."""
+    from qgis.PyQt.QtWidgets import QDialog
 
     qgis_iface = globals().get("iface")
     if qgis_iface is None:
@@ -1241,22 +2088,22 @@ def show_panel():
     main = qgis_iface.mainWindow() if qgis_iface is not None else None
 
     if main is not None:
-        for old in main.findChildren(QDockWidget, PANEL_NAME):
+        for old in main.findChildren(QDialog, DIALOG_NAME):
+            old.close()
+        # remove the docked panel left by older versions
+        from qgis.PyQt.QtWidgets import QDockWidget
+        for old in main.findChildren(QDockWidget, "EAvsBarangayCheckDock"):
             qgis_iface.removeDockWidget(old)
             old.deleteLater()
 
-    panel = make_panel_class()(qgis_iface, main)
-    if main is not None:
-        qgis_iface.addDockWidget(Qt.RightDockWidgetArea, panel)
-        gmd = main.findChild(QDockWidget, "GMDCOProcessingDock")
-        if gmd is not None and gmd.isVisible():
-            main.tabifyDockWidget(gmd, panel)  # share the space with the GMD CO Processing panel
-    panel.show()
-    panel.raise_()
-    return panel
+    dialog = make_dialog_class()(qgis_iface, main)
+    dialog.show()
+    dialog.raise_()
+    dialog.activateWindow()
+    return dialog
 
 
 if "qgis" in sys.modules and not os.environ.get("EA_QA_NO_DIALOG"):
-    _PANEL = show_panel()
+    _DIALOG = show_dialog()
 elif "qgis" not in sys.modules:
     print("Run this script inside QGIS: GMD CO Processing > EA Tools > EA vs Barangay Check.")

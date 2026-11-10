@@ -1,6 +1,6 @@
 r"""MBI EA Coverage — choose which involved EA covers each MBI gap / overlap.
 
-When the MBI Checker (EA Topology Checker) finds gaps or overlaps, every discrepancy
+When the EA MBI Checker finds gaps or overlaps, every discrepancy
 (case_uuid) involves two or more EAs — possibly from different EA layers. This window lists
 each MBI case with all of its involved EAs, so you can tick the EA that covers the MBI area:
 
@@ -12,18 +12,25 @@ Workflow:
           by 'ea_geocode' across all selected layers.
   Step 2  Optionally pick a building point layer (and its geocode field) to count the
           buildings inside each MBI, and per involved EA the ones tagged to it.
-  Step 3  Either click Run Check & Load Cases — runs the EA Topology Checker
+  Step 3  Either click Run Check & Load Cases — runs the EA MBI Checker
           (EA_topochecker.py) on the selected EA layers, adds one "MBI Results" layer with
           every gap / overlap and lists its cases — or pick an existing MBI results layer
           (needs 'case_uuid') and click Load MBI Cases.
   Step 4  Tick the Role / Status box of the covering EA in each case.
+          Shared overlaps: when an overlap runs across several EAs (and their layers are
+          selected), more than one EA can be ticked — each ticked EA keeps only its own part
+          of the overlap (the MBI clipped to that EA, minus what an EA ticked before it
+          keeps). The case is Partly Covered until the ticked EAs' parts fill the MBI.
           Auto-Assign Pending: single-EA cases go to that EA, multi-EA cases go to the EA
-          owning most of the buildings inside the MBI (needs Step 2).
-  Step 5  Apply Coverage writes 'assigned_ea' (covering EA), 'ea_role' (Covers / Releases,
-          per row) and 'coverage_status' (1_Covered / 2_Not Covered, per case) into the MBI
-          layer as unsaved, undoable edits.
-  Step 6  Export GPKG + CSV writes the processed MBI layer and a decision log CSV into the
-          Export folder (applying any pending choices first).
+          owning most of the buildings inside the MBI (needs Step 2); shared overlaps go to
+          every EA with tagged buildings, most first.
+  Step 5  Apply Coverage writes 'assigned_ea' (covering EA codes, comma-separated),
+          'ea_role' (Covers / Releases, per row) and 'coverage_status' (1_Covered /
+          2_Not Covered / 3_Partially Covered, per case) into the MBI layer as unsaved,
+          undoable edits, and refreshes the 'MBI Coverage Parts' layer (the part of each MBI
+          every covering EA keeps, plus any unassigned part).
+  Step 6  Export GPKG + CSV writes the processed MBI layer, the coverage parts and a decision
+          log CSV into the Export folder (applying any pending choices first).
 """
 # Menu / panel entry (read by the GMD CO Processing plugin)
 TOOL_NAME = "MBI EA Selector"
@@ -53,9 +60,20 @@ STATUS_FIELD = "coverage_status"  # default; editable in the panel
 ROLE_FIELD = "ea_role"
 STATUS_COVERED = "1_Covered"
 STATUS_NOT_COVERED = "2_Not Covered"
+STATUS_PARTIAL = "3_Partially Covered"   # split overlap: part of it has no covering EA yet
 EXPORT_LAYER_NAME = "mbi_ea_coverage"
 ROLE_COVERS = "Covers"
 ROLE_RELEASES = "Releases"
+
+# Split overlaps: each covering EA keeps only its own part of the MBI (MBI clipped to the EA)
+PARTS_LAYER_NAME = "MBI Coverage Parts"
+PARTS_EXPORT_NAME = "mbi_ea_coverage_parts"
+PART_KEPT = "Kept"
+PART_UNASSIGNED = "Unassigned"
+# MBI area left over after the chosen EAs' parts that still counts as covered (geometry
+# rounding along EA boundaries, not a real leftover): m², or this share of the MBI.
+SLIVER_M2 = 0.5
+SLIVER_SHARE = 0.001
 
 # ===== EA layer fields =====
 EA_GEOCODE_FIELDS = ["ea_geocode", "geocode"]
@@ -68,6 +86,7 @@ BLDG_GEOCODE_FIELDS = ["ea_geocode", "geocode"]   # auto-picked in this order
 COLOUR_PENDING = "#ffcc80"     # orange
 COLOUR_COVERED = "#a5d6a7"     # green
 COLOUR_RELEASED = "#eeeeee"    # light grey
+COLOUR_PARTIAL = "#fff59d"     # yellow
 LEVEL_COLOURS = {
     "1_": "#ef9a9a", "2_": "#ef9a9a",   # inter-region / inter-province
     "3_": "#ffcc80",                    # inter-city/municipality
@@ -112,10 +131,46 @@ def _pick_field(layer, candidates):
     return None
 
 
+def _split_codes(text):
+    """'a, b,c' -> ['a', 'b', 'c'] (the coverage field holds every covering EA)."""
+    return [c.strip() for c in str(text or "").split(",") if c.strip()]
+
+
+def _polygonal(geom):
+    """Polygon part of a geometry (an intersection can add lines / points), or None."""
+    from qgis.core import QgsGeometry, QgsWkbTypes
+    if geom is None or geom.isNull() or geom.isEmpty():
+        return None
+    if geom.type() == QgsWkbTypes.PolygonGeometry:
+        return geom
+    polys = [QgsGeometry(p) for p in geom.asGeometryCollection()
+             if p.type() == QgsWkbTypes.PolygonGeometry and not p.isEmpty()]
+    if not polys:
+        return None
+    return QgsGeometry.unaryUnion(polys) if len(polys) > 1 else polys[0]
+
+
+def _area(geom, da=None):
+    """Area in m² (QgsDistanceArea with an ellipsoid), 0 for no geometry."""
+    if geom is None or geom.isNull() or geom.isEmpty():
+        return 0.0
+    return da.measureArea(geom) if da is not None else geom.area()
+
+
+def _pct(share):
+    """0.4 -> '40%', never rounding a part to a misleading 0% / 100%."""
+    if 0 < share < 0.01:
+        return "<1%"
+    if 0.99 < share < 1:
+        return ">99%"
+    return f"{100 * share:.0f}%"
+
+
 class EACandidate:
     """One EA involved in an MBI case."""
 
-    __slots__ = ("code", "geocode", "name", "barangay", "city_mun", "fids", "bldg")
+    __slots__ = ("code", "geocode", "name", "barangay", "city_mun", "fids", "bldg",
+                 "part", "part_area", "kept", "kept_area", "kept_bldg", "released")
 
     def __init__(self, code):
         self.code = code
@@ -125,6 +180,12 @@ class EACandidate:
         self.city_mun = ""
         self.fids = []      # MBI rows where this EA is "this area"
         self.bldg = None    # buildings inside the MBI tagged (by geocode) to this EA
+        self.part = None        # MBI ∩ EA (MBI layer CRS): what this EA could keep
+        self.part_area = 0.0    # m²
+        self.kept = None        # what this EA keeps with the current choices
+        self.kept_area = 0.0
+        self.kept_bldg = None   # building points inside 'kept'
+        self.released = 0.0     # share of 'part' kept by other (covering) EAs
 
     @property
     def label(self):
@@ -143,9 +204,16 @@ class MBICase:
         self.bldg_untagged = 0     # of those, points whose geocode matches no involved EA
         self.feature_ids = []
         self.candidates = {}     # code -> EACandidate (insertion ordered)
-        self.assigned_ea = ""    # code of the covering EA, "" = pending
-        self.saved_ea = ""       # value already stored in the layer
+        self.assigned = []       # covering EA code(s) in the order chosen, [] = pending
+        self.saved = []          # value already stored in the layer
+        self._saved_raw = ""
         self.search_text = ""
+        self.geom = None         # MBI geometry (MBI layer CRS)
+        self.area = 0.0          # m²
+        self.split = False       # overlap shared out: each covering EA keeps only its part
+        self.bldg_geoms = None   # building points inside the MBI (MBI CRS), when counted
+        self.covered = 0.0       # share of the MBI kept by the covering EA(s)
+        self.unassigned = None   # part of the MBI no covering EA keeps yet
 
     def add_feature(self, feat, coverage_field=None):
         self.feature_ids.append(feat.id())
@@ -173,8 +241,76 @@ class MBICase:
             cand.barangay = cand.barangay or _text(feat, MBI_BARANGAY)
             cand.city_mun = cand.city_mun or _text(feat, MBI_CITY_MUN)
 
-        if coverage_field and not self.saved_ea:
-            self.saved_ea = _text(feat, coverage_field)
+        if coverage_field and not self._saved_raw:
+            self._saved_raw = _text(feat, coverage_field)
+
+    @property
+    def status(self):
+        """'pending' (no covering EA), 'partial' (split overlap with an uncovered part)
+        or 'covered'."""
+        if not self.assigned:
+            return "pending"
+        return "covered" if self.covered >= 1.0 else "partial"
+
+    def resolve(self, da=None):
+        """Work out what each EA keeps / releases with the current choices.
+
+        Split overlap: each covering EA keeps its own part of the MBI (MBI ∩ EA), minus
+        what an EA chosen before it already keeps; the case is covered once those parts
+        fill the whole MBI. Otherwise (gaps, single-EA cases, no EA geometry) the covering
+        EA takes the whole MBI."""
+        from qgis.core import QgsGeometry
+        for c in self.candidates.values():
+            c.kept, c.kept_area, c.kept_bldg, c.released = None, 0.0, None, 0.0
+        self.covered, self.unassigned = 0.0, self.geom
+        if not self.assigned:
+            return
+        chosen = [self.candidates[code] for code in self.assigned]
+        if not self.split:
+            cand = chosen[0]
+            cand.kept, cand.kept_area = self.geom, self.area
+            for c in self.candidates.values():
+                if c is not cand:
+                    c.released = 1.0
+            self.covered, self.unassigned = 1.0, None
+        else:
+            claimed = None
+            for cand in chosen:
+                piece = cand.part if claimed is None or cand.part is None \
+                    else _polygonal(cand.part.difference(claimed))
+                cand.kept, cand.kept_area = piece, _area(piece, da)
+                if piece is not None:
+                    claimed = piece if claimed is None else QgsGeometry.unaryUnion([claimed, piece])
+            left = self.geom if claimed is None else _polygonal(self.geom.difference(claimed))
+            left_area = _area(left, da)
+            if left_area <= max(SLIVER_M2, SLIVER_SHARE * self.area):
+                self.covered, self.unassigned = 1.0, None
+            else:
+                self.covered = min(max(1.0 - left_area / self.area, 0.0), 0.999) if self.area else 0.0
+                self.unassigned = left
+            for c in self.candidates.values():
+                if c in chosen:
+                    continue
+                if c.part_area <= SLIVER_M2:
+                    c.released = 1.0
+                elif claimed is not None:
+                    shared = _area(_polygonal(c.part.intersection(claimed)), da)
+                    c.released = min(shared / c.part_area, 1.0)
+
+        if self.bldg_geoms is not None:
+            # Each building goes to the first covering EA whose kept part holds it.
+            engines = []
+            for cand in chosen:
+                cand.kept_bldg = 0
+                if cand.kept is not None:
+                    eng = QgsGeometry.createGeometryEngine(cand.kept.constGet())
+                    eng.prepareGeometry()
+                    engines.append((cand, eng))
+            for pt in self.bldg_geoms:
+                for cand, eng in engines:
+                    if eng.intersects(pt.constGet()):
+                        cand.kept_bldg += 1
+                        break
 
     @property
     def bldg_pts(self):
@@ -230,8 +366,8 @@ def load_mbi_cases(mbi_layer, default_type="", only_fids=None, coverage_field=No
         if tick and i % 200 == 0:
             tick(i, total)
     for case in cases.values():
-        if case.saved_ea in case.candidates:
-            case.assigned_ea = case.saved_ea
+        case.saved = _split_codes(case._saved_raw)
+        case.assigned = [c for c in case.saved if c in case.candidates]
         case.finish()
     return cases
 
@@ -284,7 +420,7 @@ def load_topochecker():
     import importlib.util
     path = os.path.join(_scripts_dir(), TOPOCHECKER_FILE)
     if not os.path.exists(path):
-        raise FileNotFoundError(f"EA Topology Checker not found: {path}")
+        raise FileNotFoundError(f"EA MBI Checker not found: {path}")
     spec = importlib.util.spec_from_file_location("gmd_ea_topochecker", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -382,6 +518,16 @@ THEMES = {
                  " border: 1px solid #455A64; border-radius: 4px; padding: 8px; }"),
     },
 }
+# Run EA MBI Check box (amber, optional) and Load MBI Cases button (green): set apart so users who
+# already have an MBI Results layer skip the run step.
+RUN_COLOURS = {
+    False: {"bg": "#FFF3E0", "border": "#FB8C00", "title": "#E65100", "btn": "#FFB74D", "btn_text": "#3E2723",
+            "btn_hover": "#FFA726", "btn_off": "#FFE0B2", "load_off": "#DCEDC8", "off_text": "#8D6E63",
+            "load": "#A5D6A7", "load_text": "#1B5E20", "load_border": "#43A047", "load_hover": "#81C784"},
+    True: {"bg": "#3E2F1C", "border": "#FB8C00", "title": "#FFB74D", "btn": "#EF6C00", "btn_text": "#FFFFFF",
+           "btn_hover": "#F57C00", "btn_off": "#5D4A2E", "load_off": "#2F4A31", "off_text": "#A1887F",
+           "load": "#2E7D32", "load_text": "#FFFFFF", "load_border": "#66BB6A", "load_hover": "#388E3C"},
+}
 # Help HTML colour swaps for dark mode
 HELP_DARK_SWAPS = [("#111827", "#ECEFF1"), ("#1f2937", "#ECEFF1"), ("#374151", "#B0BEC5"),
                    ("#4b5563", "#B0BEC5"), ("#f9fafb", "#1E2327"), ("#e5e7eb", "#455A64")]
@@ -397,11 +543,14 @@ HELP_HTML = """
   <ol style="margin-top:4px;">
     <li><b>Tick your EA layers</b> (left, <i>EA Layers</i>) — every layer the involved areas come from.</li>
     <li><b>Optional:</b> pick a <i>Building Points</i> layer so each case and EA shows its building count.</li>
-    <li>Click <b>Run Check &amp; Load Cases</b> to find the gaps / overlaps and list them.
-        <i>Already have an MBI layer?</i> Pick it under <i>MBI Results Layer</i> and click
-        <b>Load MBI Cases</b> instead.</li>
+    <li><b>No MBI layer yet?</b> Click <b>Run Check &amp; Load Cases</b> (the <b style="color:#E65100;">orange</b>
+        box) to find the gaps / overlaps and list them.<br>
+        <b>Already have an MBI layer?</b> Skip the orange box: pick it under <i>MBI Results Layer</i> and click
+        <b style="color:#2e7d32;">Load MBI Cases</b> (green).</li>
     <li>In the list, <b>tick the Role / Status box of the EA that covers</b> each case — or click
-        <b>Auto-Assign Pending</b> to let the tool decide the easy ones, then review.</li>
+        <b>Auto-Assign Pending</b> to let the tool decide the easy ones, then review. An overlap that
+        runs across several EAs can be <b>shared out</b>: tick more than one EA and each keeps only its
+        own part (see <i>Shared Overlaps</i> below).</li>
     <li>Click <b>Apply Coverage</b> to write your choices into the MBI layer.</li>
     <li>Click <b>Export GPKG + CSV</b> to save the processed layer and a decision log.</li>
   </ol>
@@ -424,19 +573,23 @@ HELP_HTML = """
     <tr><td style="font-weight:bold; vertical-align:top;">EA Layers</td>
         <td>Click every EA layer the involved areas come from — an inter-barangay or inter-municipal MBI
         can involve EAs stored in different layers. EAs are matched on <i>ea_geocode</i>; the log reports
-        involved EAs that none of the selected layers contain (shown in red in the list).</td></tr>
+        involved EAs that none of the selected layers contain (shown in red in the list). The EA shapes are
+        also what <b>shared overlaps</b> are clipped to — an overlap can only be shared out when all of its
+        EAs are found in the selected layers.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Building Points</td>
         <td>Optional. <b>Case row:</b> building points inside the gap / overlap. <b>EA rows:</b> of those,
         the points whose <i>Geocode field</i> (auto: ea_geocode, then geocode) matches the EA. Used by
         Auto-Assign.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Run Topology Check</td>
-        <td>Choose <i>Overlaps and Gaps</i>, <i>Overlaps Only</i> or <i>Gaps Only</i>, then
-        <b>Run Check &amp; Load Cases</b>. It runs the EA Topology Checker on the ticked EA layers, adds one
+    <tr><td style="font-weight:bold; vertical-align:top;">Run EA MBI Check<br>(orange box)</td>
+        <td><b>Only needed if you do not have an MBI Results layer yet.</b> If you already have one, skip this
+        box. Choose <i>Overlaps and Gaps</i>, <i>Overlaps Only</i> or <i>Gaps Only</i>, then
+        <b>Run Check &amp; Load Cases</b>. It runs the EA MBI Checker on the ticked EA layers, adds one
         <i>MBI Results</i> layer (a temporary layer — right-click &gt; <b>Make Permanent</b> to keep it) and
         loads its cases. A gap / overlap that runs across more than two EAs is <b>one case</b> listing all of
         them. EA layers need <i>geocode</i> and <i>ea_geocode</i> fields and should be in EPSG:4326.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Load MBI Cases</td>
-        <td>Lists the cases of the picked MBI layer without running the check.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Load MBI Cases<br>(green button)</td>
+        <td>Lists the cases of the MBI Results layer picked at the top, without running the check. Use this
+        when you already have an MBI layer.</td></tr>
   </table>
 
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Reading the Case List</h3>
@@ -444,37 +597,78 @@ HELP_HTML = """
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">Case row (bold)</td>
         <td>One gap / overlap. Shows its MBI level, the barangays involved, how many EAs are involved and
         the <b>Bldg Pts</b> inside it. Status is <b>Pending</b> (orange) until an EA is chosen, then
-        <b>Covered by &lt;EA&gt;</b> (green).</td></tr>
+        <b>Covered by &lt;EA&gt;</b> (green) — or <b>Partly covered (x%)</b> (yellow) when the EAs ticked in a
+        shared overlap do not fill the whole MBI yet.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">EA rows (below)</td>
         <td>Each involved EA with its barangay and its own <b>Bldg Pts</b> (buildings inside this MBI tagged to
-        that EA). <b>Tick the Role / Status box of the covering EA.</b> Only one EA can cover a case —
-        ticking another moves the coverage, unticking makes the case Pending again.</td></tr>
+        that EA). <b>Tick the Role / Status box of the covering EA.</b> In a gap, or an overlap that cannot
+        be shared out, only one EA covers the case — ticking another moves the coverage. Unticking every EA
+        makes the case Pending again.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Moving around</td>
-        <td>Click a row to select it on the map, double-click to zoom, right-click for more (set covering EA,
-        mark pending, copy case ID). Use the search box and the <i>All / Pending / Covered / Overlaps /
-        Gaps / level</i> filter to find cases. Click a column header to sort.</td></tr>
+        <td>Click a row to select it on the map, double-click to zoom, right-click for more (set / add / remove
+        a covering EA, mark pending, copy case ID). Use the search box and the <i>All / Pending / Partly
+        covered / Covered / Overlaps / Gaps / level</i> filter to find cases. Click a column header to sort.</td></tr>
+  </table>
+
+  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Shared Overlaps (one MBI across several EAs)</h3>
+  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
+    <tr><td width="110" style="font-weight:bold; vertical-align:top;">What it is</td>
+        <td>An overlap that runs across several EAs (e.g. one EA of a municipality overlapping a strip of four
+        EAs of the next one) does not have to go to a single EA. Tick several EAs: <b>each ticked EA keeps only
+        its own part of the overlap</b> — the MBI clipped to that EA. The other EAs release (clip) the parts the
+        ticked EAs keep.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Order matters</td>
+        <td>Where two ticked EAs both contain the same piece of the overlap, the EA <b>ticked first</b> keeps it;
+        the later one keeps the rest of its part. To change who keeps a shared piece, untick and re-tick in the
+        order you want.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Reading the rows</td>
+        <td>Ticked EA: <b>✔ Keeps its part (x%)</b> — its share of the MBI, plus the buildings in it.
+        Unticked EA: <b>Releases (clip)</b> when all of its part is kept by ticked EAs, <b>Releases x% ·
+        candidate</b> when only some is — tick it to keep the rest. Hover a row for the areas.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">On the map</td>
+        <td>Select an EA row to see its part: <b style="color:#2e7d32;">green</b> = what it keeps,
+        <b style="color:#1565c0;">dashed blue</b> = what it would keep if ticked. Select the case row to see
+        every kept part and, in <b style="color:#e65100;">orange</b>, what no ticked EA keeps yet.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">When it applies</td>
+        <td>Overlaps with two or more EAs whose shapes are all in the selected EA layers. Gaps (no EA contains a
+        gap) and overlaps with an EA missing from the selected layers keep the one-EA-covers-all rule.</td></tr>
   </table>
 
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Roles</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
     <tr><td width="110" style="font-weight:bold;">Overlap</td>
         <td>Ticked EA: <b>Keeps overlap</b> (role <i>Covers</i>). Others: <b>Releases (clip)</b> (role <i>Releases</i>).</td></tr>
+    <tr><td style="font-weight:bold;">Shared overlap</td>
+        <td>Each ticked EA: <b>Keeps its part</b> (role <i>Covers</i>). Others: <b>Releases (clip)</b> (role
+        <i>Releases</i>) once all of their part is kept by ticked EAs; no role while part of it is undecided.</td></tr>
     <tr><td style="font-weight:bold;">Gap</td>
         <td>Ticked EA: <b>Absorbs gap</b> (role <i>Covers</i>). Others: <b>Not extended</b> (role <i>Releases</i>).</td></tr>
     <tr><td style="font-weight:bold;">Auto-Assign</td>
         <td>Single-EA cases go to that EA. Multi-EA cases go to the EA that owns most of the buildings inside
-        the MBI (needs Building Points); no tagged buildings or a tie stays Pending — decide those by hand.</td></tr>
+        the MBI (needs Building Points); shared overlaps go to <b>every</b> EA with tagged buildings, most
+        buildings first, each keeping its part. No tagged buildings or a tie stays Pending — decide those by
+        hand. Auto-assigned shared overlaps can end up Partly covered: check them with <i>Show: Partly
+        covered</i>.</td></tr>
   </table>
 
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Apply Coverage — Fields Written</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">Coverage field<br>(default <i>assigned_ea</i>)</td>
-        <td>Code of the covering EA, on every row of the case. Empty while the case is Pending.</td></tr>
+        <td>Code of the covering EA, on every row of the case — several codes, comma-separated, for a shared
+        overlap (in the order ticked). Empty while the case is Pending.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">ea_role</td>
-        <td><b>Covers</b> on the covering EA's rows, <b>Releases</b> on the others. Empty while Pending.</td></tr>
+        <td><b>Covers</b> on the covering EAs' rows, <b>Releases</b> on the others. Empty while Pending (and,
+        in a shared overlap, for an EA whose part is not fully kept by the ticked EAs).</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Status field<br>(default <i>coverage_status</i>)</td>
-        <td><b>1_Covered</b> — an EA covers the case. <b>2_Not Covered</b> — the case is still Pending.
+        <td><b>1_Covered</b> — the case is fully covered. <b>2_Not Covered</b> — the case is still Pending.
+        <b>3_Partially Covered</b> — a shared overlap where part of the MBI has no covering EA yet.
         Written for every loaded case, so you can filter or symbolise on it.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">MBI Coverage Parts<br>(new layer)</td>
+        <td>A temporary layer added (and refreshed on every Apply) showing <b>the part of each MBI every covering EA
+        keeps</b>: <i>part_role</i> <b>Kept</b> (green) with the EA's <i>ea_geocode</i>, name, barangay,
+        <i>area_m2</i>, <i>pct_of_mbi</i>, <i>num_bldg_pts</i> and <i>released_by</i> (the EAs that must clip it
+        out), plus <b>Unassigned</b> (orange) for what no covering EA keeps yet. Right-click &gt; <b>Make
+        Permanent</b> to keep it.</td></tr>
   </table>
   <div style="color:#4b5563; margin-top:4px;">The two field names can be changed in the panel (letters, digits and
   underscores only, all different). Missing fields are added to the MBI layer automatically.</div>
@@ -484,14 +678,17 @@ HELP_HTML = """
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">Export folder</td>
         <td>Where the files go. Leave it empty and you are asked for a folder when you click Export.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">GeoPackage</td>
-        <td><i>mbi_ea_coverage_&lt;date&gt;_&lt;time&gt;.gpkg</i> — the whole MBI layer including the coverage fields,
-        even if you have not saved the layer's edits yet.</td></tr>
+        <td><i>mbi_ea_coverage_&lt;date&gt;_&lt;time&gt;.gpkg</i> with two layers: <i>mbi_ea_coverage</i> — the whole MBI
+        layer including the coverage fields, even if you have not saved the layer's edits yet — and
+        <i>mbi_ea_coverage_parts</i> — the kept / unassigned parts (as in the MBI Coverage Parts layer).</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">CSV</td>
-        <td><i>mbi_ea_coverage_&lt;date&gt;_&lt;time&gt;.csv</i> — one row per case / EA: case ID, type, level, building
-        counts, EA code / name / barangay, role, covering EA and status. Opens in Excel.</td></tr>
+        <td><i>mbi_ea_coverage_&lt;date&gt;_&lt;time&gt;.csv</i> — one row per case / EA: case ID, type, level, MBI area,
+        building counts, EA code / name / barangay, the EA's part and kept area (m²) and kept buildings, role,
+        covering EA(s) and status. Opens in Excel.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Not applied yet?</td>
         <td>If your choices are not in the MBI layer yet, Export offers to <b>Apply Coverage first</b>, so the
-        files always match what you see. Pending cases are exported as <b>2_Not Covered</b>.</td></tr>
+        files always match what you see. Pending cases are exported as <b>2_Not Covered</b>, partly covered
+        shared overlaps as <b>3_Partially Covered</b>.</td></tr>
   </table>
 
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">If Something Looks Wrong</h3>
@@ -502,6 +699,12 @@ HELP_HTML = """
         <td>The picked MBI layer has no <i>case_uuid</i> field — use Run Check to create a proper one.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">EA in red / "not found"</td>
         <td>The EA's layer is not ticked. Tick it, then Load again.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Can only tick one EA in an overlap</td>
+        <td>The overlap cannot be shared out: tick the layers of <b>all</b> its EAs under <i>EA Layers</i> (none
+        may be red), then Load again. Gaps always take one EA.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Stays Partly covered</td>
+        <td>The ticked EAs' parts leave some of the MBI uncovered. Select the case row to see the orange
+        leftover on the map, then tick the EA that contains it.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">EA rows show 0 buildings</td>
         <td>No building inside this MBI is tagged to that EA. Check the <i>Geocode field</i> under Building Points
         is the one holding the EA geocode.</td></tr>
@@ -522,10 +725,11 @@ class _Cancelled(Exception):
 
 def make_dialog_class():
     import re
-    from qgis.core import (QgsApplication, QgsCoordinateTransform, QgsFeature, QgsFeatureRequest,
-                           QgsField, QgsGeometry, QgsProcessingContext, QgsProcessingFeedback,
-                           QgsProject, QgsVectorFileWriter, QgsVectorLayer, QgsWkbTypes)
-    from qgis.gui import QgsFieldComboBox, QgsFileWidget, QgsMapLayerComboBox
+    from qgis.core import (QgsApplication, QgsCategorizedSymbolRenderer, QgsCoordinateTransform,
+                           QgsDistanceArea, QgsFeature, QgsFeatureRequest, QgsField, QgsFillSymbol,
+                           QgsGeometry, QgsProcessingContext, QgsProcessingFeedback, QgsProject,
+                           QgsRendererCategory, QgsVectorFileWriter, QgsVectorLayer, QgsWkbTypes)
+    from qgis.gui import QgsFieldComboBox, QgsFileWidget, QgsMapLayerComboBox, QgsRubberBand
     from qgis.PyQt import QtWidgets
     from qgis.PyQt.QtCore import QEvent, Qt, QVariant
     from qgis.PyQt.QtGui import QBrush, QColor
@@ -669,6 +873,9 @@ def make_dialog_class():
             self.case_items = {}      # case_uuid -> top-level tree item
             self.ea_lookup = {}       # ea_geocode -> {name, fid, layer_id}
             self.mbi_layer_id = None
+            self.parts_layer_id = None   # MBI Coverage Parts layer written by Apply
+            self.da = None               # QgsDistanceArea for the MBI layer (m²)
+            self._bands = {}             # map highlights of the selected EA's MBI part
             self.running = False
             self.cancel_requested = False
             self._painting = False
@@ -730,7 +937,7 @@ def make_dialog_class():
 
             box, lay = group("MBI Results Layer")
             self.mbi_combo = layer_combo(polygon_filter)
-            self.mbi_combo.setToolTip("Gaps / Overlaps output of the EA Topology Checker.")
+            self.mbi_combo.setToolTip("Gaps / Overlaps output of the EA MBI Checker.")
             lay.addWidget(self.mbi_combo)
             self.mbi_hint = self._hint()
             lay.addWidget(self.mbi_hint)
@@ -784,15 +991,23 @@ def make_dialog_class():
             lay.addWidget(self.bldg_hint)
             ll.addWidget(box)
 
-            box, lay = group("Run Topology Check")
+            box, lay = group("Run EA MBI Check (only if you have no MBI layer)")
+            self.run_box = box
+            box.setObjectName("runBox")
+            self.run_note = QtWidgets.QLabel(
+                "Already have an MBI Results layer? Skip this box: pick it at the top, "
+                "then click Load MBI Cases.")
+            self.run_note.setWordWrap(True)
+            lay.addWidget(self.run_note)
             self.mode_combo = QtWidgets.QComboBox()
             self.mode_combo.addItems(RUN_MODES)
-            self.mode_combo.setToolTip("Which discrepancies the EA Topology Checker looks for.")
+            self.mode_combo.setToolTip("Which discrepancies the EA MBI Checker looks for.")
             lay.addWidget(self.mode_combo)
             self.run_btn = button("Run Check && Load Cases")
             self.run_btn.setToolTip(
-                "Run the EA Topology Checker on the ticked EA layers (and Building Points),\n"
+                "Run the EA MBI Checker on the ticked EA layers (and Building Points),\n"
                 "add the resulting MBI Results layer and list its cases in the viewer.")
+            self.run_btn.setObjectName("runBtn")
             self.run_btn.clicked.connect(self.run_check)
             lay.addWidget(self.run_btn)
             self.run_hint = self._hint()
@@ -802,6 +1017,7 @@ def make_dialog_class():
             self.load_btn = button("Load MBI Cases")
             self.load_btn.setToolTip("Read the existing MBI Results layer (picked above) and list each\n"
                                      "case with all of its involved EAs.")
+            self.load_btn.setObjectName("loadBtn")
             self.load_btn.clicked.connect(lambda: self.load_cases())
             ll.addWidget(self.load_btn)
             r1 = QtWidgets.QHBoxLayout()
@@ -862,7 +1078,10 @@ def make_dialog_class():
                             "Case row: buildings inside the gap / overlap (num_bldg_pts, or a live\n"
                             "count when Building Points is set).\n"
                             "EA row: of those, the buildings whose geocode belongs to that EA.")
-            head.setToolTip(COL_ROLE, "Tick the EA that covers the MBI (one per case).")
+            head.setToolTip(COL_ROLE,
+                            "Tick the EA that covers the MBI.\n"
+                            "Overlap across several EAs: tick more than one — each ticked EA keeps\n"
+                            "only its own part of the overlap (the MBI clipped to that EA).")
             self.tree.setAlternatingRowColors(True)
             self.tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
             self.tree.setUniformRowHeights(True)
@@ -877,7 +1096,8 @@ def make_dialog_class():
             swatch = '<span style="background-color:{}; border:1px solid #999;">&nbsp;&nbsp;&nbsp;</span> {}'
             self.legend = QtWidgets.QLabel(" &nbsp;&nbsp;".join([
                 swatch.format(COLOUR_PENDING, "Pending"),
-                swatch.format(COLOUR_COVERED, "Covers MBI"),
+                swatch.format(COLOUR_PARTIAL, "Partly covered"),
+                swatch.format(COLOUR_COVERED, "Covers MBI / its part"),
                 swatch.format(COLOUR_RELEASED, "Releases / not extended"),
             ]) + " &nbsp;&nbsp;·&nbsp; Double-click: zoom · Right-click: more")
             rl.addWidget(self.legend)
@@ -891,14 +1111,17 @@ def make_dialog_class():
             self.field_edit = QtWidgets.QLineEdit(COVERAGE_FIELD)
             self.field_edit.setMaximumWidth(140)
             self.field_edit.textChanged.connect(self.validate_inputs)
-            self.field_edit.setToolTip("Field that receives the code of the covering EA.")
+            self.field_edit.setToolTip("Field that receives the code(s) of the covering EA(s),\n"
+                                       "comma-separated when an overlap is shared out.")
             orow.addWidget(self.field_edit)
             orow.addSpacing(10)
             orow.addWidget(QtWidgets.QLabel("Status field:"))
             self.status_edit = QtWidgets.QLineEdit(STATUS_FIELD)
             self.status_edit.setMaximumWidth(140)
             self.status_edit.setToolTip(f"Field that receives the case status: '{STATUS_COVERED}' "
-                                        f"(an EA covers it) or '{STATUS_NOT_COVERED}' (still pending).")
+                                        f"(fully covered), '{STATUS_PARTIAL}' (part of a shared\n"
+                                        f"overlap has no covering EA yet) or '{STATUS_NOT_COVERED}' "
+                                        "(still pending).")
             self.status_edit.textChanged.connect(self.validate_inputs)
             orow.addWidget(self.status_edit)
             orow.addStretch(1)
@@ -918,23 +1141,25 @@ def make_dialog_class():
             self.auto_btn.setToolTip(
                 "Single-EA cases go to that EA. Multi-EA cases go to the EA that owns most of\n"
                 "the buildings inside the MBI (needs Building Points + geocode field);\n"
-                "no tagged buildings or a tie stays pending.")
+                "shared overlaps go to every EA with tagged buildings, most first, each keeping\n"
+                "its own part. No tagged buildings or a tie stays pending.")
             self.auto_btn.clicked.connect(self.auto_assign)
             self.reset_btn = button("Reset Choices", 32, BTN_CANCEL)
             self.reset_btn.setToolTip("Clear every EA tick in the viewer (nothing is written).")
             self.reset_btn.clicked.connect(self.reset_choices)
             self.apply_btn = button("Apply Coverage", 32, BTN_EXPORT)
             self.apply_btn.setToolTip(
-                f"Writes the covering EA ('{COVERAGE_FIELD}'), each row's role ('{ROLE_FIELD}') and\n"
-                f"the case status ('{STATUS_FIELD}': {STATUS_COVERED} / {STATUS_NOT_COVERED}) into the\n"
-                "MBI layer. Changes are left UNSAVED (the layer enters edit mode) — use QGIS's\n"
+                f"Writes the covering EA(s) ('{COVERAGE_FIELD}'), each row's role ('{ROLE_FIELD}') and\n"
+                f"the case status ('{STATUS_FIELD}') into the MBI layer, and refreshes the\n"
+                f"'{PARTS_LAYER_NAME}' layer (the part of each MBI every covering EA keeps).\n"
+                "Changes are left UNSAVED (the layer enters edit mode) — use QGIS's\n"
                 "Save Edits to keep them, or Cancel Edits to discard and revert.")
             self.apply_btn.clicked.connect(self.apply_coverage)
             self.export_btn = button("Export GPKG + CSV", 32, BTN_EXPORT)
             self.export_btn.setToolTip(
-                "Write the processed MBI layer (with the coverage fields) to a GeoPackage, plus a\n"
-                "CSV of every case / EA decision, into the Export folder. Choices not yet applied\n"
-                "are applied first.")
+                "Write the processed MBI layer (with the coverage fields) and the coverage parts\n"
+                "to a GeoPackage, plus a CSV of every case / EA decision, into the Export folder.\n"
+                "Choices not yet applied are applied first.")
             self.export_btn.clicked.connect(self.export_results)
             arow.addWidget(self.auto_btn, 1)
             arow.addWidget(self.reset_btn, 1)
@@ -996,7 +1221,8 @@ def make_dialog_class():
             current = self.show_combo.currentData()
             self.show_combo.blockSignals(True)
             self.show_combo.clear()
-            for label, data in [("All cases", None), ("Pending", "pending"), ("Covered", "covered"),
+            for label, data in [("All cases", None), ("Pending", "pending"),
+                                ("Partly covered", "partial"), ("Covered", "covered"),
                                 ("Overlaps", "type:Overlap"), ("Gaps", "type:Gap")]:
                 self.show_combo.addItem(label, data)
             for lvl in sorted(levels):
@@ -1024,6 +1250,22 @@ def make_dialog_class():
             self.ea_list.setStyleSheet(t["list"])
             self.tree.setStyleSheet(t["tree"])
             self.legend.setStyleSheet(f"font-size:11px; color:{t['hint']}; padding:2px 0;")
+            rc = RUN_COLOURS[self.is_dark]
+            self.run_box.setStyleSheet(
+                GRP_STYLE + f" QGroupBox#runBox {{ background-color:{rc['bg']}; border:1px solid {rc['border']};"
+                f" border-radius:4px; margin-top:8px; padding-top:6px; }}"
+                f" QGroupBox#runBox::title {{ color:{rc['title']}; }}")
+            self.run_note.setStyleSheet(f"color:{rc['title']}; font-size:11px; font-style:italic;")
+            self.run_btn.setStyleSheet(
+                f"QPushButton#runBtn {{ background-color:{rc['btn']}; color:{rc['btn_text']}; font-weight:600;"
+                f" border:1px solid {rc['border']}; border-radius:3px; }}"
+                f" QPushButton#runBtn:hover {{ background-color:{rc['btn_hover']}; }}"
+                f" QPushButton#runBtn:disabled {{ background-color:{rc['btn_off']}; color:{rc['off_text']}; }}")
+            self.load_btn.setStyleSheet(
+                f"QPushButton#loadBtn {{ background-color:{rc['load']}; color:{rc['load_text']}; font-weight:600;"
+                f" border:1px solid {rc['load_border']}; border-radius:3px; }}"
+                f" QPushButton#loadBtn:hover {{ background-color:{rc['load_hover']}; }}"
+                f" QPushButton#loadBtn:disabled {{ background-color:{rc['load_off']}; color:{rc['off_text']}; }}")
             html = HELP_HTML
             if self.is_dark:
                 for a, b in HELP_DARK_SWAPS:
@@ -1043,6 +1285,7 @@ def make_dialog_class():
 
         # ──────────────── teardown ────────────────
         def _teardown(self):
+            self.clear_bands()
             prj = QgsProject.instance()
             for sig in (prj.layersAdded, prj.layersRemoved):
                 try:
@@ -1109,7 +1352,7 @@ def make_dialog_class():
                                              "Run Check & Load Cases below.")
                 ok = False
             elif "case_uuid" not in field_names(mbi):
-                self.set_hint(self.mbi_hint, "Missing 'case_uuid' field — run the EA Topology "
+                self.set_hint(self.mbi_hint, "Missing 'case_uuid' field — run the EA MBI "
                                              "Checker to produce an MBI layer.", "error")
                 ok = False
             else:
@@ -1159,7 +1402,7 @@ def make_dialog_class():
             else:
                 self.set_hint(self.folder_hint, "Folder does not exist.", "error")
 
-            # Run Topology Check: needs EA layers carrying the checker's fields.
+            # Run EA MBI Check: needs EA layers carrying the checker's fields.
             if not eas:
                 self._run_ok = False
                 self.set_hint(self.run_hint, "Tick the EA layer(s) to check.")
@@ -1216,12 +1459,13 @@ def make_dialog_class():
                 self.summary.setText("Cancelling…")
 
         def clear_all(self):
-            unsaved = sum(1 for c in self.cases.values() if c.assigned_ea != c.saved_ea)
+            unsaved = sum(1 for c in self.cases.values() if c.assigned != c.saved)
             if unsaved and QtWidgets.QMessageBox.question(
                     self, DIALOG_TITLE,
                     f"{unsaved:,} choice(s) have not been applied yet. Clear the viewer anyway?",
                     QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel) != QtWidgets.QMessageBox.Yes:
                 return
+            self.clear_bands()
             self._painting = True
             self.tree.clear()
             self._painting = False
@@ -1262,17 +1506,20 @@ def make_dialog_class():
 
         def update_summary(self):
             total = len(self.cases)
-            covered = sum(1 for c in self.cases.values() if c.assigned_ea)
+            covered = sum(1 for c in self.cases.values() if c.status == "covered")
+            partial = sum(1 for c in self.cases.values() if c.status == "partial")
             shown = sum(1 for t in self.case_items.values() if not t.isHidden())
             if not total:
                 text = NO_CASES
             else:
-                text = f"{total:,} MBI case(s) - {total - covered:,} pending, {covered:,} covered."
+                text = (f"{total:,} MBI case(s) - {total - covered - partial:,} pending, "
+                        + (f"{partial:,} partly covered, " if partial else "")
+                        + f"{covered:,} covered.")
                 if shown != total:
                     text += f" Showing {shown:,}."
-                unapplied = any(c.assigned_ea != c.saved_ea for c in self.cases.values())
+                unapplied = any(c.assigned != c.saved for c in self.cases.values())
                 if covered < total:
-                    text += " Tick the covering EA of each case in the viewer."
+                    text += " Tick the covering EA(s) of each case in the viewer."
                 elif unapplied:
                     text += " Click Apply Coverage to write the choices."
                 else:
@@ -1285,7 +1532,7 @@ def make_dialog_class():
         # ──────────────── load ────────────────
         # ──────────────── run topology check ────────────────
         def _unapplied_ok(self, action):
-            unsaved = sum(1 for c in self.cases.values() if c.assigned_ea != c.saved_ea)
+            unsaved = sum(1 for c in self.cases.values() if c.assigned != c.saved)
             return not unsaved or QtWidgets.QMessageBox.question(
                 self, DIALOG_TITLE,
                 f"{unsaved:,} choice(s) have not been applied yet. {action} anyway?",
@@ -1305,11 +1552,11 @@ def make_dialog_class():
 
             self.set_busy(True)
             self.log("=" * 50)
-            self.log(f"Running EA Topology Check ({RUN_MODES[mode]}) on {len(eas)} EA layer(s): "
+            self.log(f"Running EA MBI Check ({RUN_MODES[mode]}) on {len(eas)} EA layer(s): "
                      + ", ".join(l.name() for l in eas))
             if bldg is None:
                 self.log("  No Building Points layer — building counts will be 0.")
-            self.summary.setText("Running the EA Topology Check…")
+            self.summary.setText("Running the EA MBI Check…")
             result = None
             start = datetime.now()
             try:
@@ -1321,10 +1568,10 @@ def make_dialog_class():
                 context = QgsProcessingContext()
                 context.setProject(QgsProject.instance())
                 context.setFeedback(feedback)
-                alg = topo.GapsOverlaps()
+                alg = topo.EAMBIChecker()
                 alg.initAlgorithm()
-                alg.processAlgorithm({'INPUT1': eas, 'INPUT2': bldg_inputs,
-                                      'RUN_MODE': mode, 'EXPORT_MBI': False}, context, feedback)
+                alg.processAlgorithm({'EA_LAYERS': eas, 'BLDG_LAYERS': bldg_inputs,
+                                      'RUN_MODE': mode}, context, feedback)
                 if feedback.isCanceled():
                     raise _Cancelled()
                 store = context.temporaryLayerStore()
@@ -1343,11 +1590,11 @@ def make_dialog_class():
                     self.log(f"Added layer '{result.name()}' ({result.featureCount():,} row(s), {elapsed}). "
                              "It is a temporary layer — right-click > Make Permanent to keep it.")
             except _Cancelled:
-                self.log("Topology check cancelled.")
+                self.log("EA MBI check cancelled.")
                 result = None
             except Exception as e:
                 self.log(traceback.format_exc().rstrip())
-                self.log(f"Topology check FAILED: {e}")
+                self.log(f"EA MBI check FAILED: {e}")
                 result = None
             finally:
                 self._run_feedback = None
@@ -1408,7 +1655,7 @@ def make_dialog_class():
                         self, DIALOG_TITLE, f"No features are selected in '{mbi.name()}'.")
                     return
 
-            previous = ({u: c.assigned_ea for u, c in self.cases.items() if c.assigned_ea}
+            previous = ({u: list(c.assigned) for u, c in self.cases.items() if c.assigned}
                         if mbi.id() == self.mbi_layer_id else {})
             field = self.coverage_field()
             preload = field if (self.preload_check.isChecked()
@@ -1425,11 +1672,13 @@ def make_dialog_class():
                 involved = {c for case in cases.values() for c in case.candidates}
                 self.log(f"  {len(cases):,} case(s) involving {len(involved):,} EA(s)")
                 if preload:
-                    resumed = sum(1 for c in cases.values() if c.assigned_ea)
+                    resumed = sum(1 for c in cases.values() if c.assigned)
                     self.log(f"  Resumed {resumed:,} saved choice(s) from '{preload}'")
-                for uuid, code in previous.items():
-                    if uuid in cases and code in cases[uuid].candidates:
-                        cases[uuid].assigned_ea = code
+                for uuid, codes in previous.items():
+                    if uuid in cases:
+                        cases[uuid].assigned = [c for c in codes if c in cases[uuid].candidates]
+                self.da = self._distance_area(mbi)
+                self.load_geometry(cases, mbi)
 
                 lookup = {}
                 if eas:
@@ -1461,8 +1710,13 @@ def make_dialog_class():
                     if dupes:
                         self.log(f"  {dupes:,} duplicate ea_geocode(s) across layers — the first "
                                  "selected layer's EA is used.")
+                    self.compute_parts(cases, mbi, lookup)
                 if bldg is not None:
                     self.count_buildings(cases, mbi, bldg, bldg_field)
+                for case in cases.values():
+                    if not case.split:
+                        case.assigned = case.assigned[:1]
+                    case.resolve(self.da)
 
                 self.cases = cases
                 self.ea_lookup = lookup
@@ -1480,25 +1734,104 @@ def make_dialog_class():
                 self.set_busy(False)
                 self.update_summary()
 
+        def _distance_area(self, layer):
+            """Ellipsoidal areas in m², whatever the layer CRS (degrees for EPSG:4326)."""
+            prj = QgsProject.instance()
+            da = QgsDistanceArea()
+            da.setSourceCrs(layer.crs(), prj.transformContext())
+            ellipsoid = prj.ellipsoid()
+            da.setEllipsoid(ellipsoid if ellipsoid and ellipsoid.upper() != "NONE" else "EPSG:7030")
+            return da
+
+        def load_geometry(self, cases, mbi_layer):
+            """MBI geometry of each case. Every row of a case carries the same geometry, so
+            one row per case is read."""
+            first_fid = {case.feature_ids[0]: case for case in cases.values() if case.feature_ids}
+            request = QgsFeatureRequest().setFilterFids(list(first_fid)).setNoAttributes()
+            total = max(len(first_fid), 1)
+            for i, feat in enumerate(mbi_layer.getFeatures(request)):
+                if i % 200 == 0:
+                    self.tick(i, total, "Reading MBI geometry…")
+                if not feat.hasGeometry():
+                    continue
+                geom = QgsGeometry(feat.geometry())
+                if not geom.isGeosValid():
+                    geom = geom.makeValid()
+                case = first_fid[feat.id()]
+                case.geom = _polygonal(geom)
+                case.area = _area(case.geom, self.da)
+
+        def compute_parts(self, cases, mbi_layer, lookup):
+            """Clip each case's MBI to every involved EA (MBI ∩ EA). An overlap whose
+            involved EAs all have a part is 'split': several EAs can cover it, each keeping
+            only its own part."""
+            prj = QgsProject.instance()
+            wanted = {}   # layer_id -> {fid: [(case, cand)]}
+            for case in cases.values():
+                if case.geom is None:
+                    continue
+                for cand in case.candidates.values():
+                    info = lookup.get(cand.code)
+                    if info:
+                        wanted.setdefault(info["layer_id"], {}).setdefault(
+                            info["fid"], []).append((case, cand))
+            total = max(sum(len(v) for v in wanted.values()), 1)
+            done = 0
+            for layer_id, by_fid in wanted.items():
+                layer = prj.mapLayer(layer_id)
+                if layer is None:
+                    continue
+                xform = QgsCoordinateTransform(layer.crs(), mbi_layer.crs(), prj)
+                request = QgsFeatureRequest().setFilterFids(list(by_fid)).setNoAttributes()
+                for feat in layer.getFeatures(request):
+                    if done % 50 == 0:
+                        self.tick(done, total, f"Clipping MBIs to their EAs ({done:,}/{total:,})…")
+                    done += 1
+                    if not feat.hasGeometry():
+                        continue
+                    ea_geom = QgsGeometry(feat.geometry())
+                    if layer.crs() != mbi_layer.crs():
+                        ea_geom.transform(xform)
+                    if not ea_geom.isGeosValid():
+                        ea_geom = ea_geom.makeValid()
+                    for case, cand in by_fid[feat.id()]:
+                        cand.part = _polygonal(case.geom.intersection(ea_geom))
+                        cand.part_area = _area(cand.part, self.da)
+
+            split = unsplit = 0
+            for case in cases.values():
+                cands = list(case.candidates.values())
+                is_overlap = case.mbi_type.lower() != "gap"
+                case.split = (is_overlap and case.geom is not None and len(cands) > 1
+                              and all(c.part is not None for c in cands)
+                              and sum(c.part_area for c in cands) > SLIVER_M2)
+                if case.split:
+                    split += 1
+                elif is_overlap and len(cands) > 1:
+                    unsplit += 1
+            self.log(f"  {split:,} overlap case(s) can be shared out between their EAs "
+                     "(each covering EA keeps only its part)")
+            if unsplit:
+                self.log(f"  {unsplit:,} overlap case(s) have an involved EA missing from the "
+                         "selected layers — one EA covers the whole MBI there")
+
         def count_buildings(self, cases, mbi_layer, bldg_layer, gc_field=None):
             """Case: building points inside the MBI area. EA: those of them whose geocode
             (gc_field) matches the EA's ea_geocode, or its geocode when only one involved
             EA has it. Points matching no involved EA are counted as untagged."""
             prj = QgsProject.instance()
             xform = QgsCoordinateTransform(mbi_layer.crs(), bldg_layer.crs(), prj)
-            # Every row of a case carries the same MBI geometry, so read one per case.
-            first_fid = {case.feature_ids[0]: case for case in cases.values() if case.feature_ids}
-            total = max(len(first_fid), 1)
-            self.log(f"Counting buildings inside {len(first_fid):,} MBI case(s) from "
+            with_geom = [case for case in cases.values() if case.geom is not None]
+            total = max(len(with_geom), 1)
+            self.log(f"Counting buildings inside {len(with_geom):,} MBI case(s) from "
                      f"'{bldg_layer.name()}'"
                      + (f", per EA by '{gc_field}'…" if gc_field else " (no geocode field: case totals only)…"))
-            request = QgsFeatureRequest().setFilterFids(list(first_fid)).setNoAttributes()
             n_in = n_tagged = 0
-            for i, feat in enumerate(mbi_layer.getFeatures(request)):
+            for i, case in enumerate(with_geom):
                 if i % 25 == 0:
                     self.tick(total + i, total * 2, f"Counting buildings ({i:,}/{total:,})…")
-                case = first_fid[feat.id()]
                 case.bldg_live, case.bldg_untagged = 0, 0
+                case.bldg_geoms = []
                 by_key = {}
                 if gc_field:
                     for cand in case.candidates.values():
@@ -1513,9 +1846,7 @@ def make_dialog_class():
                         k = _code_key(cand.geocode)
                         if k and shared[k] == 1:
                             by_key.setdefault(k, cand)
-                if not feat.hasGeometry():
-                    continue
-                geom = QgsGeometry(feat.geometry())
+                geom = QgsGeometry(case.geom)
                 geom.transform(xform)
                 engine = QgsGeometry.createGeometryEngine(geom.constGet())
                 engine.prepareGeometry()
@@ -1528,6 +1859,9 @@ def make_dialog_class():
                     if not p.hasGeometry() or not engine.intersects(p.geometry().constGet()):
                         continue
                     case.bldg_live += 1
+                    # kept in the MBI CRS to count the buildings in each EA's kept part
+                    case.bldg_geoms.append(QgsGeometry.fromPointXY(xform.transform(
+                        p.geometry().centroid().asPoint(), QgsCoordinateTransform.ReverseTransform)))
                     cand = by_key.get(_code_key(p[gc_field])) if gc_field else None
                     if cand is not None:
                         cand.bldg += 1
@@ -1609,6 +1943,18 @@ def make_dialog_class():
             self._fill_show_combo({c.level for c in self.cases.values() if c.level})
             self.apply_filter()
 
+        def _area_text(self, m2):
+            return f"{m2 / 10000:,.2f} ha" if m2 >= 10000 else f"{m2:,.1f} m²"
+
+        def _covered_by(self, case, long=False):
+            # EA names repeat across barangays ("EA 000000"), so short labels use the code.
+            cands = [case.candidates[c] for c in case.assigned]
+            if len(cands) == 1 and not long:
+                return cands[0].label
+            if len(cands) > 2 and not long:
+                return f"{len(cands)} EAs"
+            return ", ".join(c.label if long else c.code for c in cands)
+
         def paint_case(self, case):
             top = self.case_items.get(case.case_uuid)
             if top is None:
@@ -1620,24 +1966,60 @@ def make_dialog_class():
             for i in range(top.childCount()):
                 child = top.child(i)
                 code = child.data(COL_ID, ROLE_EA)
-                if case.assigned_ea == code:
+                cand = case.candidates.get(code)
+                if cand is None:
+                    continue
+                tip = ""
+                if case.split:
+                    tip = (f"Part of this MBI inside {cand.code}: {self._area_text(cand.part_area)} "
+                           f"({_pct(cand.part_area / case.area if case.area else 0)} of the MBI)")
+                if code in case.assigned:
                     child.setCheckState(COL_ROLE, Qt.Checked)
-                    child.setText(COL_ROLE, on_text)
+                    if case.split:
+                        share = cand.kept_area / case.area if case.area else 0
+                        text = f"✔ Keeps its part ({_pct(share)})" if cand.kept_area > SLIVER_M2 \
+                            else "✔ Keeps nothing (already kept)"
+                        if cand.kept_bldg:
+                            text += f" · {cand.kept_bldg:,} bldg"
+                        tip += (f"\nKeeps {self._area_text(cand.kept_area)}"
+                                + (" (the rest of its part is kept by an EA ticked before it)"
+                                   if cand.kept_area < cand.part_area - SLIVER_M2 else ""))
+                    else:
+                        text = on_text
+                    child.setText(COL_ROLE, text)
                     paint(child, COL_ROLE, COLOUR_COVERED)
-                elif case.assigned_ea:
+                elif case.assigned and cand.released >= 0.995:
                     child.setCheckState(COL_ROLE, Qt.Unchecked)
                     child.setText(COL_ROLE, off_text)
                     paint(child, COL_ROLE, COLOUR_RELEASED)
+                elif case.assigned and cand.released > 0.005:
+                    child.setCheckState(COL_ROLE, Qt.Unchecked)
+                    child.setText(COL_ROLE, f"Releases {_pct(cand.released)} · candidate")
+                    tip += (f"\n{_pct(cand.released)} of its part is kept by the ticked EA(s); "
+                            "tick it to keep the rest.")
+                    paint(child, COL_ROLE, None)
                 else:
                     child.setCheckState(COL_ROLE, Qt.Unchecked)
                     child.setText(COL_ROLE, "Candidate")
                     paint(child, COL_ROLE, None)
-            if case.assigned_ea:
-                cand = case.candidates.get(case.assigned_ea)
-                top.setText(COL_ROLE, f"Covered by {cand.label if cand else case.assigned_ea}")
+                child.setToolTip(COL_ROLE, tip.strip())
+            status = case.status
+            if status == "covered":
+                top.setText(COL_ROLE, f"Covered by {self._covered_by(case)}")
+                top.setToolTip(COL_ROLE, f"Covered by {self._covered_by(case, True)}")
                 paint(top, COL_ROLE, COLOUR_COVERED)
+            elif status == "partial":
+                top.setText(COL_ROLE, f"Partly covered ({_pct(case.covered)}) by {self._covered_by(case)}")
+                top.setToolTip(COL_ROLE, f"{_pct(case.covered)} of the MBI is kept by "
+                                         f"{self._covered_by(case, True)}.\n"
+                                         f"{self._area_text(case.area * (1 - case.covered))} has no "
+                                         "covering EA yet — tick another EA to cover it.")
+                paint(top, COL_ROLE, COLOUR_PARTIAL)
             else:
                 top.setText(COL_ROLE, "Pending")
+                top.setToolTip(COL_ROLE, "Tick the covering EA(s) below."
+                               + ("\nShared overlap: each ticked EA keeps only its own part."
+                                  if case.split else ""))
                 paint(top, COL_ROLE, COLOUR_PENDING)
             self._painting = was_painting
 
@@ -1647,25 +2029,38 @@ def make_dialog_class():
             case = self.cases.get(item.data(COL_ID, ROLE_UUID))
             if case is None:
                 return
-            code = item.data(COL_ID, ROLE_EA)
-            if item.checkState(COL_ROLE) == Qt.Checked:
-                self.set_assignment(case, code)
-            elif case.assigned_ea == code:
-                self.set_assignment(case, "")
+            self.toggle_ea(case, item.data(COL_ID, ROLE_EA), item.checkState(COL_ROLE) == Qt.Checked)
 
-        def set_assignment(self, case, code, quiet=False):
-            if case.assigned_ea == code:
+        def toggle_ea(self, case, code, on):
+            """Tick / untick a covering EA. Shared overlaps keep every ticked EA (each keeps
+            its own part); otherwise ticking an EA moves the coverage to it."""
+            if on:
+                if code in case.assigned:
+                    return
+                codes = case.assigned + [code] if case.split else [code]
+            else:
+                codes = [c for c in case.assigned if c != code]
+            self.set_assignment(case, codes)
+
+        def set_assignment(self, case, codes, quiet=False):
+            codes = list(codes)
+            if case.assigned == codes:
                 return
-            case.assigned_ea = code
+            case.assigned = codes
+            case.resolve(self.da)
             self.paint_case(case)
             if not quiet:
+                status = case.status
                 self.log(f"{case.mbi_type or 'MBI'} {case.short_id} → "
-                         + (f"covered by {case.candidates[code].label}" if code else "pending"))
+                         + ("pending" if status == "pending" else
+                            f"covered by {self._covered_by(case, True)}" if status == "covered" else
+                            f"partly covered ({_pct(case.covered)}) by {self._covered_by(case, True)}"))
                 self.filter_item(case)
                 self.update_summary()
+                self.on_selection_changed()
 
         def reset_choices(self):
-            if not any(c.assigned_ea for c in self.cases.values()):
+            if not any(c.assigned for c in self.cases.values()):
                 return
             if QtWidgets.QMessageBox.question(
                     self, DIALOG_TITLE, "Clear every EA tick in the preview?\n"
@@ -1673,16 +2068,14 @@ def make_dialog_class():
                     QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel) != QtWidgets.QMessageBox.Yes:
                 return
             for case in self.cases.values():
-                self.set_assignment(case, "", quiet=True)
+                self.set_assignment(case, [], quiet=True)
             self.log("All choices cleared.")
             self.apply_filter()
 
         # ──────────────── filter ────────────────
         def _case_visible(self, case):
             mode = self.show_combo.currentData()
-            if mode == "pending" and case.assigned_ea:
-                return False
-            if mode == "covered" and not case.assigned_ea:
+            if mode in ("pending", "partial", "covered") and case.status != mode:
                 return False
             if mode and mode.startswith("type:") and case.mbi_type != mode[5:]:
                 return False
@@ -1732,6 +2125,66 @@ def make_dialog_class():
                 layer = prj.mapLayer(layer_id)
                 if layer is not None:
                     layer.selectByIds(list(ea_fids.get(layer_id, ())))
+            self.show_bands()
+
+        # Map highlights: green = part kept by a covering EA, dashed blue = the part an
+        # unticked EA would keep, orange = part of the MBI no covering EA keeps yet.
+        BAND_STYLES = {"kept": ((67, 160, 71, 110), "#1b5e20", Qt.SolidLine),
+                       "part": ((30, 136, 229, 70), "#0d47a1", Qt.DashLine),
+                       "left": ((251, 140, 0, 110), "#e65100", Qt.SolidLine)}
+
+        def clear_bands(self):
+            for band in self._bands.values():
+                try:
+                    band.reset(QgsWkbTypes.PolygonGeometry)
+                    if self.iface is not None:
+                        self.iface.mapCanvas().scene().removeItem(band)
+                except RuntimeError:
+                    pass
+            self._bands = {}
+
+        def _band(self, kind):
+            band = self._bands.get(kind)
+            if band is None:
+                fill, stroke, style = self.BAND_STYLES[kind]
+                band = QgsRubberBand(self.iface.mapCanvas(), QgsWkbTypes.PolygonGeometry)
+                band.setFillColor(QColor(*fill))
+                band.setStrokeColor(QColor(stroke))
+                band.setWidth(2)
+                band.setLineStyle(style)
+                self._bands[kind] = band
+            return band
+
+        def show_bands(self):
+            """Highlight on the map the part of the MBI each selected EA keeps (or would keep)."""
+            if self.iface is None:
+                return
+            for band in self._bands.values():
+                band.reset(QgsWkbTypes.PolygonGeometry)
+            mbi = self.mbi_layer
+            if mbi is None:
+                return
+            geoms = {"kept": [], "part": [], "left": []}
+            for item in self.tree.selectedItems():
+                case = self.cases.get(item.data(COL_ID, ROLE_UUID))
+                if case is None or not case.split:
+                    continue
+                code = item.data(COL_ID, ROLE_EA)
+                cands = [case.candidates.get(code)] if code else list(case.candidates.values())
+                for cand in cands:
+                    if cand is None:
+                        continue
+                    if cand.kept is not None:
+                        geoms["kept"].append(cand.kept)
+                    elif code and cand.part is not None:
+                        geoms["part"].append(cand.part)
+                if not code and case.status == "partial" and case.unassigned is not None:
+                    geoms["left"].append(case.unassigned)
+            for kind, gs in geoms.items():
+                if gs:
+                    band = self._band(kind)
+                    for g in gs:
+                        band.addGeometry(g, mbi.crs())
 
         def on_double_click(self, item, column):
             if column == COL_ROLE and item.parent() is not None:
@@ -1779,14 +2232,24 @@ def make_dialog_class():
             if item is not None:
                 case = self.cases.get(item.data(COL_ID, ROLE_UUID))
                 code = item.data(COL_ID, ROLE_EA)
-                if case is not None and code:
+                if case is not None and code and case.split:
+                    if code in case.assigned:
+                        act = menu.addAction(f"Remove {code} from the covering EAs")
+                        act.triggered.connect(lambda: self.toggle_ea(case, code, False))
+                    else:
+                        act = menu.addAction(f"Add {code} as covering EA (keeps its part)")
+                        act.triggered.connect(lambda: self.toggle_ea(case, code, True))
+                    act = menu.addAction(f"Make {code} the only covering EA")
+                    act.setEnabled(case.assigned != [code])
+                    act.triggered.connect(lambda: self.set_assignment(case, [code]))
+                elif case is not None and code:
                     act = menu.addAction(f"Set {code} as covering EA")
-                    act.setEnabled(case.assigned_ea != code)
-                    act.triggered.connect(lambda: self.set_assignment(case, code))
+                    act.setEnabled(case.assigned != [code])
+                    act.triggered.connect(lambda: self.set_assignment(case, [code]))
                 if case is not None:
                     act = menu.addAction("Mark case as pending")
-                    act.setEnabled(bool(case.assigned_ea))
-                    act.triggered.connect(lambda: self.set_assignment(case, ""))
+                    act.setEnabled(bool(case.assigned))
+                    act.triggered.connect(lambda: self.set_assignment(case, []))
                     menu.addSeparator()
                     menu.addAction(QgsApplication.getThemeIcon("/mActionZoomToSelected.svg"),
                                    "Zoom to this", lambda: self.zoom_to_items([item]))
@@ -1799,41 +2262,162 @@ def make_dialog_class():
 
         # ──────────────── auto-assign ────────────────
         def auto_assign(self):
-            single = by_bldg = left = 0
+            single = by_bldg = shared = left = 0
             for case in self.cases.values():
-                if case.assigned_ea or not case.candidates:
+                if case.assigned or not case.candidates:
                     continue
                 cands = list(case.candidates.values())
                 if len(cands) == 1:
-                    self.set_assignment(case, cands[0].code, quiet=True)
+                    self.set_assignment(case, [cands[0].code], quiet=True)
                     single += 1
-                elif all(c.bldg is not None for c in cands):
-                    most = max(c.bldg for c in cands)
-                    leaders = [c for c in cands if c.bldg == most]
-                    if most > 0 and len(leaders) == 1:
-                        self.set_assignment(case, leaders[0].code, quiet=True)
-                        by_bldg += 1
+                elif not all(c.bldg is not None for c in cands):
+                    left += 1
+                elif case.split:
+                    # Every EA with tagged buildings keeps its part, most buildings first.
+                    owners = sorted((c for c in cands if c.bldg), key=lambda c: -c.bldg)
+                    if owners:
+                        self.set_assignment(case, [c.code for c in owners], quiet=True)
+                        shared += 1
                     else:
                         left += 1
                 else:
-                    left += 1
+                    most = max(c.bldg for c in cands)
+                    leaders = [c for c in cands if c.bldg == most]
+                    if most > 0 and len(leaders) == 1:
+                        self.set_assignment(case, [leaders[0].code], quiet=True)
+                        by_bldg += 1
+                    else:
+                        left += 1
+            partial = sum(1 for c in self.cases.values() if c.status == "partial")
             self.log(f"Auto-assign: {single:,} single-EA case(s), {by_bldg:,} to the EA owning most "
                      "of the buildings inside the MBI"
+                     + (f", {shared:,} shared overlap(s) to every EA with tagged buildings "
+                        "(each keeps its part)" if shared else "")
                      + (f", {left:,} left pending (no tagged buildings, a tie, or no building "
-                        "counts)" if left else ""))
+                        "counts)" if left else "")
+                     + (f". {partial:,} case(s) are only partly covered — review them "
+                        "(Show: Partly covered)." if partial else ""))
             self.apply_filter()
+            self.on_selection_changed()
 
         # ──────────────── apply ────────────────
         def _case_status(self, case):
-            return STATUS_COVERED if case.assigned_ea else STATUS_NOT_COVERED
+            return {"covered": STATUS_COVERED, "partial": STATUS_PARTIAL}.get(
+                case.status, STATUS_NOT_COVERED)
+
+        def _row_role(self, case, cand):
+            """Covers: a covering EA. Releases: everything this EA could keep is kept by
+            the covering EA(s). None: pending, or part of it is still undecided."""
+            if cand.code in case.assigned:
+                return ROLE_COVERS
+            if case.assigned and cand.released >= 0.995:
+                return ROLE_RELEASES
+            return None
+
+        def _status_counts(self):
+            counts = {"pending": 0, "partial": 0, "covered": 0}
+            for case in self.cases.values():
+                counts[case.status] += 1
+            return counts
 
         def _needs_apply(self, layer):
             """True when the viewer holds choices the layer does not have yet (or the layer
             is missing one of the coverage fields)."""
-            if any(c.assigned_ea != c.saved_ea for c in self.cases.values()):
+            if any(c.assigned != c.saved for c in self.cases.values()):
                 return True
             return any(layer.fields().indexOf(n) < 0
                        for n in (self.coverage_field(), ROLE_FIELD, self.status_field()))
+
+        # ──────────────── coverage parts (MBI clipped to each covering EA) ────────────────
+        PART_FIELDS = [("case_uuid", QVariant.String), ("mbi_type", QVariant.String),
+                       ("mbi_level", QVariant.String), ("part_role", QVariant.String),
+                       ("ea_geocode", QVariant.String), ("ea_name", QVariant.String),
+                       ("barangay", QVariant.String), ("city_mun", QVariant.String),
+                       ("released_by", QVariant.String), ("area_m2", QVariant.Double),
+                       ("pct_of_mbi", QVariant.Double), ("num_bldg_pts", QVariant.Int)]
+
+        def build_parts_layer(self, crs):
+            """Memory layer, one feature per covering EA holding the part of the MBI it keeps
+            ('Kept'), plus one 'Unassigned' feature per case for the part no covering EA
+            keeps yet. Together they cover every loaded MBI exactly once."""
+            uri = "MultiPolygon" + (f"?crs={crs.authid()}" if crs.authid() else "")
+            out = QgsVectorLayer(uri, PARTS_LAYER_NAME, "memory")
+            out.setCrs(crs)
+            out.dataProvider().addAttributes([QgsField(n, t) for n, t in self.PART_FIELDS])
+            out.updateFields()
+            feats = []
+
+            def add(case, geom, role, cand, released_by, area, bldg):
+                g = QgsGeometry(geom)
+                g.convertToMultiType()
+                f = QgsFeature(out.fields())
+                f.setGeometry(g)
+                f.setAttributes([
+                    case.case_uuid, case.mbi_type or None, case.level or None, role,
+                    cand.code if cand else None, (cand.name or None) if cand else None,
+                    (cand.barangay or None) if cand else None, (cand.city_mun or None) if cand else None,
+                    ",".join(released_by) or None, round(area, 2),
+                    round(100 * area / case.area, 2) if case.area else None, bldg])
+                feats.append(f)
+
+            for case in sorted(self.cases.values(), key=lambda c: (c.level, c.case_uuid)):
+                if case.geom is None:
+                    continue
+                kept_bldg = 0
+                for code in case.assigned:
+                    cand = case.candidates[code]
+                    if cand.kept is None or (case.split and cand.kept_area <= SLIVER_M2):
+                        continue
+                    if case.split:
+                        released_by = [c.code for c in case.candidates.values()
+                                       if c is not cand and c.part is not None
+                                       and _area(_polygonal(c.part.intersection(cand.kept)),
+                                                 self.da) > SLIVER_M2]
+                        bldg = cand.kept_bldg
+                    else:
+                        released_by = [c for c in case.candidates if c != code]
+                        bldg = case.bldg_pts if cand.kept_bldg is None else cand.kept_bldg
+                    kept_bldg += bldg or 0
+                    add(case, cand.kept, PART_KEPT, cand, released_by, cand.kept_area, bldg)
+                if case.status != "covered" and case.unassigned is not None:
+                    if case.bldg_geoms is not None:
+                        bldg = len(case.bldg_geoms) - kept_bldg
+                    else:
+                        bldg = case.bldg_pts if not case.assigned else None
+                    add(case, case.unassigned, PART_UNASSIGNED, None, [],
+                        _area(case.unassigned, self.da), bldg)
+            out.dataProvider().addFeatures(feats)
+            out.updateExtents()
+            return out
+
+        def _style_parts(self, layer):
+            cats = []
+            for value, fill, stroke in ((PART_KEPT, "67,160,71,120", "27,94,32,255"),
+                                        (PART_UNASSIGNED, "251,140,0,120", "230,81,0,255")):
+                sym = QgsFillSymbol.createSimple({"color": fill, "outline_color": stroke,
+                                                  "outline_width": "0.6"})
+                cats.append(QgsRendererCategory(value, sym, value))
+            layer.setRenderer(QgsCategorizedSymbolRenderer("part_role", cats))
+
+        def update_parts_layer(self, mbi_layer):
+            """Add (or refresh) the MBI Coverage Parts layer in the project."""
+            new = self.build_parts_layer(mbi_layer.crs())
+            prj = QgsProject.instance()
+            old = prj.mapLayer(self.parts_layer_id) if self.parts_layer_id else None
+            if old is not None and old.dataProvider().name() == "memory":
+                old.dataProvider().truncate()
+                old.dataProvider().addFeatures(list(new.getFeatures()))
+                old.updateExtents()
+                old.triggerRepaint()
+                layer = old
+            else:
+                self._style_parts(new)
+                prj.addMapLayer(new)
+                self.parts_layer_id = new.id()
+                layer = new
+            kept = sum(1 for f in layer.getFeatures() if f["part_role"] == PART_KEPT)
+            self.log(f"  '{layer.name()}': {kept:,} kept part(s), "
+                     f"{layer.featureCount() - kept:,} unassigned part(s) (temporary layer)")
 
         def apply_coverage(self):
             layer = self.mbi_layer
@@ -1843,11 +2427,13 @@ def make_dialog_class():
                 QtWidgets.QMessageBox.warning(
                     self, DIALOG_TITLE, "The MBI layer is no longer in the project — load again.")
                 return
-            covered = sum(1 for c in self.cases.values() if c.assigned_ea)
-            pending = len(self.cases) - covered
+            n = self._status_counts()
             msg = (f"Write '{self.coverage_field()}', '{ROLE_FIELD}' and '{self.status_field()}' "
-                   f"for all {len(self.cases):,} case(s) into '{layer.name()}'?\n\n"
-                   f"{covered:,} case(s) → {STATUS_COVERED}\n{pending:,} case(s) → {STATUS_NOT_COVERED}")
+                   f"for all {len(self.cases):,} case(s) into '{layer.name()}', and refresh the "
+                   f"'{PARTS_LAYER_NAME}' layer?\n\n"
+                   f"{n['covered']:,} case(s) → {STATUS_COVERED}\n"
+                   + (f"{n['partial']:,} case(s) → {STATUS_PARTIAL}\n" if n["partial"] else "")
+                   + f"{n['pending']:,} case(s) → {STATUS_NOT_COVERED}")
             if QtWidgets.QMessageBox.question(
                     self, DIALOG_TITLE, msg,
                     QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel) != QtWidgets.QMessageBox.Yes:
@@ -1879,13 +2465,12 @@ def make_dialog_class():
                 for i, case in enumerate(cases):
                     role_by_fid = {}
                     for cand in case.candidates.values():
-                        role = (None if not case.assigned_ea else
-                                ROLE_COVERS if cand.code == case.assigned_ea else ROLE_RELEASES)
+                        role = self._row_role(case, cand)
                         for fid in cand.fids:
                             role_by_fid[fid] = role
                     for fid in case.feature_ids:
                         layer.changeAttributeValues(fid, {
-                            f_idx: case.assigned_ea or None,
+                            f_idx: ",".join(case.assigned) or None,
                             r_idx: role_by_fid.get(fid),
                             s_idx: self._case_status(case)})
                         rows += 1
@@ -1894,14 +2479,17 @@ def make_dialog_class():
                         QtWidgets.QApplication.processEvents()
                 layer.endEditCommand()
                 for case in cases:
-                    case.saved_ea = case.assigned_ea
+                    case.saved = list(case.assigned)
                 layer.triggerRepaint()
-                self.progress.setValue(100)
-                covered = sum(1 for c in cases if c.assigned_ea)
+                n = self._status_counts()
                 self.log(f"  Updated {rows:,} row(s) across {len(cases):,} case(s): "
-                         f"{covered:,} {STATUS_COVERED}, {len(cases) - covered:,} {STATUS_NOT_COVERED}")
+                         f"{n['covered']:,} {STATUS_COVERED}, "
+                         + (f"{n['partial']:,} {STATUS_PARTIAL}, " if n["partial"] else "")
+                         + f"{n['pending']:,} {STATUS_NOT_COVERED}")
                 self.log(f"  Changes are UNSAVED edits in '{layer.name()}'. "
                          "Save: Toggle Editing > Save Edits. Undo: Edit > Undo.")
+                self.update_parts_layer(layer)
+                self.progress.setValue(100)
                 return True
             except Exception as e:
                 if layer.isEditable():
@@ -1931,23 +2519,27 @@ def make_dialog_class():
                     return
                 self.folder_widget.setFilePath(folder)
 
-            pending = sum(1 for c in self.cases.values() if not c.assigned_ea)
+            n = self._status_counts()
+            open_note = ""
+            if n["pending"]:
+                open_note += (f"\n{n['pending']:,} case(s) are still pending and will be exported "
+                              f"as {STATUS_NOT_COVERED}.")
+            if n["partial"]:
+                open_note += (f"\n{n['partial']:,} case(s) are only partly covered and will be "
+                              f"exported as {STATUS_PARTIAL}.")
             if self._needs_apply(layer):
                 msg = ("The choices in the viewer are not in the MBI layer yet.\n"
                        "Apply Coverage first, then export?")
-                if pending:
-                    msg += (f"\n\n{pending:,} case(s) are still pending and will be exported as "
-                            f"{STATUS_NOT_COVERED}.")
+                if open_note:
+                    msg += "\n" + open_note
                 if QtWidgets.QMessageBox.question(
                         self, DIALOG_TITLE, msg,
                         QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel) != QtWidgets.QMessageBox.Yes:
                     return
                 if not self._write_coverage(layer):
                     return
-            elif pending and QtWidgets.QMessageBox.question(
-                    self, DIALOG_TITLE,
-                    f"{pending:,} case(s) are still pending and will be exported as "
-                    f"{STATUS_NOT_COVERED}. Export anyway?",
+            elif open_note and QtWidgets.QMessageBox.question(
+                    self, DIALOG_TITLE, open_note.strip() + "\n\nExport anyway?",
                     QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel) != QtWidgets.QMessageBox.Yes:
                 return
 
@@ -1976,27 +2568,46 @@ def make_dialog_class():
             options.driverName = "GPKG"
             options.layerName = EXPORT_LAYER_NAME
             options.fileEncoding = "UTF-8"
-            res = QgsVectorFileWriter.writeAsVectorFormatV3(
-                layer, path, QgsProject.instance().transformContext(), options)
+            context = QgsProject.instance().transformContext()
+            res = QgsVectorFileWriter.writeAsVectorFormatV3(layer, path, context, options)
             if res[0] != QgsVectorFileWriter.NoError:
                 raise RuntimeError(f"GPKG export failed: {res[1]}")
             self.log(f"  GPKG written: {path} ({layer.featureCount():,} row(s))")
 
+            parts = self.build_parts_layer(layer.crs())
+            options = QgsVectorFileWriter.SaveVectorOptions()
+            options.driverName = "GPKG"
+            options.layerName = PARTS_EXPORT_NAME
+            options.fileEncoding = "UTF-8"
+            options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteLayer
+            res = QgsVectorFileWriter.writeAsVectorFormatV3(parts, path, context, options)
+            if res[0] != QgsVectorFileWriter.NoError:
+                raise RuntimeError(f"GPKG export of the coverage parts failed: {res[1]}")
+            self.log(f"    + layer '{PARTS_EXPORT_NAME}' ({parts.featureCount():,} part(s))")
+
         def export_csv(self, path):
             field, status_field = self.coverage_field(), self.status_field()
+
+            def m2(value):
+                return "" if value is None else round(value, 2)
+
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f)
-                w.writerow(["case_uuid", "mbi_type", "mbi_level", "num_bldg_pts", "ea_code",
-                            "ea_name", "barangay", "city_mun", "ea_bldg_in_mbi", ROLE_FIELD,
+                w.writerow(["case_uuid", "mbi_type", "mbi_level", "mbi_area_m2", "num_bldg_pts",
+                            "ea_code", "ea_name", "barangay", "city_mun", "ea_bldg_in_mbi",
+                            "ea_part_m2", "ea_kept_m2", "ea_kept_bldg", ROLE_FIELD,
                             field, status_field])
                 for case in sorted(self.cases.values(), key=lambda c: (c.level, c.case_uuid)):
                     for cand in case.candidates.values():
-                        role = ("" if not case.assigned_ea else
-                                ROLE_COVERS if cand.code == case.assigned_ea else ROLE_RELEASES)
-                        w.writerow([case.case_uuid, case.mbi_type, case.level, case.bldg_pts,
-                                    cand.code, cand.name, cand.barangay, cand.city_mun,
-                                    "" if cand.bldg is None else cand.bldg, role,
-                                    case.assigned_ea, self._case_status(case)])
+                        chosen = cand.code in case.assigned
+                        w.writerow([case.case_uuid, case.mbi_type, case.level, m2(case.area),
+                                    case.bldg_pts, cand.code, cand.name, cand.barangay,
+                                    cand.city_mun, "" if cand.bldg is None else cand.bldg,
+                                    m2(cand.part_area) if case.split else "",
+                                    m2(cand.kept_area) if chosen else "",
+                                    "" if not chosen or cand.kept_bldg is None else cand.kept_bldg,
+                                    self._row_role(case, cand) or "",
+                                    ",".join(case.assigned), self._case_status(case)])
             self.log(f"  CSV written: {path}")
 
     return CoverageDialog
