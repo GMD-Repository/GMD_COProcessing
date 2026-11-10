@@ -17,9 +17,12 @@ pick the EA layer and run the scripts in [gmd_processing_tools/](GMD_COProcessin
 See [gmd_processing_tools/README.md](GMD_COProcessing/gmd_processing_tools/README.md) for writing scripts.
 
 ## Release a new version
-Publish a GitHub release with a version tag, e.g. `v0.3.2`. The
-[release workflow](.github/workflows/release.yml) builds the plugin zip and updates the link above.
-Mark it *pre-release* to publish it as experimental.
+Releases are automatic: every push to `main` that changes the plugin (`GMD_COProcessing/`)
+bumps the patch version (e.g. `v0.3.1` -> `v0.3.2`), creates a GitHub release and updates the link
+above. QGIS users then see an **Upgrade**.
+
+For a bigger version jump (e.g. `v0.4.0`), publish a release by hand with that tag; the next automatic
+release continues from it (`v0.4.1`). Mark a manual release *pre-release* to publish it as experimental.
 
 ## Folder structure
 ```

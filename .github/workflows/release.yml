@@ -1,7 +1,9 @@
 name: Release QGIS plugin
 
-# Builds the plugin zip and plugins.xml for every published GitHub release.
-# The release tag sets the plugin version and must be a version number: "v0.2.0" -> version=0.2.0.
+# Builds the plugin zip and plugins.xml:
+#   - automatically on every push to main that changes the plugin: the patch version of the latest
+#     vX.Y.Z tag is bumped (v0.3.1 -> v0.3.2) and a GitHub release is created for it;
+#   - for a release published by hand: its tag sets the version ("v0.4.0" -> version=0.4.0).
 #
 # Both files are attached to the release AND published to the "plugin-repo" branch, which is
 # served by raw.githubusercontent.com (reachable even where github.com downloads time out).
@@ -10,8 +12,16 @@ name: Release QGIS plugin
 #   https://raw.githubusercontent.com/<owner>/<repo>/plugin-repo/plugins.xml
 
 on:
+  push:
+    branches: [main]
+    paths: ["GMD_COProcessing/**", ".github/workflows/release.yml", ".github/scripts/**"]
   release:
     types: [published]
+
+# One release at a time, so two quick pushes cannot pick the same version.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -24,19 +34,41 @@ env:
 jobs:
   package:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # all tags, to find the latest version
 
-      - name: Check release tag is a version number
+      - name: Work out the version
+        id: version
         env:
-          TAG: ${{ github.event.release.tag_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="$RELEASE_TAG"
+            PRERELEASE="$RELEASE_PRERELEASE"
+          else
+            # Latest vX.Y.Z tag, patch + 1 (none yet -> v0.1.0)
+            LAST=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+            if [ -z "$LAST" ]; then
+              TAG="v0.1.0"
+            else
+              IFS=. read -r MAJ MIN PAT <<< "${LAST#v}"
+              TAG="v${MAJ}.${MIN}.$((PAT + 1))"
+            fi
+            PRERELEASE=false
+          fi
           VERSION="${TAG#v}"
           if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
             echo "::error::Release tag '$TAG' is not a version number. Use a tag like v0.2.0 (QGIS compares versions to offer upgrades)."
             exit 1
           fi
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "Version: $TAG"
+          { echo "TAG=${TAG}"; echo "VERSION=${VERSION}"; echo "PRERELEASE=${PRERELEASE}"; } >> "$GITHUB_ENV"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Check Python syntax
         run: python -m compileall -q "${PLUGIN_DIR}"
@@ -49,7 +81,6 @@ jobs:
 
       - name: Stamp version and links into metadata.txt
         env:
-          PRERELEASE: ${{ github.event.release.prerelease }}
           REPO_URL: ${{ github.server_url }}/${{ github.repository }}
         run: |
           META="build/${PLUGIN_DIR}/metadata.txt"
@@ -78,16 +109,20 @@ jobs:
             --icon-url "${RAW}/${REPO_BRANCH}/icon.svg" \
             --out plugins.xml
 
-      - name: Attach zip and plugins.xml to the release
+      - name: Create the release (push) or attach to it (manual release)
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$TAG" "${PLUGIN_DIR}.${VERSION}.zip" plugins.xml --clobber
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            gh release upload "$TAG" "${PLUGIN_DIR}.${VERSION}.zip" plugins.xml --clobber
+          else
+            gh release create "$TAG" "${PLUGIN_DIR}.${VERSION}.zip" plugins.xml \
+              --target "${{ github.sha }}" --title "$TAG" --generate-notes
+          fi
 
       - name: Publish to the plugin-repo branch (raw.githubusercontent.com)
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
         run: |
           mkdir site
           cp "${PLUGIN_DIR}.${VERSION}.zip" plugins.xml site/
@@ -138,12 +173,12 @@ jobs:
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.NOTIFY_EMAIL }}
           from: GMD CO Processing releases <${{ secrets.MAIL_USERNAME }}>
-          subject: "${{ needs.package.result == 'success' && 'Released' || 'FAILED release' }}: GMD CO Processing ${{ github.event.release.tag_name }}"
+          subject: "${{ needs.package.result == 'success' && 'Released' || 'FAILED release' }}: GMD CO Processing ${{ needs.package.outputs.tag }}"
           body: |
-            Release ${{ github.event.release.tag_name }} of ${{ github.repository }}: ${{ needs.package.result }}.
+            Release ${{ needs.package.outputs.tag }} of ${{ github.repository }}: ${{ needs.package.result }}.
 
             ${{ needs.package.result == 'success' && 'The QGIS plugin repository was updated. In QGIS: Plugins > Manage and Install Plugins > Settings > Reload Repositories, then upgrade GMD CO Processing.' || 'The plugin repository was NOT updated. Check the workflow run for the error.' }}
 
-            Release:  ${{ github.event.release.html_url }}
+            Release:  ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.package.outputs.tag }}
             Run log:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
             Repository URL: https://raw.githubusercontent.com/${{ github.repository }}/plugin-repo/plugins.xml
