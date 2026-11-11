@@ -14,7 +14,7 @@ name: Release QGIS plugin
 on:
   push:
     branches: [main]
-    paths-ignore: ["README.md", ".gitignore", ".gitattributes"]
+    paths-ignore: ["README.md", ".gitignore", ".gitattributes", "docs/**", ".claude/**"]
   release:
     types: [published]
 
