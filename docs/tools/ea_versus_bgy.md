@@ -34,7 +34,8 @@ Requires `geopandas`, `pandas`, `pyogrio` and `shapely` in the QGIS Python.
    (orange = cut off, red = added, grey = fix by hand) and a **dotted green outline** of the Fix feature as it
    will be after **Snap Selected**. They stay drawn until the next zoom, scan, snap or Clear. A tiny piece
    (e.g. 1 m²) is zoomed to at least ~55 m across so its surroundings show. **Zoom to Selected** does the
-   same for several rows.
+   same for several rows. Untick **Blinking dotted outline and snap preview on zoom** (Snap panel) to get
+   only the plain red flash.
 6. Select the rows to fix (**Switch Fix** changes which feature takes them) and press **Snap Selected**.
 
 ### Ticking layers

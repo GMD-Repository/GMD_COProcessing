@@ -1200,7 +1200,8 @@ HELP_HTML = f"""
         blinks a <b>dotted outline with a circle</b> on the discrepancy (orange = cut off, red = added) and a
         <b>dotted green outline</b> of the Fix feature as it will be after <b>Snap Selected</b>, so even a
         1 sqm piece is easy to see and check before snapping. <b>Zoom to Selected</b> does the same for
-        several rows.</li>
+        several rows. Untick <b>Blinking dotted outline and snap preview on zoom</b> (Snap panel) for the plain
+        red flash only.</li>
     <li>Select the rows to fix (Ctrl/Shift+click for several, or <b>Select Not Snapped</b>) and click
         <b>Snap Selected</b>.</li>
     <li>Check the result on the map, then keep it with <b>Save Layer Edits</b>, or for several layers
@@ -1742,7 +1743,15 @@ def make_dialog_class():
             arow.addWidget(self.switch_btn, 1)
             arow.addWidget(self.snap_button, 2)
             gf.addLayout(arow)
-            self.snap_hint = self._hint("Snapping leaves the checked layer in edit mode: Save Layer Edits to keep "
+            self.highlight_chk = QtWidgets.QCheckBox("Blinking dotted outline and snap preview on zoom")
+            self.highlight_chk.setChecked(True)
+            self.highlight_chk.setToolTip(
+                "On: zooming (double-click / Zoom to Selected) blinks a dotted outline and circle on the\n"
+                "discrepancy and a dotted green outline of the Fix feature after Snap Selected.\n"
+                "Off: only the plain red flash.")
+            self.highlight_chk.toggled.connect(lambda on: None if on else self.clear_highlight())
+            gf.addWidget(self.highlight_chk)
+            self.snap_hint =self._hint("Snapping leaves the checked layer in edit mode: Save Layer Edits to keep "
                                         "the changes, Edit > Undo to take them back.")
             gf.addWidget(self.snap_hint)
             self.snap_group.setEnabled(False)
@@ -2198,8 +2207,12 @@ def make_dialog_class():
             extent.scale(1.5)  # a little context around the discrepancy
             canvas.setExtent(extent)
             canvas.refresh()
-            canvas.flashFeatureIds(layer, fids, QColor(255, 0, 0, 255), QColor(255, 0, 0, 0), 6, 400)
-            self.highlight_rows(rows)
+            if self.highlight_chk.isChecked():
+                canvas.flashFeatureIds(layer, fids, QColor(255, 0, 0, 255), QColor(255, 0, 0, 0), 6, 400)
+                self.highlight_rows(rows)
+            else:
+                self.clear_highlight()
+                canvas.flashFeatureIds(layer, fids)  # plain flash
 
         # ------------------------------------------------- map highlight
         def clear_highlight(self):
