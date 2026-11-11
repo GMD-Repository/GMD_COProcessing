@@ -22,20 +22,38 @@ Requires `geopandas`, `pandas`, `pyogrio` and `shapely` in the QGIS Python.
 
 ## Run it
 
-1. Load the layers. To check part of a layer, set a filter on it (right-click › Filter).
-2. Open **EA vs Barangay Check**, choose the **Check Mode**, the layer to check and (optionally, except
-   for EA vs BGY) the reference layer. Set **Ignore slivers below** (default 5 m²).
-3. Press **Scan**. Progress, warnings and the summary appear in the Log.
-4. The **Discrepancies** list shows every issue, largest first. Click a row to flash it on the map,
-   double-click to zoom.
-5. Select the rows to fix (**Switch Fix** changes which feature takes them) and press **Snap Selected**.
+1. Load the layers — e.g. every city / municipality of a province. To check part of a layer, set a filter
+   on it (right-click › Filter).
+2. Open **EA vs Barangay Check** and choose the **Check Mode**.
+3. Tick the layers to check and (optionally, except for EA vs BGY) the reference layers. **Select All**
+   ticks every layer of the list's kind; **Clear** unticks the list. Set **Ignore slivers below**
+   (default 5 m²).
+4. Press **Scan**. Progress, warnings and the summary appear in the Log.
+5. The **Discrepancies** list shows every issue, largest first. Click a row to flash it on the map,
+   double-click to zoom. The zoom blinks a **dotted outline with a circle marker** on the discrepancy
+   (orange = cut off, red = added, grey = fix by hand) and a **dotted green outline** of the Fix feature as it
+   will be after **Snap Selected**. They stay drawn until the next zoom, scan, snap or Clear. A tiny piece
+   (e.g. 1 m²) is zoomed to at least ~55 m across so its surroundings show. **Zoom to Selected** does the
+   same for several rows.
+6. Select the rows to fix (**Switch Fix** changes which feature takes them) and press **Snap Selected**.
+
+### Ticking layers
+
+| Row looks | Meaning |
+|-----------|---------|
+| Normal | A layer of the list's kind (EA or barangay). **Select All** ticks it. |
+| Grey, tickable | Looks like another kind, or is an MBI result layer (`case_uuid` / `bgy_part`). Tick it by hand if you need it; **Select All** leaves it out. |
+| Grey, not tickable | No geocode field for this mode, or the layer is ticked in the other list (a layer cannot be both checked and reference). |
+
+If exactly one layer fits a list you have not touched, it is ticked for you, so a single EA / barangay pair
+is ready to scan straight away.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-    T[Layer to check] --> K[Read · clean · key<br/>by geocode]
-    R[Reference layer] --> K
+    T[Ticked layers to check] --> K[Read each · clean · key<br/>by geocode · merge]
+    R[Ticked reference layers] --> K
     K --> D{Reference given?}
     D -->|yes| X[Outside = feature − reference<br/>Short = reference − features<br/>No matching = no geocode]
     D -->|no| Y[Overlap = feature ∩ feature<br/>Gap = enclosed, in none]
@@ -46,7 +64,11 @@ flowchart LR
 ```
 
 1. **Read.**
-   - Both layers are read (honouring any layer filter) with their geometries cleaned.
+   - Every ticked layer is read (honouring any layer filter) with its geometries cleaned. The checked layers
+     are then merged into one set, and so are the reference layers; each feature remembers its own layer.
+   - Reference features sharing a key — also across layers — are merged into one (with a warning).
+   - A ticked layer that is empty or has no usable geocodes stops the scan, and the Log names it, so a
+     result never silently misses a city / municipality.
    - Each feature gets a key: the barangay (first 8 geocode digits) in EA vs BGY and BGY vs BGY, or the
      `ea_geocode` in EA vs EA.
    - Overlays run in the layers' own lat/lon, so shared edges stay exact. Areas are measured in an
@@ -67,7 +89,7 @@ flowchart LR
    - then holes and specks below the sliver size are removed.
 
    The result is checked (valid, not empty, expected area, fits the layer, feature unchanged since the
-   scan) and written as one undo step. A row that fails the checks is marked *Failed* and the feature is
+   scan) and written to the feature's own layer, as one undo step per layer. A row that fails the checks is marked *Failed* and the feature is
    left alone.
 
 ## Discrepancy types
@@ -91,13 +113,13 @@ the layer's CRS, fit the layer (a single-part layer cannot take several parts), 
 have been edited since the scan. Otherwise the row is marked **Failed** with the reason, and the feature is
 untouched.
 
-Only geometry changes — attributes such as household counts stay as they are. The checked layer is left in
-edit mode:
+Only geometry changes — attributes such as household counts stay as they are. Each snap edits the
+feature's own layer, and the changed layers are left in edit mode (the Log names them):
 
-- **Keep:** Save Layer Edits.
-- **Revert:** Toggle Editing › Discard, or **Edit › Undo** (one undo step per Snap Selected).
+- **Keep:** Save Layer Edits, or **Layer › Current Edits › Save for All Layers** for several layers.
+- **Revert:** Toggle Editing › Discard, or **Edit › Undo** (one undo step per layer per Snap Selected).
 
-The reference layer is never edited. No layer is added to the project; each scan removes any
+The reference layers are never edited. No layer is added to the project; each scan removes any
 "Discrepancies …" scratch layers left by older versions.
 
 ## Fields it looks for
@@ -105,3 +127,13 @@ The reference layer is never edited. No layer is added to the project; each scan
 Barangay layers: `geocode`/`bgy_geocode`, `region`, `province`, `city_mun`, `barangay`.
 EA layers: `bgy_geocode`/`BGY_GEO`, `ea_geocode`/`geocode`, `name`/`ean`, plus the admin fields.
 A barangay is the first 8 digits of the 14-digit geocode.
+
+## Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| **Scan** is disabled | Tick at least one layer to check (and, for EA vs BGY, at least one barangay layer). The hint under each list says what is missing. |
+| A layer is greyed out | It has no geocode field for this mode, or it is ticked in the other list. Hover it for the reason. |
+| **Select All** skipped a layer | It does not look like the list's kind (or is an MBI layer). Tick it by hand. |
+| "No usable geocodes" / "has no features" | That ticked layer stopped the scan. Untick it or fix its geocodes. |
+| Big **Gap** in a self check | Land really outside the ticked layers (e.g. a neighbouring town not loaded). Tick that layer too, or ignore the row. |
