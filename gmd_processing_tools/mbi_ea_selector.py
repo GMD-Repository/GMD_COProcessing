@@ -28,8 +28,11 @@ Workflow:
   Step 5  Apply Coverage writes 'assigned_ea' (covering EA codes, comma-separated),
           'ea_role' (Covers / Releases, per row) and 'coverage_status' (1_Covered /
           2_Not Covered / 3_Partially Covered, per case) into the MBI layer as unsaved,
-          undoable edits. No temporary layer is added (an old 'MBI Coverage Parts' layer is
-          removed). This tool is the only one that writes the coverage status.
+          undoable edits, and adds the temporary layer 'ppp_mbi_ea_clipped' (same fields as
+          ppp_mbi): the covering barangay's row becomes one row per ticked EA, clipped to that
+          EA (assigned_ea = that EA, 1_Covered); not-covered rows and leftovers are kept with
+          2_Not Covered. An old 'MBI Coverage Parts' layer is
+          removed. This tool is the only one that writes the coverage status.
   Step 6  Export GPKG + CSV writes the processed MBI layer, the coverage parts and a decision
           log CSV into the Export folder (applying any pending choices first).
 
@@ -83,6 +86,7 @@ ROLE_RELEASES = "Releases"
 # Split overlaps: each covering EA keeps only its own part of the MBI (MBI clipped to the EA)
 PARTS_LAYER_NAME = "MBI Coverage Parts"
 PARTS_EXPORT_NAME = "mbi_ea_coverage_parts"
+CLIPPED_SUFFIX = "ea_clipped"   # Apply adds '<ppp>_mbi_ea_clipped': the MBIs clipped to each ticked EA
 PART_KEPT = "Kept"
 PART_UNASSIGNED = "Unassigned"
 # MBI area left over after the chosen EAs' parts that still counts as covered (geometry
@@ -916,10 +920,16 @@ HELP_HTML = """
         <td><b>1_Covered</b> — the case is fully covered. <b>2_Not Covered</b> — the case is still Pending.
         <b>3_Partially Covered</b> — a shared overlap where part of the MBI has no covering EA yet.
         Written for every loaded case, so you can filter or symbolise on it.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">No temporary layer</td>
-        <td>Apply adds <b>no</b> scratch layer to the project (a leftover <i>MBI Coverage Parts</i> layer from an
-        earlier version is removed). The part of each MBI every covering EA keeps is written only by <i>Export
-        GPKG + CSV</i>, as <i>mbi_ea_coverage_parts</i>.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">ppp_mbi_ea_clipped</td>
+        <td>Apply also adds one temporary layer, <b>ppp_mbi_ea_clipped</b> (<i>ppp</i> = province code of the
+        covering barangays, e.g. <i>027_mbi_ea_clipped</i>) with <b>the same fields as the ppp_mbi layer</b>. Instead
+        of one row listing all EAs in <i>assigned_ea</i>, the covering barangay's row is split into <b>one row per
+        ticked EA</b>: the MBI clipped to that EA's boundary, <i>assigned_ea</i> = that EA only, <i>1_Covered</i>.
+        The not-covered rows are kept too: the barangays not chosen and pending cases (original shape,
+        <i>2_Not Covered</i>), and the part no ticked EA keeps yet (<i>2_Not Covered</i>, no EA). Each Apply
+        replaces it. Right-click › <i>Make Permanent</i> to keep it.
+        (A leftover <i>MBI Coverage Parts</i> layer from an earlier version is removed.) <i>Export GPKG + CSV</i>
+        also writes the parts, uncovered leftovers included, as <i>mbi_ea_coverage_parts</i>.</td></tr>
   </table>
   <div style="color:#4b5563; margin-top:4px;">The two field names can be changed in the panel (letters, digits and
   underscores only, all different). Missing fields are added to the MBI layer automatically.</div>
@@ -1135,7 +1145,7 @@ def make_dialog_class():
             self.case_items = {}      # case key -> top-level tree item
             self.ea_lookup = {}       # ea_geocode -> {name, fid, layer_id}
             self.mbi_layer_id = None
-            self.parts_layer_id = None   # MBI Coverage Parts layer written by Apply
+            self.parts_layer_id = None   # old 'MBI Coverage Parts' layer (removed on Apply)
             self.da = None               # QgsDistanceArea for the MBI layer (m²)
             self.bgy_mode = False        # loaded cases come from an MBI Barangay Selector layer
             self._bands = {}             # map highlights of the selected EA's MBI part
@@ -1455,7 +1465,8 @@ def make_dialog_class():
             self.apply_btn = button("Apply Coverage", 32, BTN_EXPORT)
             self.apply_btn.setToolTip(
                 f"Writes the covering EA(s) ('{COVERAGE_FIELD}'), each row's role ('{ROLE_FIELD}') and\n"
-                f"the case status ('{STATUS_FIELD}') into the MBI layer (no temporary layer is added).\n"
+                f"the case status ('{STATUS_FIELD}') into the MBI layer, and adds 'ppp_mbi_ea_clipped'\n"
+                "(each MBI clipped to the boundary of every ticked EA).\n"
                 "Changes are left UNSAVED (the layer enters edit mode) — use QGIS's\n"
                 "Save Edits to keep them, or Cancel Edits to discard and revert.")
             self.apply_btn.clicked.connect(self.apply_coverage)
@@ -2994,12 +3005,13 @@ def make_dialog_class():
                        ("released_by", QVariant.String), ("area_m2", QVariant.Double),
                        ("pct_of_mbi", QVariant.Double), ("num_bldg_pts", QVariant.Int)]
 
-        def build_parts_layer(self, crs):
+        def build_parts_layer(self, crs, name=PARTS_LAYER_NAME, kept_only=False):
             """Memory layer, one feature per covering EA holding the part of the MBI it keeps
             ('Kept'), plus one 'Unassigned' feature per case for the part no covering EA
-            keeps yet. Together they cover every loaded MBI exactly once."""
+            keeps yet. Together they cover every loaded MBI exactly once.
+            kept_only: only the 'Kept' parts (the MBI clipped to each ticked EA)."""
             uri = "MultiPolygon" + (f"?crs={crs.authid()}" if crs.authid() else "")
-            out = QgsVectorLayer(uri, PARTS_LAYER_NAME, "memory")
+            out = QgsVectorLayer(uri, name, "memory")
             out.setCrs(crs)
             out.dataProvider().addAttributes([QgsField(n, t) for n, t in self.PART_FIELDS])
             out.updateFields()
@@ -3039,7 +3051,7 @@ def make_dialog_class():
                         bldg = case.bldg_pts if cand.kept_bldg is None else cand.kept_bldg
                     kept_bldg += bldg or 0
                     add(case, cand.kept, PART_KEPT, cand, released_by, cand.kept_area, bldg)
-                if case.status != "covered" and case.unassigned is not None:
+                if not kept_only and case.status != "covered" and case.unassigned is not None:
                     if case.bldg_geoms is not None:
                         bldg = len(case.bldg_geoms) - kept_bldg
                     else:
@@ -3058,6 +3070,120 @@ def make_dialog_class():
                                                   "outline_width": "0.6"})
                 cats.append(QgsRendererCategory(value, sym, value))
             layer.setRenderer(QgsCategorizedSymbolRenderer("part_role", cats))
+
+        def clipped_layer_name(self):
+            """'ppp_mbi_ea_clipped' — ppp = province code(s) of the covering barangays (first 3
+            geocode digits; several joined with '_'), else taken from the MBI layer's name."""
+            def prov(code):
+                s = _code_key(code)
+                if not s.isdigit():
+                    return ""
+                s = s.zfill(14) if len(s) > 9 else s   # leading zero lost: 2709007000000
+                return s[:3]
+            provs = sorted({p for p in (prov(c.bgy_code) for c in self.cases.values()) if p})
+            if provs:
+                return "_".join(provs + ["mbi", CLIPPED_SUFFIX])
+            base = self.mbi_layer.name() if self.mbi_layer is not None else "mbi"
+            return f"{base}_{CLIPPED_SUFFIX}"
+
+        def update_clipped_layer(self, mbi_layer):
+            """Add (or replace) the 'ppp_mbi_ea_clipped' scratch layer: every MBI clipped to the
+            boundary of each ticked EA — one feature per covering EA (a shared overlap ticked to
+            two EAs becomes two features). Pending cases and uncovered leftovers are left out."""
+            name = self.clipped_layer_name()
+            new = (self.build_clipped_rows(mbi_layer, name) if self.bgy_mode
+                   else self.build_parts_layer(mbi_layer.crs(), name=name, kept_only=True))
+            prj = QgsProject.instance()
+            old = [l.id() for l in prj.mapLayersByName(name) if l.dataProvider().name() == "memory"]
+            if old:
+                prj.removeMapLayers(old)
+            self._style_clipped(new)
+            prj.addMapLayer(new)
+            cases = len({f["case_uuid"] for f in new.getFeatures()})
+            s_name = self.status_field()
+            covered = (sum(1 for f in new.getFeatures() if f[s_name] == STATUS_COVERED)
+                       if s_name in new.fields().names() else new.featureCount())
+            self.log(f"  '{name}': {new.featureCount():,} row(s) of {cases:,} MBI(s) — "
+                     f"{covered:,} clipped to a ticked EA ({STATUS_COVERED}), "
+                     f"{new.featureCount() - covered:,} {STATUS_NOT_COVERED} "
+                     "(temporary layer — right-click > Make Permanent to keep it)")
+
+        def build_clipped_rows(self, mbi_layer, name):
+            """Same fields as the ppp_mbi layer. Every row of the loaded MBIs is copied, except
+            that a covering barangay's row is replaced by ONE ROW PER TICKED EA: the MBI clipped
+            to that EA, with only that EA in the coverage field and 1_Covered. The part no ticked
+            EA keeps (Partly covered) is one more row with no EA and 2_Not Covered; rows of
+            barangays not chosen and pending cases keep their geometry with 2_Not Covered."""
+            from qgis.core import QgsFeatureRequest
+            crs = mbi_layer.crs()
+            uri = "MultiPolygon" + (f"?crs={crs.authid()}" if crs.authid() else "")
+            out = QgsVectorLayer(uri, name, "memory")
+            out.setCrs(crs)
+            out.dataProvider().addAttributes(mbi_layer.fields().toList())
+            out.updateFields()
+            names = out.fields().names()
+            f_name, s_name = self.coverage_field(), self.status_field()
+
+            by_fid, every = {}, set()
+            for case in self.cases.values():
+                for fid in case.feature_ids:
+                    by_fid.setdefault(fid, []).append(case)
+                every.update(case.all_fids or case.feature_ids)
+
+            feats = []
+
+            def add(src, geom, ea_code, status):
+                if geom is None or geom.isEmpty():
+                    return
+                g = QgsGeometry(geom)
+                g.convertToMultiType()
+                f = QgsFeature(out.fields())
+                f.setGeometry(g)
+                attrs = list(src.attributes())
+                if f_name in names:
+                    attrs[names.index(f_name)] = ea_code
+                if s_name in names:
+                    attrs[names.index(s_name)] = status
+                f.setAttributes(attrs)
+                feats.append(f)
+
+            for src in mbi_layer.getFeatures(QgsFeatureRequest().setFilterFids(list(every))):
+                subs = by_fid.get(src.id(), [])
+                if not any(s.assigned for s in subs):
+                    add(src, src.geometry(), None, STATUS_NOT_COVERED)
+                    continue
+                for case in subs:
+                    for code in case.assigned:
+                        cand = case.candidates.get(code)
+                        if cand is None or cand.kept is None or \
+                                (case.split and cand.kept_area <= SLIVER_M2):
+                            continue
+                        add(src, cand.kept, code, STATUS_COVERED)
+                    if not case.assigned:
+                        add(src, case.geom, None, STATUS_NOT_COVERED)
+                    elif case.status != "covered" and case.unassigned is not None:
+                        add(src, case.unassigned, None, STATUS_NOT_COVERED)
+            out.dataProvider().addFeatures(feats)
+            out.updateExtents()
+            return out
+
+        def _style_clipped(self, layer):
+            """Two legend entries whatever the number of EAs: covered (green) / not covered (grey,
+            dashed). Each EA's part is its own feature, so the dark outlines show the EA split."""
+            field = self.status_field()
+            if field not in layer.fields().names():     # EA mode layer (part_role)
+                field, covered, not_covered = "part_role", PART_KEPT, PART_UNASSIGNED
+            else:
+                covered, not_covered = STATUS_COVERED, STATUS_NOT_COVERED
+            cats = [
+                QgsRendererCategory(covered, QgsFillSymbol.createSimple(
+                    {"color": "102,187,106,150", "outline_color": "27,94,32,255",
+                     "outline_width": "0.5"}), f"{covered} (clipped to its EA)"),
+                QgsRendererCategory(not_covered, QgsFillSymbol.createSimple(
+                    {"color": "158,158,158,90", "outline_color": "97,97,97,255",
+                     "outline_width": "0.4", "outline_style": "dash"}), not_covered),
+            ]
+            layer.setRenderer(QgsCategorizedSymbolRenderer(field, cats))
 
         def remove_parts_layer(self):
             """Remove the temporary 'MBI Coverage Parts' layer (made by earlier versions of this
@@ -3190,7 +3316,11 @@ def make_dialog_class():
                          + f"{n['pending']:,} {STATUS_NOT_COVERED}")
                 self.log(f"  Changes are UNSAVED edits in '{layer.name()}'. "
                          "Save: Toggle Editing > Save Edits. Undo: Edit > Undo.")
-                self.remove_parts_layer()   # no scratch layer: the parts go to the export GPKG only
+                self.remove_parts_layer()   # old 'MBI Coverage Parts' layer of earlier versions
+                try:
+                    self.update_clipped_layer(layer)
+                except Exception as e:
+                    self.log(f"  Could not build the clipped EA MBI layer: {e}")
                 self.progress.setValue(100)
                 return True
             except Exception as e:

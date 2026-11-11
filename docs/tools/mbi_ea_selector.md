@@ -20,12 +20,13 @@ No MBI check runs here — the MBI layer comes from the MBI Barangay Selector, s
 3. **Building Points** (optional) — pick the layer and its geocode field to count buildings per EA.
 4. Click **Load MBI Cases** (green).
 5. **Tick the covering EA(s)** of each case (or **Auto-Assign Pending**, then review).
-6. Click **Apply Coverage** — writes `assigned_ea` and `coverage_status` into the MBI layer.
+6. Click **Apply Coverage** — writes `assigned_ea` and `coverage_status` into the MBI layer, and adds
+   the `ppp_mbi_ea_clipped` layer (each MBI clipped to the boundary of every ticked EA).
 7. Click **Export GPKG + CSV** to save the result and a decision log.
 
 > **Nothing is saved until you say so.** Apply edits the layer in a normal QGIS edit session —
-> **Save Edits** to keep, **Edit › Undo** / **Discard Edits** to revert. EA layers are never edited, and
-> no temporary layer is added to the project.
+> **Save Edits** to keep, **Edit › Undo** / **Discard Edits** to revert. EA layers are never edited.
+> `ppp_mbi_ea_clipped` is a temporary layer — right-click › **Make Permanent** to keep it.
 
 ---
 
@@ -41,6 +42,7 @@ flowchart LR
     C --> T[You tick the<br/>covering EA]
     T --> R[Resolve kept parts<br/>and status]
     R --> A[Apply: assigned_ea<br/>+ coverage_status]
+    R --> K[Apply: ppp_mbi_ea_clipped<br/>MBI clipped per ticked EA]
     A --> E[Export GPKG + CSV]
 ```
 
@@ -67,7 +69,8 @@ flowchart LR
    - **Buildings:** each building point goes to the first ticked EA whose kept part contains it.
 6. **Write.** Apply edits only the covering barangay's rows: `assigned_ea` (comma-separated) and
    `coverage_status`. Rows of barangays not chosen get `2_Not Covered`. All of this is one undoable edit
-   command. Export writes the MBI layer, the kept / unassigned parts and the CSV log.
+   command. Apply also adds `ppp_mbi_ea_clipped`: the kept part of every ticked EA as its own feature.
+   Export writes the MBI layer, the kept / unassigned parts and the CSV log.
 
 ---
 
@@ -123,6 +126,20 @@ Written on the **covering barangay's row(s)** of the MBI layer:
 - Rows of barangays **not chosen** get no EA and `2_Not Covered`.
 - `assigned_bgy` is never changed (the field box turns red if you type that name).
 - Field names can be changed in the panel (letters, digits and underscores; all different).
+
+**`ppp_mbi_ea_clipped`** (temporary layer added by Apply; `ppp` = province code of the covering barangays,
+e.g. `027_mbi_ea_clipped`) has **the same fields as the `ppp_mbi` layer**. Instead of one row listing every
+EA in `assigned_ea`, the covering barangay's row is split into **one row per ticked EA**, clipped to that EA:
+
+| Row in `ppp_mbi` | Rows in `ppp_mbi_ea_clipped` |
+|------------------|------------------------------|
+| Covering barangay, two EAs ticked (`assigned_ea` = `…001000,…002000`, `1_Covered`) | Two rows: MBI ∩ EA 001000 (`assigned_ea` = `…001000`, `1_Covered`) and MBI ∩ EA 002000 (`…002000`, `1_Covered`) |
+| Covering barangay, one of two EAs ticked (`3_Partially Covered`) | MBI ∩ that EA (`1_Covered`), plus the part no EA keeps (`assigned_ea` empty, `2_Not Covered`) |
+| Gap, or an MBI with a single EA | One row, the whole MBI, `1_Covered` |
+| Barangay not chosen, or pending case (`2_Not Covered`) | Copied as is, `2_Not Covered` |
+
+Each Apply replaces the layer. It is drawn by `coverage_status` — green `1_Covered`, grey dashed
+`2_Not Covered` — so the legend has two entries however many EAs are ticked; the outlines show each EA's part.
 
 **Export GPKG + CSV** (into the Export folder; asks to Apply first if needed):
 
