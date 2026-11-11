@@ -1629,6 +1629,7 @@ class DeliverablesExportWorker(QThread):
             out_gpkg = task.get("out_gpkg_path", "")
             out_excel = task.get("out_excel_path", "")
             out_mis = task.get("out_mis_path", "")
+            out_pcd = task.get("out_pcd_path", "")
             search = task.get("search", "")
             status = task.get("status", "All")
             ea_lifecycle = task.get("ea_lifecycle", "All")
@@ -1641,7 +1642,7 @@ class DeliverablesExportWorker(QThread):
             def _gpkg_cb(sub_pct, msg):
                 if self._is_cancelled:
                     return False
-                overall = int(base_pct + (sub_pct / 100.0) * (task_slice * 0.45))
+                overall = int(base_pct + (sub_pct / 100.0) * (task_slice * 0.40))
                 self.progress_signal.emit(min(overall, 99), f"[{t_idx+1}/{total_tasks}] {m_name}: {msg}")
                 return True
 
@@ -1654,12 +1655,13 @@ class DeliverablesExportWorker(QThread):
                 "gpkg_path": out_gpkg,
                 "excel_path": out_excel,
                 "mis_path": out_mis,
+                "pcd_path": out_pcd,
                 "success": False,
                 "error": None
             }
 
             try:
-                # 1. GeoPackage Export (45% of slice)
+                # 1. GeoPackage Export (40% of slice)
                 self.progress_signal.emit(
                     max(base_pct, 1),
                     f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): Generating GeoPackage..."
@@ -1682,8 +1684,8 @@ class DeliverablesExportWorker(QThread):
                 task_res["geom_count"] = geom_cnt
 
                 if cnt > 0:
-                    # 2. Final EARF Excel Export (30% of slice)
-                    earf_pct = int(base_pct + task_slice * 0.45)
+                    # 2. Final EARF Excel Export (25% of slice)
+                    earf_pct = int(base_pct + task_slice * 0.40)
                     self.progress_signal.emit(
                         min(earf_pct, 99),
                         f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): Writing Final EARF Excel..."
@@ -1699,8 +1701,8 @@ class DeliverablesExportWorker(QThread):
                     if self._is_cancelled:
                         break
 
-                    # 3. Final MIS Excel Export (25% of slice)
-                    mis_pct = int(base_pct + task_slice * 0.75)
+                    # 3. Final MIS Excel Export (20% of slice)
+                    mis_pct = int(base_pct + task_slice * 0.65)
                     self.progress_signal.emit(
                         min(mis_pct, 99),
                         f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): Writing Final MIS Excel..."
@@ -1712,6 +1714,24 @@ class DeliverablesExportWorker(QThread):
                         ea_lifecycle=ea_lifecycle,
                         city_mun=c_code,
                     )
+
+                    if self._is_cancelled:
+                        break
+
+                    # 4. PCD EARF Excel Export (15% of slice)
+                    if out_pcd:
+                        pcd_pct = int(base_pct + task_slice * 0.85)
+                        self.progress_signal.emit(
+                            min(pcd_pct, 99),
+                            f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): Writing PCD EARF Excel..."
+                        )
+                        self.db.export_filtered_matched_to_pcd_excel(
+                            out_excel=out_pcd,
+                            search=search,
+                            status=status,
+                            ea_lifecycle=ea_lifecycle,
+                            city_mun=c_code,
+                        )
 
                     task_res["success"] = True
                     total_exported += 1
@@ -3337,7 +3357,8 @@ class COProcessingDialog(QDialog):
                 f"Final deliverables generated per City/Municipality:\n"
                 f"• Final GeoPackage (<pppmm>_ea2026.gpkg)\n"
                 f"• Final EARF Excel (<pppmm>_final_earf_<citymun>.xlsx)\n"
-                f"• Final MIS Excel (<pppmm>_MIS_<citymun>.xlsx)"
+                f"• Final MIS Excel (<pppmm>_MIS_<citymun>.xlsx)\n"
+                f"• PCD EARF Excel (<pppmm>_earf2026_PCD.xlsx)"
             )
             return
 
@@ -3353,6 +3374,7 @@ class COProcessingDialog(QDialog):
                 out_filename = os.path.basename(res["gpkg_path"])
                 out_excel_filename = os.path.basename(res["excel_path"])
                 out_mis_filename = os.path.basename(res["mis_path"])
+                out_pcd_filename = os.path.basename(res.get("pcd_path") or f"{pppmm}_earf2026_PCD.xlsx")
                 geom_count = res.get("geom_count", 0)
                 count = res.get("count", 0)
 
@@ -3365,7 +3387,8 @@ class COProcessingDialog(QDialog):
                         f"Folder: {target_folder}\n"
                         f"• Final GeoPackage: {out_filename}\n"
                         f"• Final EARF Excel: {out_excel_filename}\n"
-                        f"• Final MIS Excel: {out_mis_filename}\n\n"
+                        f"• Final MIS Excel: {out_mis_filename}\n"
+                        f"• PCD EARF Excel: {out_pcd_filename}\n\n"
                         f"GeoPackage Features: {geom_count:,} (Retained as delineated in GeoPackage)\n\n"
                         f"Would you like to add the GeoPackage layer to the QGIS map canvas?"
                     )
@@ -3385,7 +3408,8 @@ class COProcessingDialog(QDialog):
                         f"Folder: {target_folder}\n"
                         f"• Final GeoPackage: {out_filename}\n"
                         f"• Final EARF Excel: {out_excel_filename}\n"
-                        f"• Final MIS Excel: {out_mis_filename}\n\n"
+                        f"• Final MIS Excel: {out_mis_filename}\n"
+                        f"• PCD EARF Excel: {out_pcd_filename}\n\n"
                         f"Total Features: {count:,} (with Geometry: {geom_count:,})"
                     )
             elif res.get("error"):
@@ -3498,12 +3522,14 @@ class COProcessingDialog(QDialog):
             out_filename = f"{pppmm}_ea2026.gpkg"
             out_excel_filename = f"{pppmm}_final_earf_{clean_cm}.xlsx"
             out_mis_filename = f"{pppmm}_MIS_{clean_cm}.xlsx"
+            out_pcd_filename = f"{pppmm}_earf2026_PCD.xlsx"
             out_path = os.path.join(target_folder, out_filename)
             out_excel_path = os.path.join(target_folder, out_excel_filename)
             out_mis_path = os.path.join(target_folder, out_mis_filename)
+            out_pcd_path = os.path.join(target_folder, out_pcd_filename)
 
-            if os.path.exists(out_path) or os.path.exists(out_excel_path) or os.path.exists(out_mis_path):
-                existing_files = [f for f in (out_filename, out_excel_filename, out_mis_filename) if os.path.exists(os.path.join(target_folder, f))]
+            if os.path.exists(out_path) or os.path.exists(out_excel_path) or os.path.exists(out_mis_path) or os.path.exists(out_pcd_path):
+                existing_files = [f for f in (out_filename, out_excel_filename, out_mis_filename, out_pcd_filename) if os.path.exists(os.path.join(target_folder, f))]
                 reply = QMessageBox.question(
                     self,
                     "Confirm Overwrite",
@@ -3522,6 +3548,7 @@ class COProcessingDialog(QDialog):
                 "out_gpkg_path": out_path,
                 "out_excel_path": out_excel_path,
                 "out_mis_path": out_mis_path,
+                "out_pcd_path": out_pcd_path,
                 "search": self.search_match.text().strip(),
                 "status": self.cmb_match_status_filter.currentText(),
                 "ea_lifecycle": self.cmb_match_lifecycle_filter.currentText(),
@@ -3551,7 +3578,8 @@ class COProcessingDialog(QDialog):
                 f"Each City/Municipality will generate:\n"
                 f"  • Final GeoPackage: <pppmm>_ea2026.gpkg\n"
                 f"  • Final EARF Excel: <pppmm>_final_earf_<citymun>.xlsx\n"
-                f"  • Final MIS Excel: <pppmm>_MIS_<citymun>.xlsx",
+                f"  • Final MIS Excel: <pppmm>_MIS_<citymun>.xlsx\n"
+                f"  • PCD EARF Excel: <pppmm>_earf2026_PCD.xlsx",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.Yes
             )
@@ -3574,6 +3602,7 @@ class COProcessingDialog(QDialog):
                 c_out_filename = f"{pppmm}_ea2026.gpkg"
                 c_out_excel_filename = f"{pppmm}_final_earf_{clean_cm}.xlsx"
                 c_out_mis_filename = f"{pppmm}_MIS_{clean_cm}.xlsx"
+                c_out_pcd_filename = f"{pppmm}_earf2026_PCD.xlsx"
                 tasks.append({
                     "city_mun": c_code,
                     "mun_name": m_name,
@@ -3582,6 +3611,7 @@ class COProcessingDialog(QDialog):
                     "out_gpkg_path": os.path.join(target_folder, c_out_filename),
                     "out_excel_path": os.path.join(target_folder, c_out_excel_filename),
                     "out_mis_path": os.path.join(target_folder, c_out_mis_filename),
+                    "out_pcd_path": os.path.join(target_folder, c_out_pcd_filename),
                     "search": self.search_match.text().strip(),
                     "status": self.cmb_match_status_filter.currentText(),
                     "ea_lifecycle": self.cmb_match_lifecycle_filter.currentText(),
@@ -8989,7 +9019,8 @@ class COProcessingDialog(QDialog):
             f"Deliverables to generate:\n"
             f"  • Final GeoPackage (<pppmm>_ea2026.gpkg)\n"
             f"  • Final EARF Excel (<pppmm>_final_earf_<citymun>.xlsx)\n"
-            f"  • Final MIS Excel (<pppmm>_MIS_<citymun>.xlsx)",
+            f"  • Final MIS Excel (<pppmm>_MIS_<citymun>.xlsx)\n"
+            f"  • PCD EARF Excel (<pppmm>_earf2026_PCD.xlsx)",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes
         )
@@ -9019,9 +9050,11 @@ class COProcessingDialog(QDialog):
         out_filename = f"{pppmm}_ea2026.gpkg"
         out_excel_filename = f"{pppmm}_final_earf_{clean_cm}.xlsx"
         out_mis_filename = f"{pppmm}_MIS_{clean_cm}.xlsx"
+        out_pcd_filename = f"{pppmm}_earf2026_PCD.xlsx"
         out_path = os.path.join(target_folder, out_filename)
         out_excel_path = os.path.join(target_folder, out_excel_filename)
         out_mis_path = os.path.join(target_folder, out_mis_filename)
+        out_pcd_path = os.path.join(target_folder, out_pcd_filename)
 
         geom_sources = []
         try:
@@ -9041,6 +9074,7 @@ class COProcessingDialog(QDialog):
             "out_gpkg_path": out_path,
             "out_excel_path": out_excel_path,
             "out_mis_path": out_mis_path,
+            "out_pcd_path": out_pcd_path,
             "search": "",
             "status": "All",
             "ea_lifecycle": "All",

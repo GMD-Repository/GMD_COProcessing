@@ -43,6 +43,16 @@ def plugin_icon():
     return QIcon(os.path.join(PLUGIN_DIR, "icon.svg"))
 
 
+def earf_icon():
+    earf_svg = os.path.join(ICONS_DIR, "earf_post_processing.svg")
+    if os.path.exists(earf_svg):
+        return QIcon(earf_svg)
+    earf_png = os.path.join(ICONS_DIR, "earf_post_processing.png")
+    if os.path.exists(earf_png):
+        return QIcon(earf_png)
+    return plugin_icon()
+
+
 def theme_icon(name):
     return QgsApplication.getThemeIcon(f"/{name}")
 

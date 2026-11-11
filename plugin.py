@@ -10,11 +10,13 @@ Menu layout:
     └── [icon] Open Scripts Folder
 """
 
+import os
+
 from qgis.PyQt.QtCore import Qt, QUrl
 from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import QAction, QMenu
 
-from .script_registry import SCRIPTS_DIR, group_icon, grouped_scripts, plugin_icon, theme_icon
+from .script_registry import SCRIPTS_DIR, earf_icon, group_icon, grouped_scripts, plugin_icon, theme_icon
 
 MENU_TITLE = "&GMD CO Processing"
 HELP_URL = "https://github.com/GMD-Repository/GMD_COProcessing#readme"
@@ -26,6 +28,7 @@ class GMDCOProcessingPlugin:
         self.dock = None
         self.menu = None
         self.panel_action = None
+        self.earf_action = None
         self.help_action = None
         self._tools_end = None       # separator after the tool groups
         self._tool_actions = []      # group submenus, rebuilt every time the menu opens
@@ -34,6 +37,14 @@ class GMDCOProcessingPlugin:
         from .ui.dock_widget import GMDCOProcessingDock
 
         main_window = self.iface.mainWindow()
+
+        # Clean up any leftover duplicate dock widgets from prior reloads or crashes
+        for old_dock in main_window.findChildren(GMDCOProcessingDock):
+            try:
+                self.iface.removeDockWidget(old_dock)
+                old_dock.deleteLater()
+            except Exception:
+                pass
 
         # ---- dock panel (the plugin's UI)
         self.dock = GMDCOProcessingDock(self.iface, main_window)
@@ -53,6 +64,14 @@ class GMDCOProcessingPlugin:
         self.menu.aboutToShow.connect(self._rebuild_tool_menus)
 
         self._tools_end = self.menu.addSeparator()
+
+        # Dedicated action for EARF Post-Processing (with icon)
+        self.earf_action = QAction(earf_icon(), "EARF Post-Processing", main_window)
+        self.earf_action.setObjectName("GMDEARFPostProcessingAction")
+        self.earf_action.setToolTip("Open EARF Post-Processing & Geocode Matching workspace")
+        self.earf_action.triggered.connect(self._open_earf_post_processing)
+        self.menu.addAction(self.earf_action)
+
         self.menu.addAction(self.panel_action)
         self.menu.addAction(theme_icon("mActionFileNew.svg"), "New Script…", self._new_script)
         self.menu.addAction(
@@ -69,7 +88,8 @@ class GMDCOProcessingPlugin:
         else:
             menu_bar.addMenu(self.menu)
 
-        # ---- toolbar button toggles the panel
+        # ---- toolbar buttons
+        self.iface.addToolBarIcon(self.earf_action)
         self.iface.addToolBarIcon(self.panel_action)
 
         # ---- help entry under Help > Plugins (PyQGIS cookbook convention)
@@ -106,6 +126,11 @@ class GMDCOProcessingPlugin:
                 action.triggered.connect(lambda _=False, p=script.path: self._run_script(p))
             self._tool_actions.append(self.menu.insertMenu(self._tools_end, submenu))
 
+    def _open_earf_post_processing(self):
+        earf_script = os.path.join(SCRIPTS_DIR, "earf_post_processing.py")
+        if os.path.exists(earf_script):
+            self._run_script(earf_script)
+
     def _show_panel(self):
         self.dock.show()
         self.dock.raise_()
@@ -124,6 +149,11 @@ class GMDCOProcessingPlugin:
             self.help_action.deleteLater()
             self.help_action = None
 
+        if self.earf_action is not None:
+            self.iface.removeToolBarIcon(self.earf_action)
+            self.earf_action.deleteLater()
+            self.earf_action = None
+
         if self.panel_action is not None:
             self.iface.removeToolBarIcon(self.panel_action)
             self.panel_action = None
@@ -135,6 +165,27 @@ class GMDCOProcessingPlugin:
             self._tool_actions = []
 
         if self.dock is not None:
-            self.iface.removeDockWidget(self.dock)
-            self.dock.deleteLater()
+            try:
+                self.iface.removeDockWidget(self.dock)
+                self.dock.close()
+                self.dock.setParent(None)
+                self.dock.deleteLater()
+            except Exception:
+                pass
             self.dock = None
+
+        # Guard against any orphaned dock widgets with the same object name in the main window
+        main_win = self.iface.mainWindow() if self.iface else None
+        if main_win:
+            try:
+                from .ui.dock_widget import GMDCOProcessingDock
+                for orphan in main_win.findChildren(GMDCOProcessingDock):
+                    try:
+                        self.iface.removeDockWidget(orphan)
+                        orphan.close()
+                        orphan.setParent(None)
+                        orphan.deleteLater()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
