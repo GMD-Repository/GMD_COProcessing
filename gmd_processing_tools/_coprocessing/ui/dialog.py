@@ -2787,12 +2787,17 @@ class COProcessingDialog(QDialog):
             is_gpkg_db = getattr(self, "cmb_gpkg_source_mode", None) is not None and self.cmb_gpkg_source_mode.currentIndex() == 0
 
             def _add_gpkg_row(r_dict):
-                gc = str(r_dict.get("geocode", "") or "").strip()
+                bgy_gc = str(r_dict.get("bgy_geocode", "") or "").strip()
+                ean_val = str(r_dict.get("ean", "") or "").strip()
+                if bgy_gc and ean_val:
+                    gc = f"{bgy_gc}{ean_val.zfill(6)}"
+                else:
+                    gc = str(r_dict.get("geocode", "") or "").strip()
+
                 if not gc:
-                    bgy_gc = str(r_dict.get("bgy_geocode", "") or "").strip()
-                    ean_val = str(r_dict.get("ean", "") or r_dict.get("new_ean", "") or "").strip()
-                    if bgy_gc and ean_val:
-                        gc = f"{bgy_gc}{ean_val.zfill(6)}"
+                    new_ean_val = str(r_dict.get("new_ean", "") or "").strip()
+                    if bgy_gc and new_ean_val:
+                        gc = f"{bgy_gc}{new_ean_val.zfill(6)}"
                     elif r_dict.get("map_uuid"):
                         gc = f"GPKG_UNMATCHED_{r_dict.get('map_uuid')}"
                     elif r_dict.get("fid"):
@@ -2898,6 +2903,32 @@ class COProcessingDialog(QDialog):
                 p_rows = popcen_list_dict.get(gc, [])
                 e_rows = earf_list_dict.get(gc, [])
                 g_rows = gpkg_list_dict.get(gc, [])
+
+                # Align multi-entry / split rows between e_rows and g_rows by matching new_ean / code
+                if len(e_rows) > 1 and len(g_rows) > 1:
+                    def _get_entry_code(entry):
+                        c = str(entry.get("new_enumeration_area_code") or entry.get("new_ean") or entry.get("code") or entry.get("ean") or "").strip().replace(".0", "")
+                        return c.zfill(6) if c.isdigit() and len(c) < 6 else c
+
+                    matched_g_indices = set()
+                    aligned_g_rows = []
+                    for e in e_rows:
+                        e_code = _get_entry_code(e)
+                        matched_idx = None
+                        for g_idx, g in enumerate(g_rows):
+                            if g_idx not in matched_g_indices and _get_entry_code(g) == e_code:
+                                matched_idx = g_idx
+                                break
+                        if matched_idx is not None:
+                            aligned_g_rows.append(g_rows[matched_idx])
+                            matched_g_indices.add(matched_idx)
+                        else:
+                            aligned_g_rows.append({})
+                    # Append any remaining unaligned g_rows
+                    for g_idx, g in enumerate(g_rows):
+                        if g_idx not in matched_g_indices:
+                            aligned_g_rows.append(g)
+                    g_rows = aligned_g_rows
 
                 num_entries = max(len(p_rows), len(e_rows), len(g_rows), 1)
                 is_split_ea = num_entries > 1

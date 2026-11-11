@@ -206,21 +206,23 @@ def build_geocode(row_dict, field_map=None):
     lower_dict = {str(k).strip().lower(): v for k, v in row_dict.items() if k is not None}
 
     # Direct geocode check
+    direct_candidates = []
     for direct_key in ("geocode", "psgc_ea", "ea_geocode", "ean_code"):
         if direct_key in lower_dict:
             cleaned_direct = _clean_field_val(lower_dict[direct_key])
             if cleaned_direct and len(cleaned_direct) >= 9:
-                return cleaned_direct
+                direct_candidates.append(cleaned_direct)
 
     fallback_keys = {
         "province": ["province", "province_code", "prov", "prov_code", "p_code"],
         "city_mun": ["city_mun", "city_mun_code", "mun", "mun_code", "m_code"],
         "barangay": ["barangay", "barangay_code", "brgy", "bgy", "brgy_code"],
-        "ea": ["ea", "ean", "new_ean", "ea_code", "ean_code"],
+        "ea": ["ean", "ea", "ea_code", "ean_code"],
     }
 
     parts = []
     has_any = False
+    has_all_segments = True
     for seg in ("province", "city_mun", "barangay", "ea"):
         target_name = field_map.get(seg, "")
         raw = row_dict.get(target_name)
@@ -238,10 +240,25 @@ def build_geocode(row_dict, field_map=None):
         cleaned = _clean_field_val(raw)
         if cleaned:
             has_any = True
+        else:
+            has_all_segments = False
         parts.append(cleaned.zfill(CODE_WIDTHS[seg]))
+
+    # When all 4 standard PSGC hierarchy segments (Prov, Mun, Brgy, and base EAN/EA) are explicitly
+    # available in the record (such as in GeoPackage feature attributes with Prov=806, Mun=01, Brgy=051,
+    # EAN=002000), construct the geocode strictly from these base segments. This ensures that delineated
+    # or split EA features (where a direct ea_geocode might carry a temporary or split sub-code like
+    # 80601051003002 or 004002) correctly match the parent base geocode (80601051002000) shared by POPCEN
+    # and Preliminary EARF.
+    if has_all_segments:
+        return "".join(parts)
+
+    if direct_candidates:
+        return direct_candidates[0]
 
     if not has_any:
         return ""
+
     return "".join(parts)
 
 
