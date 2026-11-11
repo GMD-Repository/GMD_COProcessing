@@ -128,15 +128,44 @@ EA_NAME_FIELDS = ["name", "ean", "ea_name"]
 BLDG_GEOCODE_FIELDS = ["ea_geocode", "geocode"]   # auto-picked in this order
 
 # Status colours (table cells; text is forced dark so it stays readable in dark themes)
-COLOUR_PENDING = "#ffcc80"     # orange
-COLOUR_COVERED = "#a5d6a7"     # green
-COLOUR_RELEASED = "#eeeeee"    # light grey
-COLOUR_PARTIAL = "#fff59d"     # yellow
+# Two families that never look alike: WARM / green = decision status, COOL = MBI level.
+# All soft pastels (easy on the eyes; text stays dark on them).
+COLOUR_PENDING = "#ffe0b2"     # soft peach: still to decide
+COLOUR_COVERED = "#c8e6c9"     # soft green: chosen / covered
+COLOUR_RELEASED = "#eceff1"    # pale grey: gives it up / not extended
+COLOUR_PARTIAL = "#fff3c4"     # soft cream-yellow: partly covered
+# MBI level: cool lavender -> blue -> aqua -> slate (darker = more severe), never a status colour.
 LEVEL_COLOURS = {
-    "1_": "#ef9a9a", "2_": "#ef9a9a",   # inter-region / inter-province
-    "3_": "#ffcc80",                    # inter-city/municipality
-    "4_": "#fff59d",                    # inter-barangay
+    "1_": "#d9c8ee",   # Inter-Region            lavender
+    "2_": "#d3d6f3",   # Inter-Province          periwinkle
+    "3_": "#cfe3f6",   # Inter-City/Municipality sky blue
+    "4_": "#d3edf0",   # Inter-Barangay          pale aqua
+    "5_": "#e4e8eb",   # Within-Barangay         slate
 }
+LEVEL_NAMES = {"1_": "Inter-Region", "2_": "Inter-Province", "3_": "Inter-City/Mun",
+               "4_": "Inter-Barangay", "5_": "Within-Barangay"}
+
+# Role / Status column: plain words saying what a tick does.
+TEXT_CHOOSE = "☐ Tick if this {unit} covers it"
+
+
+def role_texts(mbi_type, unit):
+    """(ticked text, not-chosen text, ticked tooltip, not-chosen tooltip) for one MBI type."""
+    kind = (mbi_type or "").lower()
+    if kind == "gap":
+        return ("✔ Covers — its boundary is extended over the gap",
+                "Not extended — stays as it is",
+                f"\nThis {unit} absorbs the whole gap: its boundary is extended to fill it.",
+                f"\nAnother {unit} absorbs the gap; this one is not changed.")
+    if kind == "overlap":
+        return ("✔ Covers — keeps the overlap",
+                "✖ Gives up the overlap — cut out of it",
+                f"\nThis {unit} keeps the overlapping area.",
+                f"\nAnother {unit} keeps the overlap, so it is cut out of this {unit}.")
+    return ("✔ Covers — takes this area",
+            "✖ Gives up this area",
+            f"\nThis {unit} takes the whole MBI area.",
+            f"\nAnother {unit} takes the MBI area, so this {unit} gives it up.")
 
 
 # ─────────────────── data helpers ───────────────────
@@ -789,8 +818,8 @@ HELP_HTML = """
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">Case row (bold)</td>
         <td>One gap / overlap. Shows its MBI level, the barangays involved, how many EAs are involved and
-        the <b>Bldg Pts</b> inside it. Status is <b>Pending</b> (orange) until an EA is chosen, then
-        <b>Covered by &lt;EA&gt;</b> (green) — or <b>Partly covered (x%)</b> (yellow) when the EAs ticked in a
+        the <b>Bldg Pts</b> inside it. Status is <b>Pending — tick the covering EA below</b> (peach) until an EA is chosen, then
+        <b>✔ Done — covered by &lt;EA&gt;</b> (green) — or <b>Partly covered (x%) — tick another EA</b> (cream) when the EAs ticked in a
         shared overlap do not fill the whole MBI yet.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">EA rows (below)</td>
         <td>Each involved EA with its barangay and its own <b>Bldg Pts</b> (buildings inside this MBI tagged to
@@ -815,9 +844,9 @@ HELP_HTML = """
         the later one keeps the rest of its part. To change who keeps a shared piece, untick and re-tick in the
         order you want.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Reading the rows</td>
-        <td>Ticked EA: <b>✔ Keeps its part (x%)</b> — its share of the MBI, plus the buildings in it.
-        Unticked EA: <b>Releases (clip)</b> when all of its part is kept by ticked EAs, <b>Releases x% ·
-        candidate</b> when only some is — tick it to keep the rest. Hover a row for the areas.</td></tr>
+        <td>Ticked EA: <b>✔ Covers its part (x% of the MBI)</b> — its share of the MBI, plus the buildings in it.
+        Unticked EA: <b>✖ Gives up the overlap — cut out of it</b> when all of its part is kept by ticked EAs, <b>Gives up x% ·
+        tick to keep the rest</b> when only some is — tick it to keep the rest. Hover a row for the areas.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">On the map</td>
         <td>Select an EA row to see its part: <b style="color:#2e7d32;">green</b> = what it keeps,
         <b style="color:#1565c0;">dashed blue</b> = what it would keep if ticked. Select the case row to see
@@ -861,12 +890,12 @@ HELP_HTML = """
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Roles</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
     <tr><td width="110" style="font-weight:bold;">Overlap</td>
-        <td>Ticked EA: <b>Keeps overlap</b> (role <i>Covers</i>). Others: <b>Releases (clip)</b> (role <i>Releases</i>).</td></tr>
+        <td>Ticked EA: <b>✔ Covers — keeps the overlap</b> (role <i>Covers</i>). Others: <b>✖ Gives up the overlap — cut out of it</b> (role <i>Releases</i>). Before you tick, each row reads <b>☐ Tick if this EA covers it</b>.</td></tr>
     <tr><td style="font-weight:bold;">Shared overlap</td>
-        <td>Each ticked EA: <b>Keeps its part</b> (role <i>Covers</i>). Others: <b>Releases (clip)</b> (role
+        <td>Each ticked EA: <b>✔ Covers its part</b> (role <i>Covers</i>). Others: <b>✖ Gives up</b> (role
         <i>Releases</i>) once all of their part is kept by ticked EAs; no role while part of it is undecided.</td></tr>
     <tr><td style="font-weight:bold;">Gap</td>
-        <td>Ticked EA: <b>Absorbs gap</b> (role <i>Covers</i>). Others: <b>Not extended</b> (role <i>Releases</i>).</td></tr>
+        <td>Ticked EA: <b>✔ Covers — its boundary is extended over the gap</b> (role <i>Covers</i>). Others: <b>Not extended — stays as it is</b> (role <i>Releases</i>).</td></tr>
     <tr><td style="font-weight:bold;">Auto-Assign</td>
         <td>Single-EA cases go to that EA. Multi-EA cases go to the EA that owns most of the buildings inside
         the MBI (needs Building Points); shared overlaps go to <b>every</b> EA with tagged buildings, most
@@ -1352,6 +1381,12 @@ def make_dialog_class():
             self.tree.setAlternatingRowColors(True)
             self.tree.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
             self.tree.setUniformRowHeights(True)
+            # Full screen: the Barangay column takes the spare width, so Role / Status keeps
+            # its size instead of stretching across the window.
+            head_view = self.tree.header()
+            head_view.setStretchLastSection(False)
+            head_view.setSectionResizeMode(COL_BGY, QtWidgets.QHeaderView.Stretch)
+            head_view.setMinimumSectionSize(40)
             self.tree.setSortingEnabled(True)
             self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
             self.tree.customContextMenuRequested.connect(self.show_context_menu)
@@ -1361,12 +1396,15 @@ def make_dialog_class():
             rl.addWidget(self.tree, 1)
 
             swatch = '<span style="background-color:{}; border:1px solid #999;">&nbsp;&nbsp;&nbsp;</span> {}'
+            level_line = '<b>MBI level:</b> ' + ' &nbsp;'.join(
+                swatch.format(LEVEL_COLOURS[k], LEVEL_NAMES[k]) for k in sorted(LEVEL_COLOURS))
             self.legend = QtWidgets.QLabel(" &nbsp;&nbsp;".join([
-                swatch.format(COLOUR_PENDING, "Pending"),
+                swatch.format(COLOUR_PENDING, "Pending (to decide)"),
                 swatch.format(COLOUR_PARTIAL, "Partly covered"),
-                swatch.format(COLOUR_COVERED, "Covers MBI / its part"),
-                swatch.format(COLOUR_RELEASED, "Releases / not extended"),
-            ]) + " &nbsp;&nbsp;·&nbsp; Double-click: zoom · Right-click: more")
+                swatch.format(COLOUR_COVERED, "✔ Covers"),
+                swatch.format(COLOUR_RELEASED, "Gives up / not extended"),
+            ]) + " &nbsp;&nbsp;·&nbsp; Double-click: zoom · Right-click: more<br>" + level_line)
+            self.legend.setWordWrap(True)
             rl.addWidget(self.legend)
 
             # Coverage panel sits below the viewer: Load -> Review & tick -> Apply.
@@ -2560,10 +2598,7 @@ def make_dialog_class():
             if top is None:
                 return
             was_painting, self._painting = self._painting, True
-            gap = case.mbi_type.lower() == "gap"
-            overlap = case.mbi_type.lower() == "overlap"
-            on_text = "✔ Absorbs gap" if gap else "✔ Keeps overlap" if overlap else "✔ Covers MBI"
-            off_text = "Not extended" if gap else "Releases (clip)" if case.mbi_type else "Releases"
+            on_text, off_text, on_tip, off_tip = role_texts(case.mbi_type, "EA")
             for i in range(top.childCount()):
                 child = top.child(i)
                 code = child.data(COL_ID, ROLE_EA)
@@ -2578,51 +2613,55 @@ def make_dialog_class():
                     child.setCheckState(COL_ROLE, Qt.Checked)
                     if case.split:
                         share = cand.kept_area / case.area if case.area else 0
-                        text = f"✔ Keeps its part ({_pct(share)})" if cand.kept_area > SLIVER_M2 \
-                            else "✔ Keeps nothing (already kept)"
+                        text = (f"✔ Covers its part ({_pct(share)} of the MBI)" if cand.kept_area > SLIVER_M2
+                                else "✔ Covers nothing — an EA ticked earlier keeps its part")
                         if cand.kept_bldg:
                             text += f" · {cand.kept_bldg:,} bldg"
-                        tip += (f"\nKeeps {self._area_text(cand.kept_area)}"
+                        tip += (f"\nThis EA keeps {self._area_text(cand.kept_area)} of the MBI"
                                 + (" (the rest of its part is kept by an EA ticked before it)"
                                    if cand.kept_area < cand.part_area - SLIVER_M2 else ""))
                     else:
                         text = on_text
+                        tip += on_tip
                     child.setText(COL_ROLE, text)
                     paint(child, COL_ROLE, COLOUR_COVERED)
                 elif case.assigned and cand.released >= 0.995:
                     child.setCheckState(COL_ROLE, Qt.Unchecked)
                     child.setText(COL_ROLE, off_text)
+                    tip += off_tip
                     paint(child, COL_ROLE, COLOUR_RELEASED)
                 elif case.assigned and cand.released > 0.005:
                     child.setCheckState(COL_ROLE, Qt.Unchecked)
-                    child.setText(COL_ROLE, f"Releases {_pct(cand.released)} · candidate")
+                    child.setText(COL_ROLE, f"Gives up {_pct(cand.released)} · tick to keep the rest")
                     tip += (f"\n{_pct(cand.released)} of its part is kept by the ticked EA(s); "
                             "tick it to keep the rest.")
                     paint(child, COL_ROLE, None)
                 else:
                     child.setCheckState(COL_ROLE, Qt.Unchecked)
-                    child.setText(COL_ROLE, "Candidate")
+                    child.setText(COL_ROLE, TEXT_CHOOSE.format(unit="EA"))
+                    tip += f"\nTick this box if this EA should cover the {(case.mbi_type or 'MBI').lower()}."
                     paint(child, COL_ROLE, None)
                 child.setToolTip(COL_ROLE, tip.strip())
             status = case.status
             if status == "covered":
-                top.setText(COL_ROLE, f"Covered by {self._covered_by(case)}")
-                top.setToolTip(COL_ROLE, f"Covered by {self._covered_by(case, True)}")
+                top.setText(COL_ROLE, f"✔ Done — covered by {self._covered_by(case)}")
+                top.setToolTip(COL_ROLE, f"Covered by {self._covered_by(case, True)}.\n"
+                                         "Untick it below to undo, or tick another EA to change it.")
                 paint(top, COL_ROLE, COLOUR_COVERED)
             elif status == "partial":
-                top.setText(COL_ROLE, f"Partly covered ({_pct(case.covered)}) by {self._covered_by(case)}")
+                top.setText(COL_ROLE, f"Partly covered ({_pct(case.covered)}) — tick another EA")
                 top.setToolTip(COL_ROLE, f"{_pct(case.covered)} of the MBI is kept by "
                                          f"{self._covered_by(case, True)}.\n"
                                          f"{self._area_text(case.area * (1 - case.covered))} has no "
                                          "covering EA yet — tick another EA to cover it.")
                 paint(top, COL_ROLE, COLOUR_PARTIAL)
             elif not case.candidates:
-                top.setText(COL_ROLE, "Pending · no EA to choose")
+                top.setText(COL_ROLE, "Pending — no EA found to choose")
                 top.setToolTip(COL_ROLE, "No EA of the covering barangay was found in the ticked EA "
                                          "layers.\nTick its EA layer, then Load again.")
                 paint(top, COL_ROLE, COLOUR_PENDING)
             else:
-                top.setText(COL_ROLE, "Pending")
+                top.setText(COL_ROLE, "Pending — tick the covering EA below")
                 top.setToolTip(COL_ROLE, "Tick the covering EA(s) below."
                                + ("\nShared overlap: each ticked EA keeps only its own part."
                                   if case.split else "")
