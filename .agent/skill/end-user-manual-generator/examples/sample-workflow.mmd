@@ -1,0 +1,10 @@
+flowchart TD
+    A([WF01-S01 Start]) --> B[WF01-A01 Sign in]
+    B --> C[WF01-A02 Open request module]
+    C --> D[WF01-A03 Enter request details]
+    D --> E{WF01-D01 Details valid?}
+    E -- No --> F[WF01-A04 Review and correct errors]
+    F --> D
+    E -- Yes --> G[WF01-A05 Submit request]
+    G --> H[WF01-A06 System records submission]
+    H --> I([WF01-S02 Submission complete])
