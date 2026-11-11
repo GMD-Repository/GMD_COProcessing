@@ -205,22 +205,24 @@ def build_geocode(row_dict, field_map=None):
     # Lowercase lookup dictionary to support case-insensitive headers
     lower_dict = {str(k).strip().lower(): v for k, v in row_dict.items() if k is not None}
 
-    # Direct geocode check
+    # 1. Direct geocode check: If a valid numeric geocode attribute is already present in the row
+    # (e.g. from uploaded GeoPackage or POPCEN/EARF), preserve it directly.
     for direct_key in ("geocode", "psgc_ea", "ea_geocode", "ean_code"):
         if direct_key in lower_dict:
             cleaned_direct = _clean_field_val(lower_dict[direct_key])
-            if cleaned_direct and len(cleaned_direct) >= 9:
-                return cleaned_direct
+            if cleaned_direct and len(cleaned_direct) >= 9 and cleaned_direct.replace(".0", "").isdigit():
+                return cleaned_direct.replace(".0", "")
 
     fallback_keys = {
-        "province": ["province", "province_code", "prov", "prov_code", "p_code"],
-        "city_mun": ["city_mun", "city_mun_code", "mun", "mun_code", "m_code"],
-        "barangay": ["barangay", "barangay_code", "brgy", "bgy", "brgy_code"],
-        "ea": ["ea", "ean", "new_ean", "ea_code", "ean_code"],
+        "province": ["province_code", "prov_code", "prov", "p_code", "province"],
+        "city_mun": ["city_mun_code", "mun_code", "mun", "m_code", "city_mun", "city"],
+        "barangay": ["barangay_code", "brgy_code", "brgy", "bgy", "b_code", "barangay"],
+        "ea": ["ean", "ea", "ea_code", "ean_code"],
     }
 
     parts = []
     has_any = False
+    has_all_numeric_segments = True
     for seg in ("province", "city_mun", "barangay", "ea"):
         target_name = field_map.get(seg, "")
         raw = row_dict.get(target_name)
@@ -238,10 +240,28 @@ def build_geocode(row_dict, field_map=None):
         cleaned = _clean_field_val(raw)
         if cleaned:
             has_any = True
+            # Segment must be numeric to be valid code segment
+            cleaned_digits = cleaned.replace(".0", "")
+            if not cleaned_digits.isdigit():
+                has_all_numeric_segments = False
+        else:
+            has_all_numeric_segments = False
         parts.append(cleaned.zfill(CODE_WIDTHS[seg]))
+
+    # When all 4 standard PSGC hierarchy segments (Prov, Mun, Brgy, and base EAN/EA) are explicitly
+    # available as numeric codes (e.g. Prov=806, Mun=01, Brgy=051, EAN=002000), construct geocode.
+    if has_all_numeric_segments:
+        return "".join(parts)
+
+    for direct_key in ("geocode", "psgc_ea", "ea_geocode", "ean_code"):
+        if direct_key in lower_dict:
+            cleaned_direct = _clean_field_val(lower_dict[direct_key])
+            if cleaned_direct and len(cleaned_direct) >= 9:
+                return cleaned_direct
 
     if not has_any:
         return ""
+
     return "".join(parts)
 
 

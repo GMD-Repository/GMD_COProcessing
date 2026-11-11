@@ -141,6 +141,47 @@ except NameError:
 
 
 # --------------------------------------------------------------------------
+# Smart Table Widget Items for Natural & Numeric Sorting
+# --------------------------------------------------------------------------
+class SmartTableWidgetItem(QTableWidgetItem):
+    """
+    QTableWidgetItem with natural comparison support:
+      - Numbers and comma-separated numbers (e.g. 1,234 vs 95) sort numerically.
+      - Zero-padded fixed-width codes (e.g. 001000, 002000, 004002) sort cleanly.
+      - Blank values consistently sort to the bottom.
+      - Text strings sort case-insensitively.
+    """
+    def __lt__(self, other):
+        if not isinstance(other, QTableWidgetItem):
+            return super().__lt__(other)
+        t1 = self.text().strip()
+        t2 = other.text().strip()
+        if not t1 and t2:
+            return False
+        if not t2 and t1:
+            return True
+        c1 = t1.replace(",", "")
+        c2 = t2.replace(",", "")
+        # Zero-padded alphanumeric code strings (e.g. 001000, 002000, 003002)
+        if (c1.startswith("0") and len(c1) > 1 and not c1.startswith("0.")) or (c2.startswith("0") and len(c2) > 1 and not c2.startswith("0.")):
+            return t1.lower() < t2.lower()
+        try:
+            return float(c1) < float(c2)
+        except (ValueError, TypeError):
+            return t1.lower() < t2.lower()
+
+
+class CheckboxTableWidgetItem(QTableWidgetItem):
+    """QTableWidgetItem for checkbox columns that sorts by checked state."""
+    def __lt__(self, other):
+        if isinstance(other, QTableWidgetItem):
+            s1 = 1 if self.checkState() == Qt.Checked else 0
+            s2 = 1 if other.checkState() == Qt.Checked else 0
+            return s1 < s2
+        return super().__lt__(other)
+
+
+# --------------------------------------------------------------------------
 # Smart POPCEN Excel Loader
 # --------------------------------------------------------------------------
 def load_popcen_data(file_path, sheet_name=0):
@@ -732,20 +773,22 @@ class GPKGConsistencyDialog(QDialog):
         table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        table.setSortingEnabled(True)
 
         if not issues:
             table.setRowCount(1)
-            item = QTableWidgetItem("Zero duplicate or consistency issues found across all loaded layers.")
+            item = SmartTableWidgetItem("Zero duplicate or consistency issues found across all loaded layers.")
             item.setForeground(QColor("#15803d"))
             table.setItem(0, 4, item)
         else:
+            table.setSortingEnabled(False)
             table.setRowCount(len(issues))
             for i, issue in enumerate(issues):
-                num_item = QTableWidgetItem(str(i + 1))
+                num_item = SmartTableWidgetItem(str(i + 1))
                 num_item.setTextAlignment(Qt.AlignCenter)
                 table.setItem(i, 0, num_item)
 
-                gc_item = QTableWidgetItem(issue.get("geocode", ""))
+                gc_item = SmartTableWidgetItem(issue.get("geocode", ""))
                 font = gc_item.font()
                 font.setBold(True)
                 gc_item.setFont(font)
@@ -753,7 +796,7 @@ class GPKGConsistencyDialog(QDialog):
                 table.setItem(i, 1, gc_item)
 
                 st = issue.get("status", "")
-                st_item = QTableWidgetItem(st)
+                st_item = SmartTableWidgetItem(st)
                 if "CROSS_FILE" in st:
                     st_item.setBackground(QColor("#fee2e2"))
                     st_item.setForeground(QColor("#b91c1c"))
@@ -769,11 +812,12 @@ class GPKGConsistencyDialog(QDialog):
                 table.setItem(i, 2, st_item)
 
                 occ_str = f"{issue.get('file_count', 1)} files ({issue.get('dup_count', 1)} parts)"
-                occ_item = QTableWidgetItem(occ_str)
+                occ_item = SmartTableWidgetItem(occ_str)
                 table.setItem(i, 3, occ_item)
 
                 det_str = f"{issue.get('details', '')} [Files: {issue.get('source_files', '')}]"
-                table.setItem(i, 4, QTableWidgetItem(det_str))
+                table.setItem(i, 4, SmartTableWidgetItem(det_str))
+            table.setSortingEnabled(True)
 
         layout.addWidget(table, 1)
 
@@ -1083,6 +1127,7 @@ class GpkgFileSelectionDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.verticalHeader().setVisible(False)
+        self.table.setSortingEnabled(True)
 
         self.table.setColumnWidth(0, 48)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
@@ -1137,6 +1182,7 @@ class GpkgFileSelectionDialog(QDialog):
 
     def _populate_table(self):
         self._is_updating_checks = True
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(len(self.file_paths))
         for row, fpath in enumerate(self.file_paths):
             fname = os.path.basename(fpath)
@@ -1161,7 +1207,7 @@ class GpkgFileSelectionDialog(QDialog):
             can_upload = has_poly and is_valid_cols
 
             # Col 0: Checkbox
-            chk_item = QTableWidgetItem()
+            chk_item = CheckboxTableWidgetItem()
             chk_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
             chk_item.setCheckState(Qt.Checked if can_upload else Qt.Unchecked)
             chk_item.setTextAlignment(Qt.AlignCenter)
@@ -1179,14 +1225,14 @@ class GpkgFileSelectionDialog(QDialog):
             self.table.setItem(row, 0, chk_item)
 
             # Col 1: #
-            idx_item = QTableWidgetItem(str(row + 1))
+            idx_item = SmartTableWidgetItem(str(row + 1))
             idx_item.setTextAlignment(Qt.AlignCenter)
             idx_item.setForeground(QColor("#64748b"))
             idx_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.table.setItem(row, 1, idx_item)
 
             # Col 2: File Name
-            name_item = QTableWidgetItem(fname)
+            name_item = SmartTableWidgetItem(fname)
             font = name_item.font()
             font.setBold(True)
             name_item.setFont(font)
@@ -1196,7 +1242,7 @@ class GpkgFileSelectionDialog(QDialog):
             self.table.setItem(row, 2, name_item)
 
             # Col 3: Subfolder
-            dir_item = QTableWidgetItem(rel_dir)
+            dir_item = SmartTableWidgetItem(rel_dir)
             dir_item.setForeground(QColor("#475569"))
             dir_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             dir_item.setToolTip(os.path.dirname(fpath))
@@ -1205,19 +1251,19 @@ class GpkgFileSelectionDialog(QDialog):
             # Col 4: Geometry & Column Header Validation Status
             if not has_poly:
                 geom_label = desc or "Non-Polygon"
-                geom_item = QTableWidgetItem(geom_label)
+                geom_item = SmartTableWidgetItem(geom_label)
                 geom_item.setForeground(QColor("#dc2626"))  # Red
                 geom_item.setToolTip(f"Excluded: {desc}. EA GeoPackage must contain polygon/multipolygon boundaries.")
             elif not is_valid_cols:
                 geom_label = f"Missing {len(missing_cols)} Cols"
-                geom_item = QTableWidgetItem(geom_label)
+                geom_item = SmartTableWidgetItem(geom_label)
                 geom_item.setForeground(QColor("#ea580c"))  # Amber/Orange
                 missing_preview = ", ".join(missing_cols[:6]) + ("..." if len(missing_cols) > 6 else "")
                 geom_item.setToolTip(f"Excluded: Missing required columns: {missing_preview}")
             else:
                 count_str = f" ({len(poly_tables)})" if len(poly_tables) > 1 else ""
                 geom_label = f"Valid Polygon{count_str}"
-                geom_item = QTableWidgetItem(geom_label)
+                geom_item = SmartTableWidgetItem(geom_label)
                 geom_item.setForeground(QColor("#059669"))  # Emerald green
                 tip_layers = ", ".join(poly_tables) if poly_tables else fname
                 geom_item.setToolTip(f"Valid: Polygon layer with all required column headers ({tip_layers}).")
@@ -1227,19 +1273,20 @@ class GpkgFileSelectionDialog(QDialog):
 
             # Col 5: Size
             size_str = self._format_size(size_bytes)
-            size_item = QTableWidgetItem(size_str)
+            size_item = SmartTableWidgetItem(size_str)
             size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             size_item.setForeground(QColor("#0d9488"))
             size_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.table.setItem(row, 5, size_item)
 
             # Col 6: Last Modified
-            mod_item = QTableWidgetItem(mtime_str)
+            mod_item = SmartTableWidgetItem(mtime_str)
             mod_item.setTextAlignment(Qt.AlignCenter)
             mod_item.setForeground(QColor("#64748b"))
             mod_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.table.setItem(row, 6, mod_item)
 
+        self.table.setSortingEnabled(True)
         self._is_updating_checks = False
 
     @staticmethod
@@ -2290,6 +2337,7 @@ class COProcessingDialog(QDialog):
         self.table_matching.setObjectName("matchingTable")
         self.table_matching.setAlternatingRowColors(True)
         self.table_matching.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table_matching.setSortingEnabled(True)
         self.match_grouped_header = GroupedHeaderView(Qt.Horizontal, self.table_matching)
         self.table_matching.setHorizontalHeader(self.match_grouped_header)
         self.table_matching.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
@@ -2456,6 +2504,7 @@ class COProcessingDialog(QDialog):
 
     def _populate_matching_table(self, rows: list, total_filtered: int, offset: int = 0):
         self.table_matching.setUpdatesEnabled(False)
+        self.table_matching.setSortingEnabled(False)
         self.table_matching.clear()
 
         total_pages = max(1, (total_filtered + self.matching_page_size - 1) // self.matching_page_size)
@@ -2540,7 +2589,7 @@ class COProcessingDialog(QDialog):
             # 0: Row Index (with validation flag indicator)
             flags_str = str(r.get("validation_flags") or "").strip()
             notes_str = str(r.get("flag_notes") or "").strip()
-            idx_item = QTableWidgetItem(f"{offset + row_idx + 1:,}")
+            idx_item = SmartTableWidgetItem(f"{offset + row_idx + 1:,}")
             idx_item.setTextAlignment(Qt.AlignCenter)
             if flags_str:
                 idx_item.setForeground(QColor("#b91c1c"))
@@ -2552,7 +2601,7 @@ class COProcessingDialog(QDialog):
 
             # 1: Geocode
             gc_str = str(r.get("geocode", "") or "")
-            gc_item = QTableWidgetItem(gc_str)
+            gc_item = SmartTableWidgetItem(gc_str)
             gc_item.setFont(mono_font)
             gc_item.setTextAlignment(Qt.AlignCenter)
             self.table_matching.setItem(row_idx, 1, gc_item)
@@ -2562,74 +2611,74 @@ class COProcessingDialog(QDialog):
 
             # 2: Geographic Name
             gn_str = str(r.get("geographic_name", "") or "") if is_in_pop else ""
-            self.table_matching.setItem(row_idx, 2, QTableWidgetItem(gn_str))
+            self.table_matching.setItem(row_idx, 2, SmartTableWidgetItem(gn_str))
 
             # 3: Geographic Level
             gl_str = str(r.get("geographic_level", "") or "") if is_in_pop else ""
-            gl_item = QTableWidgetItem(gl_str)
+            gl_item = SmartTableWidgetItem(gl_str)
             gl_item.setTextAlignment(Qt.AlignCenter)
             self.table_matching.setItem(row_idx, 3, gl_item)
 
             # 4: region_code
             rc = str(r.get("region_code", "") or "") if is_in_pop else ""
-            rc_item = QTableWidgetItem(rc)
+            rc_item = SmartTableWidgetItem(rc)
             rc_item.setFont(mono_font)
             rc_item.setTextAlignment(Qt.AlignCenter)
             self.table_matching.setItem(row_idx, 4, rc_item)
 
             # 5: province_code
             pc = str(r.get("province_code", "") or "") if is_in_pop else ""
-            pc_item = QTableWidgetItem(pc)
+            pc_item = SmartTableWidgetItem(pc)
             pc_item.setFont(mono_font)
             pc_item.setTextAlignment(Qt.AlignCenter)
             self.table_matching.setItem(row_idx, 5, pc_item)
 
             # 6: city_mun_code
             mc = str(r.get("city_mun_code", "") or "") if is_in_pop else ""
-            mc_item = QTableWidgetItem(mc)
+            mc_item = SmartTableWidgetItem(mc)
             mc_item.setFont(mono_font)
             mc_item.setTextAlignment(Qt.AlignCenter)
             self.table_matching.setItem(row_idx, 6, mc_item)
 
             # 7: barangay_code
             bc = str(r.get("barangay_code", "") or "") if is_in_pop else ""
-            bc_item = QTableWidgetItem(bc)
+            bc_item = SmartTableWidgetItem(bc)
             bc_item.setFont(mono_font)
             bc_item.setTextAlignment(Qt.AlignCenter)
             self.table_matching.setItem(row_idx, 7, bc_item)
 
             # 8: ean
             ean_val = str(r.get("ean", "") or "").replace(".0", "") if is_in_pop else ""
-            ean_item = QTableWidgetItem(ean_val)
+            ean_item = SmartTableWidgetItem(ean_val)
             ean_item.setFont(mono_font)
             ean_item.setTextAlignment(Qt.AlignCenter)
             self.table_matching.setItem(row_idx, 8, ean_item)
 
             # 9: No. of EAs
             neas_val = str(r.get("no_of_eas", "") or "").replace(".0", "") if is_in_pop else ""
-            neas_item = QTableWidgetItem(neas_val)
+            neas_item = SmartTableWidgetItem(neas_val)
             neas_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.table_matching.setItem(row_idx, 9, neas_item)
 
             # 10: Areaname
             an_str = str(r.get("areaname", "") or "") if is_in_pop else ""
-            self.table_matching.setItem(row_idx, 10, QTableWidgetItem(an_str))
+            self.table_matching.setItem(row_idx, 10, SmartTableWidgetItem(an_str))
 
             # 11: Household Population
             hpop = str(r.get("household_population", "") or "").replace(".0", "") if is_in_pop else ""
-            hpop_item = QTableWidgetItem(hpop)
+            hpop_item = SmartTableWidgetItem(hpop)
             hpop_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.table_matching.setItem(row_idx, 11, hpop_item)
 
             # 12: No. of Households
             nhh = str(r.get("no_of_households", "") or r.get("popcen_households", "") or "").replace(".0", "") if is_in_pop else ""
-            nhh_item = QTableWidgetItem(nhh)
+            nhh_item = SmartTableWidgetItem(nhh)
             nhh_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.table_matching.setItem(row_idx, 12, nhh_item)
 
             # 13: EA Subject for Delineation
             delin = str(r.get("ea_subject_for_delineation", "") or r.get("popcen_delineation", "") or "").strip() if is_in_pop else ""
-            delin_item = QTableWidgetItem(delin)
+            delin_item = SmartTableWidgetItem(delin)
             delin_item.setTextAlignment(Qt.AlignCenter)
             if delin not in ("", "-", "0"):
                 delin_item.setBackground(QColor("#fef3c7"))
@@ -2638,7 +2687,7 @@ class COProcessingDialog(QDialog):
 
             # 14: EA Subject for Merging
             merg = str(r.get("ea_subject_for_merging", "") or r.get("popcen_merging", "") or "").strip() if is_in_pop else ""
-            merg_item = QTableWidgetItem(merg)
+            merg_item = SmartTableWidgetItem(merg)
             merg_item.setTextAlignment(Qt.AlignCenter)
             if merg not in ("", "-", "0"):
                 merg_item.setBackground(QColor("#ffedd5"))
@@ -2647,11 +2696,11 @@ class COProcessingDialog(QDialog):
 
             # 15: Remarks (POPCEN)
             prem = str(r.get("popcen_remarks", "") or "") if is_in_pop else ""
-            self.table_matching.setItem(row_idx, 15, QTableWidgetItem(prem))
+            self.table_matching.setItem(row_idx, 15, SmartTableWidgetItem(prem))
 
             # 16: New Enumeration Area Code
             nean = str(r.get("new_enumeration_area_code") or r.get("new_ean") or "").replace(".0", "")
-            nean_item = QTableWidgetItem(nean)
+            nean_item = SmartTableWidgetItem(nean)
             nean_item.setFont(mono_font)
             nean_item.setTextAlignment(Qt.AlignCenter)
             if nean and nean != ean_val:
@@ -2666,7 +2715,7 @@ class COProcessingDialog(QDialog):
             hh_cnt = str(r.get("household_count") or r.get("earf_household_count") or r.get("earf_households") or "").replace(".0", "")
             if hh_cnt.lower() in ("nan", "none", "null"):
                 hh_cnt = ""
-            hh_cnt_item = QTableWidgetItem(hh_cnt)
+            hh_cnt_item = SmartTableWidgetItem(hh_cnt)
             hh_cnt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.table_matching.setItem(row_idx, 17, hh_cnt_item)
 
@@ -2674,13 +2723,13 @@ class COProcessingDialog(QDialog):
             bldg_cnt = str(r.get("building_count") or r.get("earf_building_count") or "").replace(".0", "")
             if bldg_cnt.lower() in ("nan", "none", "null"):
                 bldg_cnt = ""
-            bldg_cnt_item = QTableWidgetItem(bldg_cnt)
+            bldg_cnt_item = SmartTableWidgetItem(bldg_cnt)
             bldg_cnt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.table_matching.setItem(row_idx, 18, bldg_cnt_item)
 
             # 19: EA Type (Displayed based on GPKG / EARF)
             ea_t_val = str(r.get("ea_type") or r.get("ea_lifecycle") or "").strip().upper()
-            ea_t_item = QTableWidgetItem(ea_t_val)
+            ea_t_item = SmartTableWidgetItem(ea_t_val)
             ea_t_item.setTextAlignment(Qt.AlignCenter)
             if "RETAIN" in ea_t_val:
                 ea_t_item.setForeground(QColor("#15803d"))
@@ -2697,18 +2746,18 @@ class COProcessingDialog(QDialog):
             if not sy:
                 ea_life = str(r.get("ea_lifecycle") or "").upper()
                 sy = "2024" if "RETAIN" in ea_life else "2026"
-            sy_item = QTableWidgetItem(sy)
+            sy_item = SmartTableWidgetItem(sy)
             sy_item.setFont(mono_font)
             sy_item.setTextAlignment(Qt.AlignCenter)
             self.table_matching.setItem(row_idx, 20, sy_item)
 
             # 21: Remarks (EARF)
             erem = str(r.get("earf_remarks") or r.get("remarks") or "")
-            self.table_matching.setItem(row_idx, 21, QTableWidgetItem(erem))
+            self.table_matching.setItem(row_idx, 21, SmartTableWidgetItem(erem))
 
             # 22: Recoded Enumeration Area (Option B: displayed exclusively in Column 22)
             rec_val = str(r.get("recoded_ean") or "").strip()
-            recoded_item = QTableWidgetItem(rec_val)
+            recoded_item = SmartTableWidgetItem(rec_val)
             recoded_item.setFont(mono_font)
             recoded_item.setTextAlignment(Qt.AlignCenter)
             if rec_val:
@@ -2718,6 +2767,7 @@ class COProcessingDialog(QDialog):
                 recoded_item.setFont(r_font)
             self.table_matching.setItem(row_idx, 22, recoded_item)
 
+        self.table_matching.setSortingEnabled(True)
         self.table_matching.setUpdatesEnabled(True)
 
     def _on_matching_search_changed(self):
@@ -2787,12 +2837,24 @@ class COProcessingDialog(QDialog):
             is_gpkg_db = getattr(self, "cmb_gpkg_source_mode", None) is not None and self.cmb_gpkg_source_mode.currentIndex() == 0
 
             def _add_gpkg_row(r_dict):
-                gc = str(r_dict.get("geocode", "") or "").strip()
+                bgy_gc = str(r_dict.get("bgy_geocode", "") or "").strip()
+                ean_val = str(r_dict.get("ean", "") or "").strip()
+                if bgy_gc and ean_val:
+                    gc = f"{bgy_gc}{ean_val.zfill(6)}"
+                else:
+                    gc = str(r_dict.get("geocode", "") or "").strip()
+
+                # Reconstruct base geocode if geocode last 6 digits do not match base ean
+                # (e.g. split EA in GPKG has geocode 80601051003002 but ean 002000)
+                if len(gc) >= 14 and gc[:8].isdigit() and ean_val and ean_val.isdigit():
+                    ean_std = f"{int(ean_val):03d}000" if len(ean_val) <= 3 else f"{int(ean_val):06d}"
+                    if not gc.endswith(ean_std):
+                        gc = f"{gc[:8]}{ean_std}"
+
                 if not gc:
-                    bgy_gc = str(r_dict.get("bgy_geocode", "") or "").strip()
-                    ean_val = str(r_dict.get("ean", "") or r_dict.get("new_ean", "") or "").strip()
-                    if bgy_gc and ean_val:
-                        gc = f"{bgy_gc}{ean_val.zfill(6)}"
+                    new_ean_val = str(r_dict.get("new_ean", "") or "").strip()
+                    if bgy_gc and new_ean_val:
+                        gc = f"{bgy_gc}{new_ean_val.zfill(6)}"
                     elif r_dict.get("map_uuid"):
                         gc = f"GPKG_UNMATCHED_{r_dict.get('map_uuid')}"
                     elif r_dict.get("fid"):
@@ -2898,6 +2960,32 @@ class COProcessingDialog(QDialog):
                 p_rows = popcen_list_dict.get(gc, [])
                 e_rows = earf_list_dict.get(gc, [])
                 g_rows = gpkg_list_dict.get(gc, [])
+
+                # Align multi-entry / split rows between e_rows and g_rows by matching new_ean / code
+                if len(e_rows) > 1 and len(g_rows) > 1:
+                    def _get_entry_code(entry):
+                        c = str(entry.get("new_enumeration_area_code") or entry.get("new_ean") or entry.get("code") or entry.get("ean") or "").strip().replace(".0", "")
+                        return c.zfill(6) if c.isdigit() and len(c) < 6 else c
+
+                    matched_g_indices = set()
+                    aligned_g_rows = []
+                    for e in e_rows:
+                        e_code = _get_entry_code(e)
+                        matched_idx = None
+                        for g_idx, g in enumerate(g_rows):
+                            if g_idx not in matched_g_indices and _get_entry_code(g) == e_code:
+                                matched_idx = g_idx
+                                break
+                        if matched_idx is not None:
+                            aligned_g_rows.append(g_rows[matched_idx])
+                            matched_g_indices.add(matched_idx)
+                        else:
+                            aligned_g_rows.append({})
+                    # Append any remaining unaligned g_rows
+                    for g_idx, g in enumerate(g_rows):
+                        if g_idx not in matched_g_indices:
+                            aligned_g_rows.append(g)
+                    g_rows = aligned_g_rows
 
                 num_entries = max(len(p_rows), len(e_rows), len(g_rows), 1)
                 is_split_ea = num_entries > 1
@@ -3941,7 +4029,7 @@ class COProcessingDialog(QDialog):
         self.table_widget = QTableWidget()
         self.table_widget.setObjectName("previewTable")
         self.table_widget.setAlternatingRowColors(True)
-        self.table_widget.setSortingEnabled(False)
+        self.table_widget.setSortingEnabled(True)
         self.table_widget.horizontalHeader().setStretchLastSection(False)
         self.table_widget.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table_widget.verticalHeader().setDefaultSectionSize(26)
@@ -4172,7 +4260,7 @@ class COProcessingDialog(QDialog):
         self.table_earf = QTableWidget()
         self.table_earf.setObjectName("previewTable")
         self.table_earf.setAlternatingRowColors(True)
-        self.table_earf.setSortingEnabled(False)
+        self.table_earf.setSortingEnabled(True)
         self.table_earf.horizontalHeader().setStretchLastSection(False)
         self.table_earf.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table_earf.verticalHeader().setDefaultSectionSize(26)
@@ -4401,7 +4489,7 @@ class COProcessingDialog(QDialog):
         self.table_gpkg = QTableWidget()
         self.table_gpkg.setObjectName("previewTable")
         self.table_gpkg.setAlternatingRowColors(True)
-        self.table_gpkg.setSortingEnabled(False)
+        self.table_gpkg.setSortingEnabled(True)
         self.table_gpkg.horizontalHeader().setStretchLastSection(False)
         self.table_gpkg.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table_gpkg.verticalHeader().setDefaultSectionSize(26)
@@ -4619,6 +4707,7 @@ class COProcessingDialog(QDialog):
         try:
             self.table_widget.setUpdatesEnabled(False)
             self.table_widget.blockSignals(True)
+            self.table_widget.setSortingEnabled(False)
             self.table_widget.clear()
 
             if df.empty:
@@ -4673,7 +4762,7 @@ class COProcessingDialog(QDialog):
 
             for row_idx, (_, row) in enumerate(df.iterrows()):
                 # Column 0: Checkbox for row selection
-                chk_item = QTableWidgetItem()
+                chk_item = CheckboxTableWidgetItem()
                 chk_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
                 row_id = row.get("id") if "id" in row and pd.notna(row.get("id")) else row.name
                 norm_id = int(row_id) if str(row_id).isdigit() else row_id
@@ -4693,7 +4782,7 @@ class COProcessingDialog(QDialog):
                 self.table_widget.setItem(row_idx, 0, chk_item)
 
                 # Column 1: Row index
-                idx_item = QTableWidgetItem(f"{offset + row_idx + 1:,}")
+                idx_item = SmartTableWidgetItem(f"{offset + row_idx + 1:,}")
                 idx_item.setTextAlignment(Qt.AlignCenter)
                 idx_item.setForeground(QColor("#64748b"))
                 self.table_widget.setItem(row_idx, 1, idx_item)
@@ -4711,7 +4800,7 @@ class COProcessingDialog(QDialog):
                     ):
                         val = to_whole_number_str(val)
 
-                    item = QTableWidgetItem(val)
+                    item = SmartTableWidgetItem(val)
 
                     if any(k in col_low for k in ["code", "ean", "geocode", "#", "no_of_eas"]):
                         item.setTextAlignment(Qt.AlignCenter)
@@ -4757,6 +4846,7 @@ class COProcessingDialog(QDialog):
 
                     self.table_widget.setItem(row_idx, col_idx + 2, item)
 
+            self.table_widget.setSortingEnabled(True)
             self.table_widget.blockSignals(False)
             self.table_widget.setUpdatesEnabled(True)
         finally:
@@ -6187,6 +6277,7 @@ class COProcessingDialog(QDialog):
     def _populate_earf_table(self, df: pd.DataFrame, total_filtered: int, offset: int = 0):
         self.table_earf.setUpdatesEnabled(False)
         self.table_earf.blockSignals(True)
+        self.table_earf.setSortingEnabled(False)
         self.table_earf.clear()
 
         if df.empty:
@@ -6289,7 +6380,7 @@ class COProcessingDialog(QDialog):
 
         for row_idx, (_, row) in enumerate(df.iterrows()):
             # Column 0: Checkbox for row selection
-            chk_item = QTableWidgetItem()
+            chk_item = CheckboxTableWidgetItem()
             chk_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
             row_id = row.get("id") if "id" in row and pd.notna(row.get("id")) else row.name
             norm_id = int(row_id) if str(row_id).isdigit() else row_id
@@ -6309,7 +6400,7 @@ class COProcessingDialog(QDialog):
             self.table_earf.setItem(row_idx, 0, chk_item)
 
             # Column 1: Row number index
-            idx_item = QTableWidgetItem(f"{offset + row_idx + 1:,}")
+            idx_item = SmartTableWidgetItem(f"{offset + row_idx + 1:,}")
             idx_item.setTextAlignment(Qt.AlignCenter)
             idx_item.setForeground(QColor("#64748b"))
             self.table_earf.setItem(row_idx, 1, idx_item)
@@ -6323,7 +6414,7 @@ class COProcessingDialog(QDialog):
                     val = ""
 
                 col_low = col_name.lower().strip()
-                item = QTableWidgetItem(val)
+                item = SmartTableWidgetItem(val)
                 is_new_ea = (col_name == new_ea_identified) or ("new" in col_low and any(k in col_low for k in ["ea", "ean", "code", "enumeration"]))
 
                 if is_new_ea or any(k in col_low for k in ["code", "prov", "mun", "brgy", "ea", "geocode", "#", "year", "consistency"]):
@@ -6378,15 +6469,23 @@ class COProcessingDialog(QDialog):
                     if "RETAIN" in v_up:
                         item.setBackground(QColor("#dcfce7"))
                         item.setForeground(QColor("#15803d"))
-                    elif "SPLIT" in v_up:
+                    elif "SPLIT" in v_up or "DELIN" in v_up:
                         item.setBackground(QColor("#dbeafe"))
                         item.setForeground(QColor("#1d4ed8"))
                     elif "MERG" in v_up:
                         item.setBackground(QColor("#ffedd5"))
                         item.setForeground(QColor("#c2410c"))
+                elif col_low == "final_ean":
+                    item.setTextAlignment(Qt.AlignCenter)
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#1d4ed8"))
+                    item.setBackground(QColor("#eff6ff"))
 
                 self.table_earf.setItem(row_idx, col_idx + 2, item)
 
+        self.table_earf.setSortingEnabled(True)
         self.table_earf.blockSignals(False)
         self.table_earf.setUpdatesEnabled(True)
         self._update_earf_selection_state()
@@ -7273,6 +7372,26 @@ class COProcessingDialog(QDialog):
             return
 
         df = df.copy()
+        if "final_ean" not in df.columns or df["final_ean"].isna().all():
+            try:
+                recs = df.to_dict("records")
+                if hasattr(self.db, "compute_recoded_enumeration_areas"):
+                    self.db.compute_recoded_enumeration_areas(recs)
+                elif "compute_recoded_enumeration_areas" in globals():
+                    compute_recoded_enumeration_areas(recs)
+                df["final_ean"] = [str(r.get("final_ean") or r.get("recoded_ean") or "").strip() for r in recs]
+            except Exception:
+                pass
+
+        if "new_geocode" not in df.columns or df["new_geocode"].isna().all():
+            def _build_new_gc(row):
+                gc = str(row.get("geocode", "") or "").strip()
+                fean = str(row.get("final_ean", "") or "").strip()
+                if len(gc) >= 8 and fean:
+                    return f"{gc[:8]}{fean.zfill(6)}"
+                return ""
+            df["new_geocode"] = df.apply(_build_new_gc, axis=1)
+
         if "source_files" in df.columns and "source_file" in df.columns:
             has_multi = df["source_files"].astype(str).str.contains(",", na=False)
             df.loc[has_multi, "source_file"] = df.loc[has_multi, "source_files"]
@@ -7293,6 +7412,8 @@ class COProcessingDialog(QDialog):
             "bldgcount",
             "sy",
             "new_ean",
+            "final_ean",
+            "new_geocode",
             "hh_count",
             "bldg_count",
             "ea_type",
@@ -7331,7 +7452,7 @@ class COProcessingDialog(QDialog):
 
         for row_idx, (_, row) in enumerate(df.iterrows()):
             # Column 0: Checkbox for feature selection
-            chk_item = QTableWidgetItem()
+            chk_item = CheckboxTableWidgetItem()
             chk_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable | Qt.ItemIsSelectable)
             row_id = row["id"] if ("id" in row and pd.notna(row["id"])) else row.name
             norm_id = int(row_id) if str(row_id).isdigit() else row_id
@@ -7351,7 +7472,7 @@ class COProcessingDialog(QDialog):
             self.table_gpkg.setItem(row_idx, 0, chk_item)
 
             # Column 1: Row number index
-            idx_item = QTableWidgetItem(f"{offset + row_idx + 1:,}")
+            idx_item = SmartTableWidgetItem(f"{offset + row_idx + 1:,}")
             idx_item.setTextAlignment(Qt.AlignCenter)
             idx_item.setForeground(QColor("#64748b"))
             self.table_gpkg.setItem(row_idx, 1, idx_item)
@@ -7362,7 +7483,7 @@ class COProcessingDialog(QDialog):
                 if val.lower() == "nan":
                     val = ""
 
-                item = QTableWidgetItem(val)
+                item = SmartTableWidgetItem(val)
                 col_low = col_name.lower().strip()
 
                 if any(k in col_low for k in ["code", "ean", "geocode", "#", "sy", "uuid", "dup_count", "file_count"]):
@@ -7432,15 +7553,23 @@ class COProcessingDialog(QDialog):
                     if "RETAIN" in v_up:
                         item.setBackground(QColor("#dcfce7"))
                         item.setForeground(QColor("#15803d"))
-                    elif "SPLIT" in v_up:
+                    elif "SPLIT" in v_up or "DELIN" in v_up:
                         item.setBackground(QColor("#dbeafe"))
                         item.setForeground(QColor("#1d4ed8"))
                     elif "MERG" in v_up:
                         item.setBackground(QColor("#ffedd5"))
                         item.setForeground(QColor("#c2410c"))
+                elif col_low == "final_ean":
+                    item.setTextAlignment(Qt.AlignCenter)
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#1d4ed8"))
+                    item.setBackground(QColor("#eff6ff"))
 
                 self.table_gpkg.setItem(row_idx, col_idx + 2, item)
 
+        self.table_gpkg.setSortingEnabled(True)
         self.table_gpkg.blockSignals(False)
         self.table_gpkg.setUpdatesEnabled(True)
         self._update_gpkg_selection_state()
@@ -8193,6 +8322,7 @@ class COProcessingDialog(QDialog):
         self.table_monitoring.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_monitoring.setSelectionMode(QTableWidget.SingleSelection)
         self.table_monitoring.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table_monitoring.setSortingEnabled(True)
         self.table_monitoring.verticalHeader().setVisible(False)
         self.table_monitoring.verticalHeader().setDefaultSectionSize(28)
         self.table_monitoring.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -8638,25 +8768,26 @@ class COProcessingDialog(QDialog):
 
     def _populate_monitoring_table(self, records, offset):
         """Populates the QTableWidget with deliverable statuses and styled badges."""
+        self.table_monitoring.setSortingEnabled(False)
         self.table_monitoring.setRowCount(len(records))
 
         for row_idx, r in enumerate(records):
             # Col 0: Index
-            idx_item = QTableWidgetItem(f"{offset + row_idx + 1:,}")
+            idx_item = SmartTableWidgetItem(f"{offset + row_idx + 1:,}")
             idx_item.setTextAlignment(Qt.AlignCenter)
             self.table_monitoring.setItem(row_idx, 0, idx_item)
 
             # Col 1: Region
-            reg_item = QTableWidgetItem(r.get("region", "") or "-")
+            reg_item = SmartTableWidgetItem(r.get("region", "") or "-")
             self.table_monitoring.setItem(row_idx, 1, reg_item)
 
             # Col 2: Province
-            prov_item = QTableWidgetItem(r.get("province", "") or "-")
+            prov_item = SmartTableWidgetItem(r.get("province", "") or "-")
             self.table_monitoring.setItem(row_idx, 2, prov_item)
 
             # Col 3: City / Municipality
             mun_str = f"{r.get('code', '')} - {r.get('name', '')}" if r.get('code') else r.get('name', '')
-            mun_item = QTableWidgetItem(mun_str)
+            mun_item = SmartTableWidgetItem(mun_str)
             mun_font = QFont()
             mun_font.setBold(True)
             mun_item.setFont(mun_font)
@@ -8665,7 +8796,7 @@ class COProcessingDialog(QDialog):
             # Col 4: Overall Status Badge
             st = r.get("status", "MISSING")
             ratio = r.get("completion_ratio", "0/3")
-            status_item = QTableWidgetItem(f"{ratio} {st}")
+            status_item = SmartTableWidgetItem(f"{ratio} {st}")
             status_item.setTextAlignment(Qt.AlignCenter)
             status_font = QFont()
             status_font.setBold(True)
@@ -8684,7 +8815,7 @@ class COProcessingDialog(QDialog):
             # Col 5: Output GPKG
             gpkg = r.get("gpkg", {})
             if gpkg.get("exists"):
-                gpkg_item = QTableWidgetItem(f"READY ({gpkg.get('size_str', '')})")
+                gpkg_item = SmartTableWidgetItem(f"READY ({gpkg.get('size_str', '')})")
                 gpkg_item.setTextAlignment(Qt.AlignCenter)
                 gpkg_item.setForeground(QColor("#0369a1"))
                 gpkg_item.setBackground(QColor("#e0f2fe"))
@@ -8692,7 +8823,7 @@ class COProcessingDialog(QDialog):
                 fc_fmt = f"{fc:,}" if isinstance(fc, (int, float)) else str(fc or 0)
                 gpkg_item.setToolTip(f"File: {gpkg.get('filename')}\nPath: {gpkg.get('path')}\nSize: {gpkg.get('size_str')}\nFeatures: {fc_fmt}\nModified: {gpkg.get('mtime_str')}")
             else:
-                gpkg_item = QTableWidgetItem("MISSING")
+                gpkg_item = SmartTableWidgetItem("MISSING")
                 gpkg_item.setTextAlignment(Qt.AlignCenter)
                 gpkg_item.setForeground(QColor("#94a3b8"))
                 gpkg_item.setBackground(QColor("#f8fafc"))
@@ -8702,13 +8833,13 @@ class COProcessingDialog(QDialog):
             # Col 6: Final EARF Excel
             earf = r.get("final_earf", {})
             if earf.get("exists"):
-                earf_item = QTableWidgetItem(f"READY ({earf.get('size_str', '')})")
+                earf_item = SmartTableWidgetItem(f"READY ({earf.get('size_str', '')})")
                 earf_item.setTextAlignment(Qt.AlignCenter)
                 earf_item.setForeground(QColor("#047857"))
                 earf_item.setBackground(QColor("#d1fae5"))
                 earf_item.setToolTip(f"File: {earf.get('filename')}\nPath: {earf.get('path')}\nSize: {earf.get('size_str')}\nModified: {earf.get('mtime_str')}")
             else:
-                earf_item = QTableWidgetItem("MISSING")
+                earf_item = SmartTableWidgetItem("MISSING")
                 earf_item.setTextAlignment(Qt.AlignCenter)
                 earf_item.setForeground(QColor("#94a3b8"))
                 earf_item.setBackground(QColor("#f8fafc"))
@@ -8718,13 +8849,13 @@ class COProcessingDialog(QDialog):
             # Col 7: MIS EARF Excel
             mis = r.get("mis_earf", {})
             if mis.get("exists"):
-                mis_item = QTableWidgetItem(f"READY ({mis.get('size_str', '')})")
+                mis_item = SmartTableWidgetItem(f"READY ({mis.get('size_str', '')})")
                 mis_item.setTextAlignment(Qt.AlignCenter)
                 mis_item.setForeground(QColor("#6d28d9"))
                 mis_item.setBackground(QColor("#ede9fe"))
                 mis_item.setToolTip(f"File: {mis.get('filename')}\nPath: {mis.get('path')}\nSize: {mis.get('size_str')}\nModified: {mis.get('mtime_str')}")
             else:
-                mis_item = QTableWidgetItem("MISSING")
+                mis_item = SmartTableWidgetItem("MISSING")
                 mis_item.setTextAlignment(Qt.AlignCenter)
                 mis_item.setForeground(QColor("#94a3b8"))
                 mis_item.setBackground(QColor("#f8fafc"))
@@ -8733,14 +8864,16 @@ class COProcessingDialog(QDialog):
 
             # Col 8: Last Modified
             mod_str = str(r.get("last_modified_str") or r.get("last_modified") or "-")
-            mod_item = QTableWidgetItem(mod_str)
+            mod_item = SmartTableWidgetItem(mod_str)
             mod_item.setTextAlignment(Qt.AlignCenter)
             self.table_monitoring.setItem(row_idx, 8, mod_item)
 
             # Col 9: Subfolder Location
-            loc_item = QTableWidgetItem(r.get("folder_path", "") or "-")
+            loc_item = SmartTableWidgetItem(r.get("folder_path", "") or "-")
             loc_item.setToolTip(r.get("folder_path", ""))
             self.table_monitoring.setItem(row_idx, 9, loc_item)
+
+        self.table_monitoring.setSortingEnabled(True)
 
     def _on_monitoring_row_selected(self):
         """Called when a row is clicked/selected in table_monitoring."""
