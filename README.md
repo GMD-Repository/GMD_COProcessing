@@ -16,6 +16,11 @@ A **GMD CO Processing** menu appears in the menu bar. The toolbar button opens t
 pick the EA layer and run the scripts in [gmd_processing_tools/](gmd_processing_tools/).
 See [gmd_processing_tools/README.md](gmd_processing_tools/README.md) for writing scripts.
 
+## Documentation
+How to use each tool: **[docs/README.md](docs/README.md)** — one page per script in
+[docs/tools/](docs/tools/) (EA MBI Checker, EA vs Barangay Check, MBI Barangay Selector, MBI EA Selector,
+EARF Post-Processing).
+
 ## Release a new version
 Releases are automatic: every push to `main` that changes the plugin (anything except this README)
 bumps the patch version (e.g. `v0.3.1` -> `v0.3.2`), creates a GitHub release and updates the link

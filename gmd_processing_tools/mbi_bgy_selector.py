@@ -43,9 +43,10 @@ Workflow:
           Step 3); shared overlaps go to every barangay with tagged buildings, most first.
           No-longer-detected MBIs have nothing to cover and cannot be ticked.
   Step 6  Apply Coverage writes 'assigned_bgy' (covering barangay geocodes, comma-separated)
-          and 'coverage_status' per barangay row into the MBI layer: the chosen barangay's row is
-          1_Covered (3_Partially Covered in a partly covered shared overlap), every barangay not
-          chosen is 2_Not Covered. Unsaved, undoable edits; no-longer-detected MBIs are untouched.
+          into the MBI layer. No coverage status is written here — the MBI EA Selector writes
+          it. Unsaved, undoable edits; no-longer-detected MBIs are untouched.
+          An MBI between TWO barangays goes to one of them (ticking one unticks the other);
+          only an overlap across THREE OR MORE barangays can be shared out (several ticks).
   Step 7  Join MBI to Barangays makes a 'Barangays + MBI' layer: the ticked barangay layers with
           every kept MBI part added as its own feature carrying the covering barangay's attributes,
           flagged 'bgy_part' = 'MBI' / 'is_mbi' = 1 and drawn hatched magenta (kept parts are cut
@@ -1291,7 +1292,8 @@ HELP_HTML = """
         runs across several barangays can be <b>shared out</b>: tick more than one barangay and each keeps only
         its own part (see <i>Shared Overlaps</i> below).</li>
     <li>Click <b>Apply Coverage</b> to write your choices into the <i>ppp_mbi</i> layer: the chosen barangay's row
-        becomes <b>1_Covered</b>, every barangay you did not choose <b>2_Not Covered</b>.</li>
+        gets the covering barangay geocode in <i>assigned_bgy</i>. No coverage status is written here — the MBI EA
+        Selector writes it.</li>
     <li>Click <b>Join MBI to Barangays</b> for a copy of the barangay layers with each MBI joined to the barangay
         it is assigned to — the joined MBI parts are drawn <b style="color:#c51162;">hatched magenta</b> and flagged
         <i>bgy_part</i> = <b>MBI</b> / <i>is_mbi</i> = <b>1</b>.</li>
@@ -1308,8 +1310,7 @@ HELP_HTML = """
     The MBI EA Selector reads <i>assigned_bgy</i> from this layer (keep the Coverage field named
     <i>assigned_bgy</i>). A shared overlap is listed there once per covering barangay, each with only its part.
     MBIs still pending here are skipped there, so assign them first. It writes <i>assigned_ea</i> and
-    <i>ea_coverage_status</i> on the covering barangay's rows and never changes <i>assigned_bgy</i> or
-    <i>coverage_status</i>.
+    <i>coverage_status</i> on the covering barangay's rows and never changes <i>assigned_bgy</i>.
   </div>
 
   <div style="background:#f9fafb; border:1px solid #e5e7eb; border-left:4px solid #4b5563;
@@ -1423,8 +1424,9 @@ HELP_HTML = """
     <tr><td style="font-weight:bold; vertical-align:top;">Barangay rows (below)</td>
         <td>Each involved barangay (geocode, name, city / municipality) with its own <b>Bldg Pts</b> (buildings
         inside this MBI tagged to that barangay). <b>Tick the Role / Status box of the covering barangay.</b> In a
-        gap, or an overlap that cannot be shared out, only one barangay covers the case — ticking another moves
-        the coverage. Unticking every barangay makes the case Pending again.</td></tr>
+        gap, an MBI between <b>two</b> barangays, or an overlap that cannot be shared out, only one barangay covers
+        the case — ticking one unticks the other. Only an overlap across <b>three or more</b> barangays lets you
+        tick several. Unticking every barangay makes the case Pending again.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Moving around</td>
         <td>Click a row to select it on the map, double-click to zoom, right-click for more (set / add / remove
         a covering barangay, mark pending, copy case ID or the remaining MBI's case ID). Use the search box
@@ -1436,7 +1438,8 @@ HELP_HTML = """
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Shared Overlaps (one MBI across several barangays)</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">What it is</td>
-        <td>An overlap that runs across several barangays (e.g. one barangay overlapping a strip of three
+        <td><b>Needs three or more candidate barangays</b> — an MBI between two barangays always goes to one of
+        them. An overlap that runs across several barangays (e.g. one barangay overlapping a strip of three
         barangays of the next municipality) does not have to go to a single barangay. Tick several: <b>each
         ticked barangay keeps only its own part of the overlap</b> — the MBI clipped to that barangay. The other
         barangays release (clip) the parts the ticked ones keep.</td></tr>
@@ -1461,13 +1464,12 @@ HELP_HTML = """
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Choices in the Viewer</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
     <tr><td width="110" style="font-weight:bold;">Overlap</td>
-        <td>Ticked barangay: <b>Keeps overlap</b> (row status <i>1_Covered</i>). Others: <b>Releases (clip)</b>
-        (<i>2_Not Covered</i>).</td></tr>
+        <td>Ticked barangay: <b>Keeps overlap</b>. Others: <b>Releases (clip)</b>. With two barangays, ticking one
+        unticks the other.</td></tr>
     <tr><td style="font-weight:bold;">Shared overlap</td>
-        <td>Each ticked barangay: <b>Keeps its part</b> (<i>1_Covered</i>, or <i>3_Partially Covered</i> while part of
-        the MBI has no covering barangay). Others: <b>Releases (clip)</b> (<i>2_Not Covered</i>).</td></tr>
+        <td>Three or more barangays: each ticked barangay <b>Keeps its part</b>. Others: <b>Releases (clip)</b>.</td></tr>
     <tr><td style="font-weight:bold;">Gap</td>
-        <td>Ticked barangay: <b>Absorbs gap</b> (<i>1_Covered</i>). Others: <b>Not extended</b> (<i>2_Not Covered</i>).</td></tr>
+        <td>Ticked barangay: <b>Absorbs gap</b>. Others: <b>Not extended</b>.</td></tr>
     <tr><td style="font-weight:bold;">Auto-Assign</td>
         <td>Single-barangay cases go to that barangay. Multi-barangay cases go to the barangay that owns most of the
         buildings inside the MBI (needs Building Points); shared overlaps go to <b>every</b> barangay with tagged
@@ -1507,17 +1509,14 @@ HELP_HTML = """
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">Coverage field<br>(default <i>assigned_bgy</i>)</td>
         <td>Geocode of the covering barangay, on every row of the case — several geocodes, comma-separated, for a
         shared overlap (in the order ticked). Empty while the case is Pending.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Status field<br>(default <i>coverage_status</i>)</td>
-        <td><b>Per barangay row:</b> <b>1_Covered</b> — the barangay you chose for the MBI. <b>2_Not Covered</b> —
-        every barangay you did <b>not</b> choose (all rows of a Pending case). <b>3_Partially Covered</b> — a chosen
-        barangay in a shared overlap where part of the MBI has no covering barangay yet. Filter
-        <i>"coverage_status" = '1_Covered'</i> for the chosen barangay of every MBI. A layer with only one row for
-        the whole MBI gets the case status on that row. Skipped within-barangay cases are not loaded and
-        no-longer-detected MBIs have nothing to cover, so both are left untouched.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">No coverage status</td>
+        <td>This tool writes <b>no</b> <i>coverage_status</i>: the coverage status is decided per EA and written by
+        the <b>MBI EA Selector</b>. Skipped within-barangay cases are not loaded and no-longer-detected MBIs have
+        nothing to cover, so both are left untouched.</td></tr>
   </table>
-  <div style="color:#4b5563; margin-top:4px;">The two field names can be changed in the panel (letters, digits and
-  underscores only, different from each other). Missing fields are added to the MBI layer automatically. The
-  coverage field's default differs from the MBI EA Selector's (<i>assigned_ea</i>).</div>
+  <div style="color:#4b5563; margin-top:4px;">The field name can be changed in the panel (letters, digits and
+  underscores only), but the MBI EA Selector reads <i>assigned_bgy</i> — keep that name. A missing field is
+  added to the MBI layer automatically.</div>
 
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Export GPKG + CSV</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
@@ -1531,11 +1530,10 @@ HELP_HTML = """
         <td><i>ppp_mbi_&lt;date&gt;_&lt;time&gt;.csv</i> — one row per case / barangay: case ID, detection,
         remaining MBI case ID and declared status, type, level, MBI
         area, building counts, barangay geocode / name / city / province, its EAs, the barangay's part and kept
-        area (m²) and kept buildings, covering barangay(s) and that barangay row's status. Opens in Excel.</td></tr>
+        area (m²) and kept buildings, <i>chosen</i> (Yes for the covering barangay) and the covering barangay(s). Opens in Excel.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Not applied yet?</td>
         <td>If your choices are not in the MBI layer yet, Export offers to <b>Apply Coverage first</b>, so the
-        files always match what you see. Barangays not chosen (and every row of a Pending case) are exported as
-        <b>2_Not Covered</b>.</td></tr>
+        files always match what you see. Pending cases are exported with an empty <i>assigned_bgy</i>.</td></tr>
   </table>
 
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">If Something Looks Wrong</h3>
@@ -1565,8 +1563,9 @@ HELP_HTML = """
         <td>The barangay's layer is not ticked, or its geocode differs from the MBI layer's <i>geocode</i>. Tick
         the layer, then Load again.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Can only tick one barangay in an overlap</td>
-        <td>The overlap cannot be shared out: tick the layers of <b>all</b> its barangays under <i>Barangay
-        Layers</i> (none may be red), then Load again. Gaps always take one barangay.</td></tr>
+        <td>An MBI between two barangays (and every gap) takes one barangay. An overlap across three or more can
+        be shared out only when the layers of <b>all</b> its barangays are ticked under <i>Barangay Layers</i> (none
+        may be red) — tick them, then Load again.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Stays Partly covered</td>
         <td>The ticked barangays' parts leave some of the MBI uncovered. Select the case row to see the orange
         leftover on the map, then tick the barangay that contains it.</td></tr>
@@ -1575,7 +1574,7 @@ HELP_HTML = """
         Points holds the barangay geocode (or an EA geocode starting with it).</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Field name turns red</td>
         <td>Use letters, digits and underscores only, starting with a letter or underscore; the Coverage field,
-        Status field must differ. Apply and Export stay disabled until fixed.</td></tr>
+        Apply and Export stay disabled until fixed.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Made a mistake</td>
         <td>Before Apply: <b>Reset Choices</b> or untick. After Apply: <b>Edit &gt; Undo</b> or
         <b>Discard Edits</b> on the MBI layer (before saving).</td></tr>
@@ -2028,16 +2027,16 @@ def make_dialog_class():
             self.field_edit.setToolTip("Field that receives the geocode(s) of the covering barangay(s),\n"
                                        "comma-separated when an overlap is shared out.")
             orow.addWidget(self.field_edit)
-            orow.addSpacing(10)
-            orow.addWidget(QtWidgets.QLabel("Status field:"))
+            # No coverage status here: the status is written by the MBI EA Selector only.
+            # (The widget is kept hidden so field validation stays unchanged.)
             self.status_edit = QtWidgets.QLineEdit(STATUS_FIELD)
+            self.status_edit.setVisible(False)
             self.status_edit.setMaximumWidth(140)
             self.status_edit.setToolTip(f"Field that receives the case status: '{STATUS_COVERED}' "
                                         f"(fully covered), '{STATUS_PARTIAL}' (part of a shared\n"
                                         f"overlap has no covering barangay yet) or '{STATUS_NOT_COVERED}' "
                                         "(still pending).")
             self.status_edit.textChanged.connect(self.validate_inputs)
-            orow.addWidget(self.status_edit)
             orow.addStretch(1)
             gf.addLayout(orow)
             erow = QtWidgets.QHBoxLayout()
@@ -2063,9 +2062,8 @@ def make_dialog_class():
             self.reset_btn.clicked.connect(self.reset_choices)
             self.apply_btn = button("Apply Coverage", 32, BTN_EXPORT)
             self.apply_btn.setToolTip(
-                f"Writes the covering barangay(s) ('{COVERAGE_FIELD}') and each row's status ('{STATUS_FIELD}')\n"
-                f"into the MBI layer: the chosen barangay's row is {STATUS_COVERED}, every barangay\n"
-                f"not chosen is {STATUS_NOT_COVERED}.\n"
+                f"Writes the covering barangay geocode(s) ('{COVERAGE_FIELD}') into the MBI layer.\n"
+                "No coverage status is written here — the MBI EA Selector writes it.\n"
                 "Changes are left UNSAVED (the layer enters edit mode) — use QGIS's\n"
                 "Save Edits to keep them, or Cancel Edits to discard and revert.")
             self.apply_btn.clicked.connect(self.apply_coverage)
@@ -2864,17 +2862,24 @@ def make_dialog_class():
                     cand.part = _polygonal(case.geom.intersection(bgy_geom))
                     cand.part_area = _area(cand.part, self.da)
 
-            split = unsplit = 0
+            split = unsplit = pairs = 0
             for case in cases.values():
                 cands = list(case.candidates.values())
                 is_overlap = case.mbi_type.lower() != "gap" and not case.gone
-                case.split = (is_overlap and case.geom is not None and len(cands) > 1
+                # Two candidates: one barangay or the other (ticking one unticks the other).
+                # Only an MBI with 3+ candidate barangays can be shared out (several ticks).
+                case.split = (is_overlap and case.geom is not None and len(cands) > 2
                               and all(c.part is not None for c in cands)
                               and sum(c.part_area for c in cands) > SLIVER_M2)
                 if case.split:
                     split += 1
-                elif is_overlap and len(cands) > 1:
+                elif is_overlap and len(cands) == 2:
+                    pairs += 1
+                elif is_overlap and len(cands) > 2:
                     unsplit += 1
+            if pairs:
+                self.log(f"  {pairs:,} overlap / disputed case(s) between two barangays — one barangay "
+                         "covers the whole MBI (ticking one unticks the other)")
             self.log(f"  {split:,} overlap / disputed case(s) can be shared out between their barangays "
                      "(each covering barangay keeps only its part)")
             if unsplit:
@@ -3119,8 +3124,6 @@ def make_dialog_class():
                     child.setCheckState(COL_ROLE, Qt.Unchecked)
                     child.setText(COL_ROLE, "Candidate")
                     paint(child, COL_ROLE, None)
-                if not case.gone and cand.fids:
-                    tip += f"\nApply writes this row's status as {self._row_status(case, cand)}."
                 child.setToolTip(COL_ROLE, tip.strip())
             status = case.status
             if status == "covered":
@@ -3151,8 +3154,9 @@ def make_dialog_class():
             self.toggle_bgy(case, item.data(COL_ID, ROLE_BGY), item.checkState(COL_ROLE) == Qt.Checked)
 
         def toggle_bgy(self, case, code, on):
-            """Tick / untick a covering barangay. Shared overlaps keep every ticked barangay (each keeps
-            its own part); otherwise ticking a barangay moves the coverage to it."""
+            """Tick / untick a covering barangay. Shared overlaps (3+ candidate barangays) keep every
+            ticked barangay (each keeps its own part); otherwise — gaps, and MBIs between two
+            barangays — ticking a barangay moves the coverage to it (the other is unticked)."""
             if on:
                 if code in case.assigned:
                     return
@@ -3453,8 +3457,7 @@ def make_dialog_class():
             is missing one of the coverage fields)."""
             if any(c.assigned != c.saved for c in self.cases.values()):
                 return True
-            return any(layer.fields().indexOf(n) < 0
-                       for n in (self.coverage_field(), self.status_field()))
+            return layer.fields().indexOf(self.coverage_field()) < 0
 
         def _kept_parts(self, case):
             """(cand, released_by codes, building count) for every covering barangay of the case
@@ -3739,13 +3742,11 @@ def make_dialog_class():
                     self, DIALOG_TITLE, "The MBI layer is no longer in the project — load again.")
                 return
             n = self._status_counts()
-            msg = (f"Write '{self.coverage_field()}' and '{self.status_field()}' "
+            msg = (f"Write '{self.coverage_field()}' (covering barangay geocodes) "
                    f"for {len(self.cases) - n['gone']:,} case(s) into '{layer.name()}'?\n\n"
-                   f"Each barangay row gets its own status: the chosen barangay → {STATUS_COVERED}"
-                   + (f" ({STATUS_PARTIAL} in a partly covered shared overlap)" if n["partial"] else "")
-                   + f", every barangay not chosen → {STATUS_NOT_COVERED}.\n"
                    f"{n['covered'] + n['partial']:,} case(s) have a covering barangay, "
-                   f"{n['pending']:,} are still pending (all rows {STATUS_NOT_COVERED})."
+                   f"{n['pending']:,} are still pending (left empty).\n"
+                   "No coverage status is written here — the MBI EA Selector writes it."
                    + (f"\n{n['gone']:,} no-longer-detected MBI(s) are left untouched." if n["gone"] else ""))
             if QtWidgets.QMessageBox.question(
                     self, DIALOG_TITLE, msg,
@@ -3754,37 +3755,28 @@ def make_dialog_class():
             self._write_coverage(layer)
 
         def _write_coverage(self, layer):
-            """Write the coverage field (per case) and the status (per barangay row) for every loaded
-            case (unsaved, undoable edits). Returns True on success."""
-            field, status_field = self.coverage_field(), self.status_field()
+            """Write the coverage field (covering barangay geocodes, on every row of the case) for
+            every loaded case (unsaved, undoable edits). No coverage status: the MBI EA Selector
+            writes it. Returns True on success."""
+            field = self.coverage_field()
             self.set_busy(True)
             self.log("-" * 50)
             self.log(f"Applying coverage to '{layer.name()}'…")
             try:
                 if not layer.isEditable() and not layer.startEditing():
                     raise RuntimeError(f"Cannot edit '{layer.name()}'")
-                for name in (field, status_field):
-                    if layer.fields().indexOf(name) < 0:
-                        layer.addAttribute(QgsField(name, QVariant.String))
-                        self.log(f"  Added field '{name}'")
+                if layer.fields().indexOf(field) < 0:
+                    layer.addAttribute(QgsField(field, QVariant.String))
+                    self.log(f"  Added field '{field}'")
                 layer.updateFields()
                 f_idx = layer.fields().indexOf(field)
-                s_idx = layer.fields().indexOf(status_field)
 
                 cases = [c for c in self.cases.values() if not c.gone]   # nothing to cover there
                 layer.beginEditCommand(f"MBI barangay coverage for {len(cases)} case(s)")
-                rows, by_status = 0, {}
+                rows = 0
                 for i, case in enumerate(cases):
-                    status_by_fid = {}
-                    for cand in case.candidates.values():
-                        for fid in cand.fids:
-                            status_by_fid[fid] = self._row_status(case, cand)
                     for fid in case.feature_ids:
-                        # A row with no barangay of its own (one row per MBI) gets the case status.
-                        status = status_by_fid.get(fid) or self._case_status(case)
-                        layer.changeAttributeValues(fid, {
-                            f_idx: ",".join(case.assigned) or None, s_idx: status})
-                        by_status[status] = by_status.get(status, 0) + 1
+                        layer.changeAttributeValues(fid, {f_idx: ",".join(case.assigned) or None})
                         rows += 1
                     if i % 200 == 0:
                         self.progress.setValue(int(100 * i / max(len(cases), 1)))
@@ -3794,9 +3786,9 @@ def make_dialog_class():
                     case.saved = list(case.assigned)
                 layer.triggerRepaint()
                 n = self._status_counts()
-                self.log(f"  Updated {rows:,} row(s) across {len(cases):,} case(s) "
-                         f"({n['pending']:,} case(s) still pending): "
-                         + ", ".join(f"{by_status[k]:,} {k}" for k in sorted(by_status)))
+                self.log(f"  Updated '{field}' on {rows:,} row(s) across {len(cases):,} case(s): "
+                         f"{n['covered'] + n['partial']:,} with a covering barangay, "
+                         f"{n['pending']:,} still pending")
                 self.log(f"  Changes are UNSAVED edits in '{layer.name()}'. "
                          "Save: Toggle Editing > Save Edits. Undo: Edit > Undo.")
                 self.progress.setValue(100)
@@ -3833,10 +3825,10 @@ def make_dialog_class():
             open_note = ""
             if n["pending"]:
                 open_note += (f"\n{n['pending']:,} case(s) are still pending and will be exported "
-                              f"as {STATUS_NOT_COVERED}.")
+                              "with no covering barangay.")
             if n["partial"]:
-                open_note += (f"\n{n['partial']:,} case(s) are only partly covered and will be "
-                              f"exported as {STATUS_PARTIAL}.")
+                open_note += (f"\n{n['partial']:,} shared case(s) are only partly covered by their "
+                              "ticked barangays.")
             if self._needs_apply(layer):
                 msg = ("The choices in the viewer are not in the MBI layer yet.\n"
                        "Apply Coverage first, then export?")
@@ -3910,7 +3902,7 @@ def make_dialog_class():
                      f"{_s['bgy']:,} barangay feature(s))")
 
         def export_csv(self, path):
-            field, status_field = self.coverage_field(), self.status_field()
+            field = self.coverage_field()
 
             def m2(value):
                 return "" if value is None else round(value, 2)
@@ -3921,7 +3913,7 @@ def make_dialog_class():
                             "mbi_type", "mbi_level", "mbi_area_m2", "num_bldg_pts",
                             "bgy_geocode", "barangay", "city_mun", "province", "ea_names",
                             "bgy_bldg_in_mbi", "bgy_part_m2", "bgy_kept_m2", "bgy_kept_bldg",
-                            field, status_field])
+                            "chosen", field])
                 for case in sorted(self.cases.values(), key=lambda c: (c.level, c.case_uuid)):
                     for cand in case.candidates.values():
                         chosen = cand.code in case.assigned
@@ -3933,8 +3925,7 @@ def make_dialog_class():
                                     m2(cand.part_area) if case.split else "",
                                     m2(cand.kept_area) if chosen else "",
                                     "" if not chosen or cand.kept_bldg is None else cand.kept_bldg,
-                                    ",".join(case.assigned),
-                                    "" if case.gone else self._row_status(case, cand)])
+                                    "Yes" if chosen else "", ",".join(case.assigned)])
             self.log(f"  CSV written: {path}")
 
     return CoverageDialog

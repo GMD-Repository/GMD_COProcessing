@@ -3,3 +3,5 @@
 .gitignore export-ignore
 .gitattributes export-ignore
 /README.md export-ignore
+/docs export-ignore
+/.claude export-ignore

@@ -12,10 +12,11 @@ Workflow:
           by 'ea_geocode' across all selected layers.
   Step 2  Optionally pick a building point layer (and its geocode field) to count the
           buildings inside each MBI, and per involved EA the ones tagged to it.
-  Step 3  Either click Run Check & Load Cases — runs the EA MBI Checker
-          (EA_topochecker.py) on the selected EA layers, adds one "MBI Results" layer with
-          every gap / overlap and lists its cases — or pick an existing MBI results layer
-          (needs 'case_uuid') and click Load MBI Cases.
+  Step 3  Pick the MBI Results layer — the 'ppp_mbi' layer of the MBI Barangay Selector
+          (needs 'case_uuid') — and click Load MBI Cases. No MBI check is run here (the
+          Run Check box is hidden): the MBIs were detected in the Barangay Selector.
+          A row without a barangay name gets it by its geocode / bgy_geocode from the other
+          MBI rows, else from the ticked EA layers.
   Step 4  Tick the Role / Status box of the covering EA in each case.
           Shared overlaps: when an overlap runs across several EAs (and their layers are
           selected), more than one EA can be ticked — each ticked EA keeps only its own part
@@ -27,8 +28,8 @@ Workflow:
   Step 5  Apply Coverage writes 'assigned_ea' (covering EA codes, comma-separated),
           'ea_role' (Covers / Releases, per row) and 'coverage_status' (1_Covered /
           2_Not Covered / 3_Partially Covered, per case) into the MBI layer as unsaved,
-          undoable edits, and refreshes the 'MBI Coverage Parts' layer (the part of each MBI
-          every covering EA keeps, plus any unassigned part).
+          undoable edits. No temporary layer is added (an old 'MBI Coverage Parts' layer is
+          removed). This tool is the only one that writes the coverage status.
   Step 6  Export GPKG + CSV writes the processed MBI layer, the coverage parts and a decision
           log CSV into the Export folder (applying any pending choices first).
 
@@ -42,9 +43,9 @@ MBIs from the MBI Barangay Selector ('ppp_mbi', has 'assigned_bgy'):
       EAs holding part of it (several can share it out), for a gap the EAs within the search
       distance (default 5 m); none that close -> the 3 nearest EAs of the barangay.
     • MBIs with no covering barangay yet, and no-longer-detected MBIs, are skipped.
-  Apply writes 'assigned_ea' and 'ea_coverage_status' on the covering barangay's row(s) only;
-  rows of barangays not chosen get no EA and 2_Not Covered. The Barangay Selector's own
-  'assigned_bgy' / 'coverage_status' are never changed (no 'ea_role' in this mode).
+  Apply writes 'assigned_ea' and 'coverage_status' on the covering barangay's row(s) only;
+  rows of barangays not chosen get no EA and 2_Not Covered. The Barangay Selector's
+  'assigned_bgy' is never changed (no 'ea_role' in this mode).
 """
 # Menu / panel entry (read by the GMD CO Processing plugin)
 TOOL_NAME = "MBI EA Selector"
@@ -93,8 +94,9 @@ SLIVER_SHARE = 0.001
 # The covering barangay(s) chosen there are read from BGY_COVERAGE_FIELD; the EAs offered for a
 # case are only the EAs of that barangay that cover / border the MBI.
 BGY_COVERAGE_FIELD = "assigned_bgy"        # covering barangay geocode(s), comma-separated
-BGY_STATUS_FIELD = "coverage_status"       # the Barangay Selector's row status: never overwritten
-BGY_MODE_STATUS_FIELD = "ea_coverage_status"   # default EA status field for those layers
+# The coverage status is written by this tool only (the Barangay Selector writes none), so
+# barangay mode uses the same default status field.
+BGY_MODE_STATUS_FIELD = STATUS_FIELD
 MBI_DETECTION = "detection"
 DETECT_GONE = "No longer detected"
 GAP_SEARCH_M = 5.0      # default: EAs of the covering barangay within this distance of a gap
@@ -103,6 +105,23 @@ NEAREST_FALLBACK = 3    # no EA that close: list this many of the barangay's nea
 # ===== EA layer fields =====
 EA_GEOCODE_FIELDS = ["ea_geocode", "geocode"]
 EA_BGY_FIELDS = ["geocode", "bgy_geocode"]   # barangay geocode of an EA (else: ea_geocode prefix)
+# Barangay name lookup. A row without a barangay name falls back to the name found, by its
+# geocode / bgy_geocode, on other rows of the MBI layer, then in the EA layers.
+BGY_CODE_FIELDS = ["geocode", "bgy_geocode", "bgy_geo"]
+BGY_NAME_FIELDS = ["barangay", "bgy_name", "brgy_name", "barangay_name"]
+BGY_CITY_FIELDS = ["city_mun", "city_municipality", "citymun", "mun_name"]
+
+
+def _first_text(feature, candidates):
+    """First non-empty value among the candidate fields (case-insensitive), else ''."""
+    names = {f.name().lower(): f.name() for f in feature.fields()}
+    for c in candidates:
+        real = names.get(c.lower())
+        if real:
+            v = _text(feature, real)
+            if v and v.upper() not in ("NULL", "UNKNOWN"):
+                return v
+    return ""
 EA_NAME_FIELDS = ["name", "ean", "ea_name"]
 
 # ===== Building point fields =====
@@ -146,6 +165,25 @@ def _code_key(value):
         value = int(value)
     s = str(value).strip()
     return (s.lstrip("0") or "0") if s.isdigit() else s
+
+
+BGY_DIGITS = 8   # 14-digit PSA geocode = 8-digit barangay + 6-digit EA number ('000000' = barangay)
+
+
+def _bgy_key(value):
+    """Barangay part of a geocode, for matching a barangay with its EAs.
+
+    14-digit codes (13 when the leading zero was lost): the first 8 digits — so barangay
+    '02709007000000' and its EAs '02709007001000', '02709007002000' share the key '02709007'.
+    Other codes: _code_key (the EA code then has to start with the barangay code)."""
+    if value is None or (hasattr(value, "isNull") and value.isNull()):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    s = str(value).strip()
+    if s.isdigit() and len(s) in (13, 14):
+        return s.zfill(14)[:BGY_DIGITS]
+    return _code_key(s)
 
 
 def _pick_field(layer, candidates):
@@ -314,9 +352,10 @@ class MBICase:
             self.num_bldg_pts = max(self.num_bldg_pts, int(float(bldg)))
         except (TypeError, ValueError):
             pass
-        if _code_key(_text(feat, MBI_GEOCODE)) == _code_key(self.bgy_code):
-            self.bgy_name = self.bgy_name or _text(feat, MBI_BARANGAY)
-            self.bgy_city = self.bgy_city or _text(feat, MBI_CITY_MUN)
+        row_code = _first_text(feat, BGY_CODE_FIELDS)
+        if _code_key(row_code) == _code_key(self.bgy_code):
+            self.bgy_name = self.bgy_name or _first_text(feat, BGY_NAME_FIELDS)
+            self.bgy_city = self.bgy_city or _first_text(feat, BGY_CITY_FIELDS)
         if coverage_field and not self._saved_raw:
             self._saved_raw = _text(feat, coverage_field)
 
@@ -472,10 +511,15 @@ def load_bgy_assigned_cases(mbi_layer, only_fids=None, coverage_field=None, tick
     total = len(only_fids) if only_fids is not None else max(mbi_layer.featureCount(), 1)
 
     rows = {}   # case_uuid -> [feature]
+    names = {}  # barangay geocode key -> (name, city) seen on any row (name fallback)
     for i, feat in enumerate(mbi_layer.getFeatures(request)):
         uuid = _text(feat, MBI_CASE_UUID)
         if uuid:
             rows.setdefault(uuid, []).append(feat)
+        k = _code_key(_first_text(feat, BGY_CODE_FIELDS))
+        name = _first_text(feat, BGY_NAME_FIELDS)
+        if k and name and k not in names:
+            names[k] = (name, _first_text(feat, BGY_CITY_FIELDS))
         if tick and i % 200 == 0:
             tick(i, total)
 
@@ -492,13 +536,16 @@ def load_bgy_assigned_cases(mbi_layer, only_fids=None, coverage_field=None, tick
         stats["used"] += 1
         all_fids = [f.id() for f in feats]
         for code in codes:
-            own = [f for f in feats if _code_key(_text(f, MBI_GEOCODE)) == _code_key(code)]
+            own = [f for f in feats if _code_key(_first_text(f, BGY_CODE_FIELDS)) == _code_key(code)]
             case = MBICase(uuid)
             case.key = f"{uuid}|{code}"
             case.bgy_code, case.bgy_codes, case.all_fids = code, codes, all_fids
             # One row for the whole MBI (older layers): every covering barangay shares it.
             for f in own or feats:
                 case.add_bgy_row(f, coverage_field)
+            if not case.bgy_name:   # fallback: the name another row gives this geocode
+                case.bgy_name, city = names.get(_code_key(code), ("", ""))
+                case.bgy_city = case.bgy_city or city
             cases[case.key] = case
     for case in cases.values():
         case.saved = _split_codes(case._saved_raw)
@@ -585,8 +632,8 @@ GRP_STYLE = ("QGroupBox { font-weight:600; margin-top:6px; } "
              "QGroupBox::title { subcontrol-origin:margin; left:8px; }")
 LEFT_WIDTH = 315
 
-NO_CASES = ("No MBI cases loaded. Tick the EA layers on the left, then click Run Check & Load "
-            "Cases — or pick an existing MBI Results layer and click Load MBI Cases.")
+NO_CASES = ("No MBI cases loaded. Pick the MBI Results layer from the MBI Barangay Selector, tick "
+            "the EA layers on the left, then click Load MBI Cases.")
 
 TREE_COLS = ["MBI Case / EA Geocode", "MBI Level", "Barangay", "EA Name", "Bldg Pts", "Role / Status"]
 COL_ID, COL_LEVEL, COL_BGY, COL_NAME, COL_BLDG, COL_ROLE = range(6)
@@ -675,12 +722,11 @@ HELP_HTML = """
 
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Quick Start</h3>
   <ol style="margin-top:4px;">
-    <li><b>Tick your EA layers</b> (left, <i>EA Layers</i>) — every layer the involved areas come from.</li>
+    <li><b>Pick the MBI Results Layer</b> — the <i>ppp_mbi</i> layer from the <b>MBI Barangay Selector</b>, after
+        you assigned the covering barangays there. No check is run here: the cases are only loaded.</li>
+    <li><b>Tick your EA layers</b> (left, <i>EA Layers</i>) — the layers of the covering barangays' EAs.</li>
     <li><b>Optional:</b> pick a <i>Building Points</i> layer so each case and EA shows its building count.</li>
-    <li><b>No MBI layer yet?</b> Click <b>Run Check &amp; Load Cases</b> (the <b style="color:#E65100;">orange</b>
-        box) to find the gaps / overlaps and list them.<br>
-        <b>Already have an MBI layer?</b> Skip the orange box: pick it under <i>MBI Results Layer</i> and click
-        <b style="color:#2e7d32;">Load MBI Cases</b> (green).</li>
+    <li>Click <b style="color:#2e7d32;">Load MBI Cases</b> (green).</li>
     <li>In the list, <b>tick the Role / Status box of the EA that covers</b> each case — or click
         <b>Auto-Assign Pending</b> to let the tool decide the easy ones, then review. An overlap that
         runs across several EAs can be <b>shared out</b>: tick more than one EA and each keeps only its
@@ -711,8 +757,7 @@ HELP_HTML = """
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Inputs (left panel)</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">MBI Results Layer</td>
-        <td>The Gaps / Overlaps layer (must have <i>case_uuid</i>). Created for you by <i>Run Check</i>;
-        pick one yourself only to continue earlier work. Tick <i>Only selected MBI features</i> to load
+        <td>The <i>ppp_mbi</i> layer of the MBI Barangay Selector (must have <i>case_uuid</i>). Tick <i>Only selected MBI features</i> to load
         just part of it, and <i>Resume saved coverage choices</i> to pre-tick EAs already stored in it.
         A <i>ppp_mbi</i> layer of the MBI Barangay Selector works too (see below).</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Choose EAs inside the covering barangay</td>
@@ -730,16 +775,14 @@ HELP_HTML = """
         <td>Optional. <b>Case row:</b> building points inside the gap / overlap. <b>EA rows:</b> of those,
         the points whose <i>Geocode field</i> (auto: ea_geocode, then geocode) matches the EA. Used by
         Auto-Assign.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Run EA MBI Check<br>(orange box)</td>
-        <td><b>Only needed if you do not have an MBI Results layer yet.</b> If you already have one, skip this
-        box. Choose <i>Overlaps and Gaps</i>, <i>Overlaps Only</i> or <i>Gaps Only</i>, then
-        <b>Run Check &amp; Load Cases</b>. It runs the EA MBI Checker on the ticked EA layers, adds one
-        <i>MBI Results</i> layer (a temporary layer — right-click &gt; <b>Make Permanent</b> to keep it) and
-        loads its cases. A gap / overlap that runs across more than two EAs is <b>one case</b> listing all of
-        them. EA layers need <i>geocode</i> and <i>ea_geocode</i> fields and should be in EPSG:4326.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Load MBI Cases<br>(green button)</td>
-        <td>Lists the cases of the MBI Results layer picked at the top, without running the check. Use this
-        when you already have an MBI layer.</td></tr>
+        <td>Lists the cases of the MBI Results layer picked at the top. No MBI check is run in this tool — the
+        MBIs were already detected and assigned a barangay in the MBI Barangay Selector.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Barangay name fallback</td>
+        <td>If a row of the MBI layer has no barangay name, the name is looked up by the barangay geocode
+        (<i>geocode</i> / <i>bgy_geocode</i> / <i>bgy_geo</i>): first on the other rows of the MBI layer, then in
+        the ticked EA layers (their <i>barangay</i> / <i>bgy_name</i> field). The log says how many were filled
+        and lists geocodes with no name found (shown by geocode only).</td></tr>
   </table>
 
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Reading the Case List</h3>
@@ -796,8 +839,10 @@ HELP_HTML = """
         (the MBI clipped to that barangay's EAs) — the column shows the part's share, e.g. <i>its part (60%)</i>.
         Select the case row to see that part on the map (dashed blue).</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Which EAs are offered</td>
-        <td>Only the EAs of the covering barangay, from the ticked EA layers (matched on the EA layer's
-        <i>geocode</i>, else the start of its <i>ea_geocode</i>):<br>
+        <td>Only the EAs of the covering barangay, from the ticked EA layers. With 14-digit geocodes the
+        <b>first 8 digits</b> are the barangay and the last 6 the EA: the barangay in <i>assigned_bgy</i>
+        (<i>02709007000000</i>) gets the EAs <i>02709007001000</i>, <i>02709007002000</i>, … Other codes: the EA code must
+        start with the barangay code.<br>
         <b>Overlap / disputed area</b> — the barangay's EAs holding part of it. Several EAs can share it out,
         each keeping its own part (as in <i>Shared Overlaps</i>).<br>
         <b>Gap</b> — the barangay's EAs bordering the gap or within the <i>EAs within … m of a gap</i> distance;
@@ -806,10 +851,10 @@ HELP_HTML = """
         Barangay column: check those on the map.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Fields written</td>
         <td>On the <b>covering barangay's row(s)</b> of the MBI layer: <i>assigned_ea</i> (chosen EA codes) and
-        <i>ea_coverage_status</i> (1_Covered / 2_Not Covered / 3_Partially Covered). Rows of barangays not
-        chosen get no EA and <b>2_Not Covered</b>. The Barangay Selector's <i>assigned_bgy</i> and
-        <i>coverage_status</i> are <b>never changed</b> (the Status field turns red if you type one of them).
-        There is no <i>ea_role</i> in this mode. The Coverage Parts layer, GPKG and CSV also carry the covering
+        <i>coverage_status</i> (1_Covered / 2_Not Covered / 3_Partially Covered — only this tool writes it; the
+        Barangay Selector writes none). Rows of barangays not chosen get no EA and <b>2_Not Covered</b>. The
+        Barangay Selector's <i>assigned_bgy</i> is <b>never changed</b> (a field name turns red if you type it).
+        There is no <i>ea_role</i> in this mode. The exported coverage parts and the CSV also carry the covering
         barangay (<i>bgy_geocode</i> / <i>covering_bgy</i>).</td></tr>
   </table>
 
@@ -842,12 +887,10 @@ HELP_HTML = """
         <td><b>1_Covered</b> — the case is fully covered. <b>2_Not Covered</b> — the case is still Pending.
         <b>3_Partially Covered</b> — a shared overlap where part of the MBI has no covering EA yet.
         Written for every loaded case, so you can filter or symbolise on it.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">MBI Coverage Parts<br>(new layer)</td>
-        <td>A temporary layer added (and refreshed on every Apply) showing <b>the part of each MBI every covering EA
-        keeps</b>: <i>part_role</i> <b>Kept</b> (green) with the EA's <i>ea_geocode</i>, name, barangay,
-        <i>area_m2</i>, <i>pct_of_mbi</i>, <i>num_bldg_pts</i> and <i>released_by</i> (the EAs that must clip it
-        out), plus <b>Unassigned</b> (orange) for what no covering EA keeps yet. Right-click &gt; <b>Make
-        Permanent</b> to keep it.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">No temporary layer</td>
+        <td>Apply adds <b>no</b> scratch layer to the project (a leftover <i>MBI Coverage Parts</i> layer from an
+        earlier version is removed). The part of each MBI every covering EA keeps is written only by <i>Export
+        GPKG + CSV</i>, as <i>mbi_ea_coverage_parts</i>.</td></tr>
   </table>
   <div style="color:#4b5563; margin-top:4px;">The two field names can be changed in the panel (letters, digits and
   underscores only, all different). Missing fields are added to the MBI layer automatically.</div>
@@ -859,7 +902,9 @@ HELP_HTML = """
     <tr><td style="font-weight:bold; vertical-align:top;">GeoPackage</td>
         <td><i>mbi_ea_coverage_&lt;date&gt;_&lt;time&gt;.gpkg</i> with two layers: <i>mbi_ea_coverage</i> — the whole MBI
         layer including the coverage fields, even if you have not saved the layer's edits yet — and
-        <i>mbi_ea_coverage_parts</i> — the kept / unassigned parts (as in the MBI Coverage Parts layer).</td></tr>
+        <i>mbi_ea_coverage_parts</i> — the part of each MBI every covering EA keeps (<i>part_role</i> <b>Kept</b>,
+        with the EA's <i>ea_geocode</i>, name, barangay, <i>area_m2</i>, <i>pct_of_mbi</i>, <i>num_bldg_pts</i>,
+        <i>released_by</i>), plus <b>Unassigned</b> for what no covering EA keeps yet.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">CSV</td>
         <td><i>mbi_ea_coverage_&lt;date&gt;_&lt;time&gt;.csv</i> — one row per case / EA: case ID, type, level, MBI area,
         building counts, EA code / name / barangay, the EA's part and kept area (m²) and kept buildings, role,
@@ -872,10 +917,12 @@ HELP_HTML = """
 
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">If Something Looks Wrong</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
-    <tr><td width="110" style="font-weight:bold; vertical-align:top;">Run Check is greyed out</td>
-        <td>Tick at least one EA layer, and make sure each has <i>geocode</i> and <i>ea_geocode</i> fields.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Load MBI Cases is greyed out</td>
-        <td>The picked MBI layer has no <i>case_uuid</i> field — use Run Check to create a proper one.</td></tr>
+    <tr><td width="110" style="font-weight:bold; vertical-align:top;">Load MBI Cases is greyed out</td>
+        <td>Pick the <i>ppp_mbi</i> layer of the MBI Barangay Selector (it needs <i>case_uuid</i>) and tick at least
+        one EA layer with an <i>ea_geocode</i> field.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Barangay column shows only a geocode</td>
+        <td>No barangay name was found for that geocode in the MBI layer or the ticked EA layers. Tick an EA layer
+        that has a <i>barangay</i> / <i>bgy_name</i> field, then Load again.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">EA in red / "not found"</td>
         <td>The EA's layer is not ticked. Tick it, then Load again.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Can only tick one EA in an overlap</td>
@@ -1230,10 +1277,13 @@ def make_dialog_class():
             self.run_hint = self._hint()
             lay.addWidget(self.run_hint)
             ll.addWidget(box)
+            # The MBI Results layer comes from the MBI Barangay Selector: no check is run here,
+            # the cases are only loaded. (Kept hidden so the old run path stays intact.)
+            box.setVisible(False)
 
             self.load_btn = button("Load MBI Cases")
-            self.load_btn.setToolTip("Read the existing MBI Results layer (picked above) and list each\n"
-                                     "case with all of its involved EAs.")
+            self.load_btn.setToolTip("Read the MBI Results layer picked above (the ppp_mbi layer of the\n"
+                                     "MBI Barangay Selector) and list each case with its candidate EAs.")
             self.load_btn.setObjectName("loadBtn")
             self.load_btn.clicked.connect(lambda: self.load_cases())
             ll.addWidget(self.load_btn)
@@ -1367,8 +1417,7 @@ def make_dialog_class():
             self.apply_btn = button("Apply Coverage", 32, BTN_EXPORT)
             self.apply_btn.setToolTip(
                 f"Writes the covering EA(s) ('{COVERAGE_FIELD}'), each row's role ('{ROLE_FIELD}') and\n"
-                f"the case status ('{STATUS_FIELD}') into the MBI layer, and refreshes the\n"
-                f"'{PARTS_LAYER_NAME}' layer (the part of each MBI every covering EA keeps).\n"
+                f"the case status ('{STATUS_FIELD}') into the MBI layer (no temporary layer is added).\n"
                 "Changes are left UNSAVED (the layer enters edit mode) — use QGIS's\n"
                 "Save Edits to keep them, or Cancel Edits to discard and revert.")
             self.apply_btn.clicked.connect(self.apply_coverage)
@@ -1589,12 +1638,12 @@ def make_dialog_class():
             ok = True
             mbi = self.mbi_combo.currentLayer()
             if mbi is None:
-                self.set_hint(self.mbi_hint, "Pick an existing MBI Results layer, or create one with "
-                                             "Run Check & Load Cases below.")
+                self.set_hint(self.mbi_hint, "Pick the MBI Results layer (ppp_mbi) from the MBI "
+                                             "Barangay Selector.")
                 ok = False
             elif "case_uuid" not in field_names(mbi):
-                self.set_hint(self.mbi_hint, "Missing 'case_uuid' field — run the EA MBI "
-                                             "Checker to produce an MBI layer.", "error")
+                self.set_hint(self.mbi_hint, "Missing 'case_uuid' field — pick the ppp_mbi layer of "
+                                             "the MBI Barangay Selector.", "error")
                 ok = False
             elif is_bgy_mbi_layer(mbi):
                 self.set_hint(self.mbi_hint, f"{mbi.featureCount():,} MBI row(s) · covering barangays "
@@ -1641,16 +1690,16 @@ def make_dialog_class():
             names = (self.coverage_field(), self.status_field(), ROLE_FIELD)
             valid = [bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n)) for n in names]
             clash = len({n.lower() for n in names}) < len(names)
-            # Barangay mode: never overwrite the Barangay Selector's own fields.
-            taken = {BGY_COVERAGE_FIELD.lower(), BGY_STATUS_FIELD.lower()} if bgy_mode else set()
+            # Barangay mode: never overwrite the Barangay Selector's covering barangays.
+            taken = {BGY_COVERAGE_FIELD.lower()} if bgy_mode else set()
             bad_cov, bad_status = names[0].lower() in taken, names[1].lower() in taken
             bad = "border: 1px solid #c62828;"
             self._field_ok = all(valid) and not clash and not bad_cov and not bad_status
             self.field_edit.setStyleSheet("" if valid[0] and not clash and not bad_cov else bad)
             self.status_edit.setStyleSheet("" if valid[1] and not clash and not bad_status else bad)
             self.status_edit.setToolTip(
-                (f"'{names[1]}' holds the Barangay Selector's barangay status — use another name "
-                 f"(default '{BGY_MODE_STATUS_FIELD}').\n\n" if bad_status else "")
+                (f"'{names[1]}' holds the Barangay Selector's covering barangays — use another "
+                 f"name (default '{STATUS_FIELD}').\n\n" if bad_status else "")
                 + f"Field that receives the case status: '{STATUS_COVERED}' (fully covered), "
                 f"'{STATUS_PARTIAL}' (part of a shared\noverlap has no covering EA yet) or "
                 f"'{STATUS_NOT_COVERED}' (still pending).")
@@ -2111,22 +2160,26 @@ def make_dialog_class():
             import math
             from qgis.core import QgsCoordinateReferenceSystem
             prj = QgsProject.instance()
-            keys = {_code_key(c.bgy_code) for c in cases.values()}
+            keys = {_bgy_key(c.bgy_code) for c in cases.values()}
             key_lens = sorted({len(k) for k in keys}, reverse=True)
 
             # 1. EAs of the covering barangays (MBI layer CRS)
             eas_by_bgy, lookup, dupes = {}, {}, 0
+            bgy_names = {}   # barangay key -> (name, city) from the EA layers (name fallback)
             total = max(sum(l.featureCount() for l in ea_layers), 1)
             done = 0
             for layer in ea_layers:
                 ea_field = _pick_field(layer, EA_GEOCODE_FIELDS)
-                bgy_field = _pick_field(layer, EA_BGY_FIELDS)
+                bgy_field = _pick_field(layer, BGY_CODE_FIELDS)
                 if bgy_field == ea_field:
                     bgy_field = None
                 name_field = _pick_field(layer, EA_NAME_FIELDS)
+                bname_field = _pick_field(layer, BGY_NAME_FIELDS)
+                bcity_field = _pick_field(layer, BGY_CITY_FIELDS)
                 xform = QgsCoordinateTransform(layer.crs(), mbi_layer.crs(), prj)
                 request = QgsFeatureRequest().setSubsetOfAttributes(
-                    [f for f in (ea_field, bgy_field, name_field) if f], layer.fields())
+                    [f for f in (ea_field, bgy_field, name_field, bname_field, bcity_field) if f],
+                    layer.fields())
                 for feat in layer.getFeatures(request):
                     if done % 500 == 0:
                         self.tick(done, total, f"Reading the barangays' EAs ({done:,}/{total:,})…")
@@ -2134,13 +2187,19 @@ def make_dialog_class():
                     code = _text(feat, ea_field)
                     if not code or not feat.hasGeometry():
                         continue
-                    bkey = _code_key(_text(feat, bgy_field)) if bgy_field else ""
+                    bkey = _bgy_key(_text(feat, bgy_field)) if bgy_field else ""
                     if bkey not in keys:
-                        # an EA geocode starts with its barangay's geocode
+                        # 14-digit PSA codes: the first 8 digits are the barangay
+                        bkey = _bgy_key(code)
+                    if bkey not in keys:
+                        # otherwise an EA geocode starts with its barangay's geocode
                         ek = _code_key(code)
                         bkey = next((ek[:n] for n in key_lens if n < len(ek) and ek[:n] in keys), "")
                     if not bkey:
                         continue
+                    if bkey not in bgy_names and bname_field and _text(feat, bname_field):
+                        bgy_names[bkey] = (_text(feat, bname_field),
+                                           _text(feat, bcity_field) if bcity_field else "")
                     if code in lookup:
                         dupes += 1
                         continue
@@ -2154,11 +2213,27 @@ def make_dialog_class():
                     eas_by_bgy.setdefault(bkey, []).append((code, lookup[code]["name"], g))
             self.log(f"  {len(lookup):,} EA(s) of the {len(keys):,} covering barangay(s) found in "
                      f"{len(ea_layers)} EA layer(s)")
+            # Barangay name fallback: the MBI layer had none for this geocode -> EA layers
+            named = 0
+            for case in cases.values():
+                found = bgy_names.get(_bgy_key(case.bgy_code))
+                if found and not case.bgy_name:
+                    case.bgy_name = found[0]
+                    named += 1
+                if found and not case.bgy_city:
+                    case.bgy_city = found[1]
+            if named:
+                self.log(f"  {named:,} case(s) had no barangay name in the MBI layer — named from the "
+                         "EA layers by geocode")
+            unnamed = sorted({c.bgy_code for c in cases.values() if not c.bgy_name})
+            if unnamed:
+                self.log(f"  No barangay name found for {len(unnamed):,} geocode(s): "
+                         + ", ".join(unnamed[:10]) + (" …" if len(unnamed) > 10 else ""))
             if dupes:
                 self.log(f"  {dupes:,} duplicate ea_geocode(s) across layers — the first selected "
                          "layer's EA is used.")
             missing = sorted({c.bgy_label for c in cases.values()
-                              if _code_key(c.bgy_code) not in eas_by_bgy})
+                              if _bgy_key(c.bgy_code) not in eas_by_bgy})
             if missing:
                 self.log(f"  {len(missing):,} covering barangay(s) have no EA in the selected layers: "
                          + ", ".join(missing[:10]) + (" …" if len(missing) > 10 else ""))
@@ -2178,7 +2253,7 @@ def make_dialog_class():
                     continue
                 claimed = None
                 for case in subs:   # in the order the barangays were chosen
-                    geoms = [g for _c, _n, g in eas_by_bgy.get(_code_key(case.bgy_code), [])
+                    geoms = [g for _c, _n, g in eas_by_bgy.get(_bgy_key(case.bgy_code), [])
                              if g.intersects(whole)]
                     part = _polygonal(whole.intersection(
                         geoms[0] if len(geoms) == 1 else QgsGeometry.unaryUnion(geoms))) if geoms else None
@@ -2208,7 +2283,7 @@ def make_dialog_class():
             for i, case in enumerate(cases.values()):
                 if i % 25 == 0:
                     self.tick(i, len(cases), f"Finding the EAs of each covering barangay ({i:,}/{len(cases):,})…")
-                infos = eas_by_bgy.get(_code_key(case.bgy_code), [])
+                infos = eas_by_bgy.get(_bgy_key(case.bgy_code), [])
                 if case.geom is None or not infos:
                     n["none"] += 1
                     continue
@@ -2945,6 +3020,19 @@ def make_dialog_class():
                 cats.append(QgsRendererCategory(value, sym, value))
             layer.setRenderer(QgsCategorizedSymbolRenderer("part_role", cats))
 
+        def remove_parts_layer(self):
+            """Remove the temporary 'MBI Coverage Parts' layer (made by earlier versions of this
+            tool) from the project. The parts are only written to the export GeoPackage."""
+            prj = QgsProject.instance()
+            ids = [l.id() for l in prj.mapLayersByName(PARTS_LAYER_NAME)
+                   if l.dataProvider().name() == "memory"]
+            if self.parts_layer_id and prj.mapLayer(self.parts_layer_id) is not None:
+                ids.append(self.parts_layer_id)
+            if ids:
+                prj.removeMapLayers(list(set(ids)))
+                self.log(f"  Removed the temporary '{PARTS_LAYER_NAME}' layer")
+            self.parts_layer_id = None
+
         def update_parts_layer(self, mbi_layer):
             """Add (or refresh) the MBI Coverage Parts layer in the project."""
             new = self.build_parts_layer(mbi_layer.crs())
@@ -2975,11 +3063,10 @@ def make_dialog_class():
                 return
             n = self._status_counts()
             fields = "', '".join(self._written_fields())
-            msg = (f"Write '{fields}' for all {len(self.cases):,} case(s) into '{layer.name()}', "
-                   f"and refresh the '{PARTS_LAYER_NAME}' layer?\n\n"
+            msg = (f"Write '{fields}' for all {len(self.cases):,} case(s) into '{layer.name()}'?\n\n"
                    + (f"Written on the covering barangay's row(s); the rows of barangays not chosen "
-                      f"get {STATUS_NOT_COVERED} and no EA. '{BGY_COVERAGE_FIELD}' and "
-                      f"'{BGY_STATUS_FIELD}' are not changed.\n\n" if self.bgy_mode else "")
+                      f"get {STATUS_NOT_COVERED} and no EA. '{BGY_COVERAGE_FIELD}' is not "
+                      "changed.\n\n" if self.bgy_mode else "")
                    + f"{n['covered']:,} case(s) → {STATUS_COVERED}\n"
                    + (f"{n['partial']:,} case(s) → {STATUS_PARTIAL}\n" if n["partial"] else "")
                    + f"{n['pending']:,} case(s) → {STATUS_NOT_COVERED}")
@@ -3064,7 +3151,7 @@ def make_dialog_class():
                          + f"{n['pending']:,} {STATUS_NOT_COVERED}")
                 self.log(f"  Changes are UNSAVED edits in '{layer.name()}'. "
                          "Save: Toggle Editing > Save Edits. Undo: Edit > Undo.")
-                self.update_parts_layer(layer)
+                self.remove_parts_layer()   # no scratch layer: the parts go to the export GPKG only
                 self.progress.setValue(100)
                 return True
             except Exception as e:
