@@ -11,3 +11,13 @@ __pycache__/
 
 # temporary local backups
 *.bak*
+
+# SQLite local databases & WAL files
+*.db
+*.db-shm
+*.db-wal
+
+# Secured runtime database directories
+secured/
+**/secured/
+

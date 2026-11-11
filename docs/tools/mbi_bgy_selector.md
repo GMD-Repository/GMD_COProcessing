@@ -57,7 +57,9 @@ flowchart LR
    - **gaps** — holes enclosed by the barangays but inside none;
    - **disputed areas** — polygons whose `boundary` is *Contested*, plus the barangays within 0.50 m of them.
 
-   Findings under 0.10 m² are dropped as slivers. Barangays within 0.50 m of a gap or disputed area count
+   Findings of 0.10 m² or less **with no building point inside** are dropped as slivers; a tiny finding
+   that holds a building is kept. That area is measured on the project's ellipsoid (as QGIS `$area`, the
+   same as the National-Level and EA MBI Checkers), or planar in EPSG:3857 when the project has no ellipsoid. Barangays within 0.50 m of a gap or disputed area count
    as involved. Each contiguous piece becomes one case (`case_uuid`), and the building points inside it are
    counted.
 2. **Counter-check.** Every detection is intersected with the remaining MBIs. Sharing more than 0.01 m²
