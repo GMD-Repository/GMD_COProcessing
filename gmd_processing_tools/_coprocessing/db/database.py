@@ -349,11 +349,31 @@ def is_summary_header_record(r: Dict[str, Any]) -> bool:
     if gc.endswith("00000000"):
         return True
     if gc.endswith("000000"):
+        # Check if record has explicit geometry indicators from GPKG or matching
         in_p = r.get("in_popcen") in (1, "1", True)
-        in_g = r.get("in_gpkg") in (1, "1", True) or bool(r.get("has_geometry"))
+        in_g = (
+            r.get("in_gpkg") in (1, "1", True)
+            or bool(r.get("has_geometry"))
+            or bool(r.get("map_uuid"))
+            or bool(r.get("geom_status"))
+            or bool(r.get("layer_source"))
+        )
         ne = str(r.get("new_enumeration_area_code") or r.get("new_ean") or "").strip()
-        hh = str(r.get("household_count") or r.get("earf_household_count") or r.get("no_of_households") or "").strip()
-        bldg = str(r.get("building_count") or r.get("earf_building_count") or "").strip()
+        hh = str(
+            r.get("household_count")
+            or r.get("earf_household_count")
+            or r.get("no_of_households")
+            or r.get("hh_count")
+            or r.get("hhcount")
+            or ""
+        ).strip()
+        bldg = str(
+            r.get("building_count")
+            or r.get("earf_building_count")
+            or r.get("bldg_count")
+            or r.get("bldgcount")
+            or ""
+        ).strip()
         if not in_p and not in_g and (not ne or ne == "000000") and not hh and not bldg:
             return True
     return False

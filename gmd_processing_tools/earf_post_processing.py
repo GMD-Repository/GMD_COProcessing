@@ -31,6 +31,12 @@ _COPROC_DIR = os.path.join(_CURRENT_DIR, "_coprocessing")
 if os.path.exists(_COPROC_DIR) and _COPROC_DIR not in sys.path:
     sys.path.insert(0, _COPROC_DIR)
 
+# Force reload of local _coprocessing submodules when launched inside QGIS
+# so changes take effect without needing a full QGIS application restart
+for _mod_name in list(sys.modules.keys()):
+    if _mod_name.startswith("_coprocessing") or _mod_name in ("dialog", "database"):
+        del sys.modules[_mod_name]
+
 # Import dialog class from local bundled package or fallback to COProcessing plugin
 try:
     from _coprocessing.ui.dialog import COProcessingDialog

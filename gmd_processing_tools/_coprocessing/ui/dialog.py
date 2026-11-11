@@ -7329,6 +7329,15 @@ class COProcessingDialog(QDialog):
             except Exception:
                 pass
 
+        if "new_geocode" not in df.columns or df["new_geocode"].isna().all():
+            def _build_new_gc(row):
+                gc = str(row.get("geocode", "") or "").strip()
+                fean = str(row.get("final_ean", "") or "").strip()
+                if len(gc) >= 8 and fean:
+                    return f"{gc[:8]}{fean.zfill(6)}"
+                return ""
+            df["new_geocode"] = df.apply(_build_new_gc, axis=1)
+
         if "source_files" in df.columns and "source_file" in df.columns:
             has_multi = df["source_files"].astype(str).str.contains(",", na=False)
             df.loc[has_multi, "source_file"] = df.loc[has_multi, "source_files"]
@@ -7350,6 +7359,7 @@ class COProcessingDialog(QDialog):
             "sy",
             "new_ean",
             "final_ean",
+            "new_geocode",
             "hh_count",
             "bldg_count",
             "ea_type",
