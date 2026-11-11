@@ -2794,6 +2794,13 @@ class COProcessingDialog(QDialog):
                 else:
                     gc = str(r_dict.get("geocode", "") or "").strip()
 
+                # Reconstruct base geocode if geocode last 6 digits do not match base ean
+                # (e.g. split EA in GPKG has geocode 80601051003002 but ean 002000)
+                if len(gc) >= 14 and gc[:8].isdigit() and ean_val and ean_val.isdigit():
+                    ean_std = f"{int(ean_val):03d}000" if len(ean_val) <= 3 else f"{int(ean_val):06d}"
+                    if not gc.endswith(ean_std):
+                        gc = f"{gc[:8]}{ean_std}"
+
                 if not gc:
                     new_ean_val = str(r_dict.get("new_ean", "") or "").strip()
                     if bgy_gc and new_ean_val:
