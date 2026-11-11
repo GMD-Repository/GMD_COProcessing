@@ -21,7 +21,7 @@ The window's list shows them, largest first. No layer is added to the project: t
 memory by the window, for zooming and snapping. Reference features with no match are named in the log.
 
 Snapping is done per discrepancy: select rows in the list and press "Snap Selected". Only the feature named
-in the "Fix" column is changed, and only in the checked layer (the reference is never edited):
+in the "Fix" column is changed, and only in the checked layers (the reference is never edited):
 
   - Outside / Overlap pieces are cut off the feature.
   - Short / Gap pieces are added to the feature sharing the longest border with them.
@@ -31,10 +31,13 @@ Before a feature is changed, the new geometry must be valid, not empty, have the
 in the layer's CRS, fit the layer (single-part layers cannot take several parts), and the feature must not
 have been edited since the scan. Otherwise the row is marked Failed with the reason and it is untouched.
 
-The checked layer is left in edit mode and nothing is written to its file until you save:
+Several layers can be ticked on each side (e.g. every city / municipality of a province). The ticked layers are
+scanned together, so discrepancies between two layers are found too, and each snap edits the feature's own layer.
 
-  Keep    Save Layer Edits
-  Revert  Toggle Editing > Discard, or Edit > Undo (one undo step per Snap Selected)
+The changed layers are left in edit mode and nothing is written to their files until you save:
+
+  Keep    Save Layer Edits, or Layer > Current Edits > Save for All Layers
+  Revert  Toggle Editing > Discard, or Edit > Undo (one undo step per layer per Snap Selected)
 
 Only the geometry is changed: attributes such as household counts stay as they are.
 Each scan also removes any "Discrepancies ..." scratch layers left in the project by older versions.
@@ -43,8 +46,8 @@ Usage:
   1. Load the layers into the project. To check only part of a layer, set a filter on it (right-click > Filter).
   2. GMD CO Processing > EA Tools > EA vs Barangay Check. This opens the "EA vs Barangay Check" window
      (same layout as the MBI EA Selector, plus a Help and Information tab).
-  3. Choose the Check Mode, pick the layer to check and (optionally, except for EA vs BGY) the reference
-     layer, then press Scan. Progress, warnings and the summary appear in the Log.
+  3. Choose the Check Mode, tick the layers to check and (optionally, except for EA vs BGY) the reference
+     layers, or press Select All, then press Scan. Progress, warnings and the summary appear in the Log.
   4. The Discrepancies list shows every issue: click a row to flash it on the map, double-click to zoom to it.
      Select the rows to fix (Switch Fix to change which feature takes them) and press Snap Selected.
 """
@@ -771,9 +774,9 @@ def to_layer_geometry(geom, ea_layer):
 class Scan:
     """Everything a scan found, kept so that selected discrepancies can be snapped afterwards."""
 
-    def __init__(self, ea_layer, ea, discrepancies, layer, fids, min_area, mode="ea_bgy", self_check=False):
-        self.ea_layer = ea_layer            # the target layer (the one snapped)
-        self.ea = ea                        # target features as scanned (lat/lon); updated after each snap
+    def __init__(self, ea, discrepancies, layer, fids, min_area, mode="ea_bgy", self_check=False):
+        self.ea = ea                        # target features as scanned (lat/lon; src_layer = the id of the
+                                            # layer each came from); updated after each snap
         self.discrepancies = discrepancies  # one row per discrepancy; Status updated after each snap
         self.layer = layer                  # in-memory Discrepancies layer, not in the project (None if none)
         self.fids = fids                    # its feature id for each discrepancy row
@@ -823,12 +826,12 @@ def switch_fix(scan, row):
 def snap_rows(scan, rows):
     """Snap the selected discrepancy rows. Returns {row: (status, message)} for the rows it handled.
 
-    Rows are grouped by the feature they change, so each feature is edited once. All changes go to the
-    target layer's edit buffer as one undo step; nothing is saved.
+    Rows are grouped by the feature they change, so each feature is edited once, in the layer it came
+    from. The changes go to each layer's edit buffer as one undo step per layer; nothing is saved.
     """
-    from qgis.core import QgsWkbTypes
+    from qgis.core import QgsProject, QgsWkbTypes
 
-    d, ea, ea_layer, unit = scan.discrepancies, scan.ea, scan.ea_layer, scan.unit
+    d, ea, unit = scan.discrepancies, scan.ea, scan.unit
     Unit = unit[0].upper() + unit[1:]
     outcome, todo = {}, {}
     for r in rows:
@@ -840,14 +843,18 @@ def snap_rows(scan, rows):
         else:
             todo.setdefault(int(d.at[r, "_ea_idx"]), []).append(r)
 
-    multi_layer = QgsWkbTypes.isMultiType(ea_layer.wkbType())
-    edits = []
+    edits = {}  # layer id -> the edits to make in that layer
     for idx, ea_rows in todo.items():
         code = ea.at[idx, "EA Geocode"]
 
         def fail(message):
             outcome.update({r: (STATUS_FAILED, f"{Unit} {code} not changed: {message}") for r in ea_rows})
 
+        layer_id = ea.at[idx, "src_layer"]
+        ea_layer = QgsProject.instance().mapLayer(layer_id)
+        if ea_layer is None:
+            fail("its layer was removed from the project. Scan again")
+            continue
         fid = int(ea.at[idx, "src_fid"])
         feature = ea_layer.getFeature(fid)
         if not feature.isValid():
@@ -874,7 +881,7 @@ def snap_rows(scan, rows):
             continue
 
         parts = shapely.get_num_geometries(new)
-        if parts > 1 and not multi_layer:
+        if parts > 1 and not QgsWkbTypes.isMultiType(ea_layer.wkbType()):
             fail(f"it would have {parts} parts, but '{ea_layer.name()}' is a single-part Polygon layer. "
                  f"To allow it: Export > Save Features As, tick 'Force to multi-type', and scan that layer")
             continue
@@ -883,17 +890,17 @@ def snap_rows(scan, rows):
         if geom is None:
             fail(why)
             continue
-        edits.append((idx, ea_rows, fid, geom, new, old_area, new_area))
+        edits.setdefault(layer_id, []).append((idx, ea_rows, fid, geom, new, old_area, new_area))
 
-    if edits:
+    what = "overlaps / gaps" if scan.self_check else f"{MODES[scan.mode]['ref_unit']} boundaries"
+    for layer_id, layer_edits in edits.items():
+        ea_layer = QgsProject.instance().mapLayer(layer_id)
         if not ea_layer.isEditable() and not ea_layer.startEditing():
-            for _, ea_rows, *_ in edits:
+            for _, ea_rows, *_ in layer_edits:
                 outcome.update({r: (STATUS_FAILED, f"'{ea_layer.name()}' cannot be edited") for r in ea_rows})
-            edits = []
-    if edits:
-        what = "overlaps / gaps" if scan.self_check else f"{MODES[scan.mode]['ref_unit']} boundaries"
-        ea_layer.beginEditCommand(f"Snap {len(edits)} {unit}(s) to {what}")
-        for idx, ea_rows, fid, geom, new, old_area, new_area in edits:
+            continue
+        ea_layer.beginEditCommand(f"Snap {len(layer_edits)} {unit}(s) to {what}")
+        for idx, ea_rows, fid, geom, new, old_area, new_area in layer_edits:
             code = ea.at[idx, "EA Geocode"]
             if ea_layer.changeGeometry(fid, geom):
                 ea.at[idx, "geometry"] = new
@@ -981,27 +988,50 @@ def _load_reference(layer, mode):
     return merge_duplicate_barangays(load_layer(layer, prepare_ea_ref, EA_FIELDS["ea_geocode"]), "EA")
 
 
-def run_check(bgy_layer, ea_layer, min_area, step=print, mode="ea_bgy"):
+def _load_targets(layers, mode, step):
+    """All target layers as one frame; src_layer is the id of the layer each feature came from."""
+    parts = []
+    for n, layer in enumerate(layers, 1):
+        step(f"Loading {MODES[mode]['unit']} layer {n} of {len(layers)}: {layer.name()}...")
+        parts.append(_load_target(layer, mode).assign(src_layer=layer.id()))
+    return gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry", crs=DATA_CRS)
+
+
+def _load_references(layers, mode, step):
+    """All reference layers as one frame, one feature per geocode (also across layers)."""
+    parts = []
+    for n, layer in enumerate(layers, 1):
+        step(f"Loading {MODES[mode]['ref_unit']} layer {n} of {len(layers)}: {layer.name()}...")
+        parts.append(_load_reference(layer, mode))
+    merged = gpd.GeoDataFrame(pd.concat(parts, ignore_index=True), geometry="geometry", crs=DATA_CRS)
+    return merge_duplicate_barangays(merged, "barangay" if MODES[mode]["ref"] == "bgy" else "EA")
+
+
+def run_check(bgy_layers, ea_layers, min_area, step=print, mode="ea_bgy"):
     """Finds the discrepancies and returns a Scan (its layer is kept in memory, not added to the project).
 
-    bgy_layer is the fixed reference, ea_layer the target that gets snapped. In BGY vs BGY and EA vs EA
-    the reference is optional: without it (None) the target is checked against itself for overlaps and
-    gaps. Nothing is changed: use snap_rows() on the discrepancies to fix.
+    bgy_layers are the fixed reference, ea_layers the targets that get snapped (a single layer is also
+    accepted for either). Each side's layers are scanned together, so discrepancies between two layers
+    are found too. In BGY vs BGY and EA vs EA the reference is optional: without it (empty / None) the
+    targets are checked against each other for overlaps and gaps. Nothing is changed: use snap_rows() on
+    the discrepancies to fix.
     """
+    as_list = lambda x: [] if x is None else list(x) if isinstance(x, (list, tuple)) else [x]
+    bgy_layers, ea_layers = as_list(bgy_layers), as_list(ea_layers)
     m = MODES[mode]
     unit = m["unit"]
     WARNINGS.clear()
-    self_check = bgy_layer is None
+    self_check = not bgy_layers
     if self_check and m["ref_required"]:
         raise ValueError(f"{m['label']} needs a {m['ref_unit']} layer")
-    step(f"Loading {unit} layer...")
-    ea = _load_target(ea_layer, mode)
+    if not ea_layers:
+        raise ValueError(f"No {unit} layer to check")
+    ea = _load_targets(ea_layers, mode, step)
     if self_check:
         step(f"Checking the {unit}s against each other (overlaps and gaps)...")
         discrepancies = find_self_discrepancies(ea, min_area, mode)
     else:
-        step(f"Loading {m['ref_unit']} layer...")
-        bgy = _load_reference(bgy_layer, mode)
+        bgy = _load_references(bgy_layers, mode, step)
         step(f"Comparing {unit}s to the {m['ref_unit']}s...")
         discrepancies, no_ea = find_discrepancies(ea, bgy, min_area, mode)
         warn_bgy_overlaps(bgy, min_area, f"{m['ref_unit']}s")
@@ -1016,7 +1046,7 @@ def run_check(bgy_layer, ea_layer, min_area, step=print, mode="ea_bgy"):
         step("Creating the output layer...")
         layer, fids = to_memory_layer(discrepancies, f"Discrepancies {datetime.now():%Y-%m-%d %H:%M:%S}",
                                       mode_issues(mode, self_check))
-    return Scan(ea_layer, ea, discrepancies, layer, fids, min_area, mode, self_check)
+    return Scan(ea, discrepancies, layer, fids, min_area, mode, self_check)
 
 
 # ================= RESULT TEXT =================
@@ -1055,17 +1085,23 @@ STATUS_COLOURS = {STATUS_DONE: "#2e7d32", STATUS_FAILED: "#c62828", STATUS_MANUA
 GRP_STYLE = ("QGroupBox { font-weight:600; margin-top:6px; } "
              "QGroupBox::title { subcontrol-origin:margin; left:8px; }")
 LEFT_WIDTH = 315
+# Map highlight on double-click / Zoom to Selected: dotted outline + circle on the discrepancy (by what a
+# snap does) and a dotted green outline of the Fix feature as it will be after Snap Selected.
+HIGHLIGHT_COLOURS = {"cut": "#ff6d00", "add": "#d50000", "none": "#616161", "after": "#00c853"}
+BLINKS = 12          # on/off steps of 300 ms, then the outlines stay drawn
+MAX_PREVIEWS = 50    # most "after snap" outlines drawn at once
+MIN_ZOOM_DEG = 0.0005  # ~55 m: zooming to a tiny piece (e.g. 1 sqm) still shows its surroundings
 
-NO_RESULTS = "No scan yet. Choose a check mode and the layers on the left, then click Scan."
+NO_RESULTS = "No scan yet. Choose a check mode and tick the layers on the left, then click Scan."
 
 # Per mode: titles of the two layer boxes, and what the mode does (shown under the radio buttons).
 MODE_TEXT = {
-    "ea_bgy": {"target": "EA Layer (snapped)", "ref": "Barangay Layer (fixed reference)",
+    "ea_bgy": {"target": "EA Layers (snapped)", "ref": "Barangay Layers (fixed reference)",
                "hint": "Each EA is compared to its barangay; the EA is snapped to the barangay boundary."},
-    "bgy_bgy": {"target": "Barangay Layer (checked and snapped)", "ref": "Reference Barangay Layer (optional)",
+    "bgy_bgy": {"target": "Barangay Layers (checked and snapped)", "ref": "Reference Barangay Layers (optional)",
                 "hint": "With a reference: each barangay is snapped to the reference barangay with the same "
                         "geocode. Without: the barangays are checked against each other for overlaps and gaps."},
-    "ea_ea": {"target": "EA Layer (checked and snapped)", "ref": "Reference EA Layer (optional)",
+    "ea_ea": {"target": "EA Layers (checked and snapped)", "ref": "Reference EA Layers (optional)",
               "hint": "With a reference: each EA is snapped to the reference EA with the same ea_geocode. "
                       "Without: the EAs are checked against each other for overlaps and gaps."},
 }
@@ -1078,6 +1114,11 @@ THEMES = {
         "log": ("background: #FFFFFF; color: #1F2937; font-family: Consolas, monospace; "
                 "font-size: 11px; border: 1px solid #BDC3C7;"),
         "table": "",
+        "list": """
+            QListWidget { border: 1px solid #b0bec5; outline: 0; }
+            QListWidget::item { padding: 3px 4px; }
+            QListWidget::indicator:checked { background-color: #1565c0; border: 1px solid #1565c0; }
+        """,
         "tabs": """
             QTabBar::tab {
                 font-weight: bold; font-size: 12px; min-width: 180px; padding: 10px 24px;
@@ -1104,6 +1145,12 @@ THEMES = {
             QHeaderView::section { background-color: #37474F; color: #ECEFF1;
                                    border: 1px solid #455A64; padding: 4px; }
             QTableCornerButton::section { background-color: #37474F; }
+        """,
+        "list": """
+            QListWidget { border: 1px solid #455A64; border-radius: 4px; outline: 0;
+                          background-color: #263238; alternate-background-color: #1E2327; color: #ECEFF1; }
+            QListWidget::item { padding: 3px 4px; }
+            QListWidget::item:hover { background-color: #37474F; }
         """,
         "tabs": """
             QTabBar::tab {
@@ -1145,14 +1192,19 @@ HELP_HTML = f"""
     <li>Load the layers into the project. To check only part of a layer, set a filter on it first
         (right-click the layer &gt; Filter).</li>
     <li>Under <b>Check Mode</b>, choose <b>EA vs BGY</b>, <b>BGY vs BGY</b> or <b>EA vs EA</b>.</li>
-    <li>Pick the layer to check (it is the one that gets snapped) and, if the mode uses one, the reference
-        layer (fixed, never changed). Layers are detected from their fields and names; pick them by hand if
-        the guess is wrong.</li>
+    <li>Tick the layers to check (they are the ones that get snapped) and, if the mode uses one, the reference
+        layers (fixed, never changed). For a whole province, load its cities / municipalities and press
+        <b>Select All</b> in each list. All ticked layers are scanned together.</li>
     <li>Click <b>Scan</b>. Progress and warnings appear in the Log.</li>
-    <li>Review the <b>Discrepancies</b> list: click a row to flash it on the map, double-click to zoom.</li>
+    <li>Review the <b>Discrepancies</b> list: click a row to flash it on the map, double-click to zoom. The zoom
+        blinks a <b>dotted outline with a circle</b> on the discrepancy (orange = cut off, red = added) and a
+        <b>dotted green outline</b> of the Fix feature as it will be after <b>Snap Selected</b>, so even a
+        1 sqm piece is easy to see and check before snapping. <b>Zoom to Selected</b> does the same for
+        several rows.</li>
     <li>Select the rows to fix (Ctrl/Shift+click for several, or <b>Select Not Snapped</b>) and click
         <b>Snap Selected</b>.</li>
-    <li>Check the result on the map, then keep it with <b>Save Layer Edits</b> in QGIS.</li>
+    <li>Check the result on the map, then keep it with <b>Save Layer Edits</b>, or for several layers
+        <b>Layer &gt; Current Edits &gt; Save for All Layers</b>.</li>
   </ol>
 
   <h3 style="color:#111827; margin:12px 0 4px 0;">Check modes</h3>
@@ -1171,6 +1223,18 @@ HELP_HTML = f"""
   ])}
   <p style="margin:6px 0 0 0;"><b>Ignore slivers below</b>: differences smaller than this area (sqm) are treated
      as slivers and not listed.</p>
+
+  <h3 style="color:#111827; margin:12px 0 4px 0;">Ticking layers</h3>
+  <ul style="margin-top:0;">
+    <li>Click a row to tick or untick it. <b>Select All</b> ticks every layer of the list's kind; <b>Clear</b>
+        unticks the list.</li>
+    <li>The ticked layers are scanned as one, so a self check also finds overlaps and gaps
+        <i>between</i> two cities / municipalities.</li>
+    <li>Grey rows: a layer without the needed geocode field cannot be ticked. One that looks like another kind
+        (or an MBI result layer) can be ticked by hand, but <b>Select All</b> leaves it out.</li>
+    <li>A layer ticked in one list is greyed out in the other. If only one layer fits a list, it is ticked
+        for you.</li>
+  </ul>
 
   <h3 style="color:#111827; margin:12px 0 4px 0;">Issues in the list</h3>
   {_help_table([
@@ -1192,7 +1256,8 @@ HELP_HTML = f"""
   <h3 style="color:#111827; margin:12px 0 4px 0;">Buttons</h3>
   {_help_table([
       ("Select Not Snapped", "Selects every listed row that can still be snapped."),
-      ("Zoom to Selected", "Zooms the map to the selected discrepancies."),
+      ("Zoom to Selected", "Zooms the map to the selected discrepancies and blinks their dotted outlines, plus "
+                           "the dotted green preview of each Fix feature after Snap Selected."),
       ("Switch Fix", "For overlaps and gaps (and shortfalls bordering several features): gives the selected row "
                      "to the next feature that could take it. Also lets you snap a row marked <i>Fix manually</i> "
                      "because no feature had most of its border."),
@@ -1210,10 +1275,11 @@ HELP_HTML = f"""
 
   <h3 style="color:#111827; margin:12px 0 4px 0;">Saving and undoing</h3>
   <ul style="margin-top:0;">
-    <li>Only the checked layer is edited, and it is left in <b>edit mode</b>; nothing is written to its file
-        until you save. The reference layer is never changed.</li>
-    <li><b>Keep:</b> Save Layer Edits.</li>
-    <li><b>Revert:</b> Toggle Editing &gt; Discard, or Edit &gt; Undo (one undo step per Snap Selected).</li>
+    <li>Each snap edits the feature's own layer. The changed layers are left in <b>edit mode</b>; nothing is
+        written to their files until you save. The reference layers are never changed.</li>
+    <li><b>Keep:</b> Save Layer Edits, or Layer &gt; Current Edits &gt; Save for All Layers.</li>
+    <li><b>Revert:</b> Toggle Editing &gt; Discard, or Edit &gt; Undo (one undo step per layer per Snap
+        Selected).</li>
     <li>Only the geometry changes; attributes such as household counts stay as they are.</li>
     <li>Before a feature is changed, the new shape is checked (valid, not empty, expected area, fits the layer)
         and the feature must not have been edited since the scan. Otherwise the row is marked Failed.</li>
@@ -1221,8 +1287,10 @@ HELP_HTML = f"""
 
   <h3 style="color:#111827; margin:12px 0 4px 0;">Troubleshooting</h3>
   <ul style="margin-top:0;">
-    <li><b>Scan is disabled:</b> pick the layer to check (and, for EA vs BGY, the barangay layer), and make the
-        two layers different. The hint under each layer says what is missing.</li>
+    <li><b>Scan is disabled:</b> tick at least one layer to check (and, for EA vs BGY, at least one barangay
+        layer). The hint under each list says what is missing.</li>
+    <li><b>Scan stops at one layer:</b> a ticked layer that is empty or has only blank geocodes stops the scan,
+        so a result never silently misses a city / municipality. The Log names it: untick it or fix it.</li>
     <li><b>"No usable geocodes":</b> the layer has no geocode field. Barangays need <code>geocode</code> (or
         <code>bgy_geocode</code>); EAs need <code>ea_geocode</code> (EA vs BGY also accepts
         <code>bgy_geocode</code>).</li>
@@ -1256,18 +1324,11 @@ class _LogStream:
 
 
 def make_dialog_class():
-    from qgis.core import QgsApplication, QgsCoordinateTransform, QgsFeatureRequest, QgsProject
-    from qgis.gui import QgsMapLayerComboBox
+    from qgis.core import (QgsApplication, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeatureRequest,
+                           QgsGeometry, QgsProject, QgsRectangle, QgsVectorLayer, QgsWkbTypes)
     from qgis.PyQt import QtWidgets
-    from qgis.PyQt.QtCore import Qt
+    from qgis.PyQt.QtCore import QEvent, QSize, Qt, QTimer, pyqtSignal
     from qgis.PyQt.QtGui import QBrush, QColor, QFont
-
-    try:
-        from qgis.core import Qgis
-        polygon_filter = Qgis.LayerFilter.PolygonLayer
-    except AttributeError:  # QGIS < 3.34
-        from qgis.core import QgsMapLayerProxyModel
-        polygon_filter = QgsMapLayerProxyModel.PolygonLayer
 
     FID_ROLE = Qt.UserRole          # on the Issue cell: feature id in the Discrepancies layer
     ROW_ROLE = Qt.UserRole + 1      # on the Issue cell: row in scan.discrepancies
@@ -1276,7 +1337,9 @@ def make_dialog_class():
     search_cols = [COL[c] for c in SEARCH_COLUMNS]
     snappable = {STATUS_PENDING, STATUS_FAILED}
     DARK_TEXT = QBrush(QColor("#212121"))
-    SCORE = {"ea": 0, "bgy": 1}     # index into layer_scores()
+    LAYER_ID_ROLE = Qt.UserRole     # on a layer row: the layer's id
+    LIKELY_ROLE = Qt.UserRole + 1   # on a layer row: True if Select All may tick it
+    USABLE_ROLE = Qt.UserRole + 2   # on a layer row: True if it has the geocode field the role needs
 
     def qcolour(rgba, alpha=70):
         return QColor(*[int(v) for v in rgba.split(",")[:3]], alpha)
@@ -1293,16 +1356,10 @@ def make_dialog_class():
         b.setFixedHeight(height)
         return b
 
-    def layer_combo():
-        combo = QgsMapLayerComboBox()
-        combo.setFilters(polygon_filter)
-        combo.setAllowEmptyLayer(True)
-        combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        combo.setMinimumContentsLength(12)
-        return combo
-
     # Fields only an EA layer has; a barangay layer has a geocode but none of these.
     ea_only = {"ea_geocode", "ean", "bgy_geo"}
+    # Fields of MBI / joined result layers: they have a geocode, but are not boundaries to check.
+    result_only = {"case_uuid", "bgy_part"}
     bgy_geocode = {c.lower() for c in BGY_FIELDS["geocode"]}
 
     def needed_fields(mode, role):
@@ -1333,16 +1390,131 @@ def make_dialog_class():
                + (1 if "barangay" in fields and not is_ea else 0))
         return ea, bgy
 
-    def best_layer(combo, score_index, exclude=None):
-        best, best_score = None, 0
-        for i in range(combo.count()):
-            layer = combo.layer(i)
-            if layer is None or layer == exclude:
-                continue
-            score = layer_scores(layer)[score_index]
-            if score > best_score:
-                best, best_score = layer, score
-        return best
+    def looks_like(layer, kind):
+        """True if the layer's fields and name say it is a boundary layer of this kind ('ea' / 'bgy')."""
+        if layer_fields(layer) & result_only:
+            return False
+        ea, bgy = layer_scores(layer)
+        return ea > bgy if kind == "ea" else bgy > ea
+
+    class CompactList(QtWidgets.QListWidget):
+        """A list that asks for little height, so the left column fits without scrolling; it still
+        stretches into any free room."""
+
+        def sizeHint(self):
+            return QSize(super().sizeHint().width(), 110)
+
+    class LayerCheckDelegate(QtWidgets.QStyledItemDelegate):
+        """Clicking anywhere on a layer row toggles its checkbox."""
+
+        def editorEvent(self, event, model, option, index):
+            if not (index.flags() & Qt.ItemIsUserCheckable) or not (index.flags() & Qt.ItemIsEnabled):
+                return False
+            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                current = index.data(Qt.CheckStateRole)
+                model.setData(index, Qt.Unchecked if current == Qt.Checked else Qt.Checked, Qt.CheckStateRole)
+                return True
+            return False
+
+    class LayerChecklist(QtWidgets.QWidget):
+        """The project's polygon layers, one checkbox each, with Select All / Clear buttons.
+
+        Layers without the geocode field the role needs are greyed out and cannot be ticked. Layers that
+        look like another kind (e.g. a barangay layer in an EA list, or an MBI layer) can be ticked by hand,
+        but Select All leaves them out. A layer ticked in the other list is greyed out: it cannot be in both.
+        """
+        changed = pyqtSignal()  # the user ticked or unticked something
+
+        def __init__(self, tooltip):
+            super().__init__()
+            lay = QtWidgets.QVBoxLayout(self)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(4)
+            row = QtWidgets.QHBoxLayout()
+            self.all_btn = button("Select All", 24)
+            self.all_btn.setToolTip("Tick every layer of this kind (e.g. all the cities / municipalities).")
+            self.all_btn.clicked.connect(lambda: self._tick_all(True))
+            self.none_btn = button("Clear", 24)
+            self.none_btn.setToolTip("Untick every layer in this list.")
+            self.none_btn.clicked.connect(lambda: self._tick_all(False))
+            row.addWidget(self.all_btn)
+            row.addWidget(self.none_btn)
+            lay.addLayout(row)
+            self.list = CompactList()
+            self.list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+            self.list.setAlternatingRowColors(True)
+            self.list.setToolTip(tooltip)
+            self.list.setItemDelegate(LayerCheckDelegate(self.list))
+            self.list.setMinimumHeight(110)
+            self.list.itemChanged.connect(lambda _item: self.changed.emit())
+            lay.addWidget(self.list, 1)
+
+        def items(self):
+            return [self.list.item(i) for i in range(self.list.count())]
+
+        def checked_ids(self):
+            return {i.data(LAYER_ID_ROLE) for i in self.items() if i.checkState() == Qt.Checked}
+
+        def layers(self):
+            """The ticked layers, in list order."""
+            prj = QgsProject.instance()
+            found = (prj.mapLayer(i.data(LAYER_ID_ROLE)) for i in self.items() if i.checkState() == Qt.Checked)
+            return [lyr for lyr in found if lyr is not None]
+
+        def likely_ids(self):
+            return [i.data(LAYER_ID_ROLE) for i in self.items() if i.data(LIKELY_ROLE)]
+
+        def fill(self, mode, role):
+            """List the project's polygon layers for this role of the mode, keeping the ticks still valid."""
+            checked = self.checked_ids()
+            needed = needed_fields(mode, role)
+            kind = MODES[mode][role]
+            layers = [lyr for lyr in QgsProject.instance().mapLayers().values()
+                      if isinstance(lyr, QgsVectorLayer) and lyr.geometryType() == QgsWkbTypes.PolygonGeometry]
+            rows = [(lyr, bool(layer_fields(lyr) & {f.lower() for f in needed})) for lyr in layers]
+            rows = [(lyr, usable, usable and looks_like(lyr, kind)) for lyr, usable in rows]
+            rows.sort(key=lambda r: (not r[2], not r[1], r[0].name().lower()))  # likely layers first
+            self.list.blockSignals(True)
+            self.list.clear()
+            for lyr, usable, likely in rows:
+                item = QtWidgets.QListWidgetItem(lyr.name())
+                item.setData(LAYER_ID_ROLE, lyr.id())
+                item.setData(LIKELY_ROLE, likely)
+                item.setData(USABLE_ROLE, usable)
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable if usable else Qt.NoItemFlags)
+                item.setCheckState(Qt.Checked if usable and lyr.id() in checked else Qt.Unchecked)
+                if not usable:
+                    item.setToolTip(f"No geocode field. Expected one of: {', '.join(needed)}.")
+                elif not likely:
+                    item.setToolTip(f"Does not look like {'a barangay' if kind == 'bgy' else 'an EA'} boundary "
+                                    "layer: Select All leaves it out, but you can tick it by hand.")
+                if not likely:
+                    item.setForeground(QBrush(QColor("#9e9e9e")))
+                self.list.addItem(item)
+            self.list.blockSignals(False)
+
+        def set_ticks(self, ids):
+            """Tick exactly these layers (those that can be ticked)."""
+            self.list.blockSignals(True)
+            for item in self.items():
+                can_tick = bool(item.flags() & Qt.ItemIsEnabled)
+                item.setCheckState(Qt.Checked if can_tick and item.data(LAYER_ID_ROLE) in ids else Qt.Unchecked)
+            self.list.blockSignals(False)
+
+        def block_layers(self, ids):
+            """Grey out the rows of these layers (ticked in the other list); release the others."""
+            self.list.blockSignals(True)
+            for item in self.items():
+                if item.data(USABLE_ROLE):
+                    blocked = item.data(LAYER_ID_ROLE) in ids
+                    if blocked:
+                        item.setCheckState(Qt.Unchecked)
+                    item.setFlags(Qt.NoItemFlags if blocked else Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            self.list.blockSignals(False)
+
+        def _tick_all(self, on):
+            self.set_ticks(self.likely_ids() if on else [])
+            self.changed.emit()
 
     class CheckDialog(QtWidgets.QDialog):
         def __init__(self, iface, parent=None):
@@ -1362,12 +1534,13 @@ def make_dialog_class():
 
             self.iface = iface
             self.scan_result = None
+            self.bands = []     # map highlight rubber bands
+            self._blink = None  # their blink timer
             self.running = False
             self._inputs_ok = False
             self.is_dark = self.palette().color(self.palette().Window).lightness() < 128
-            # A combo the user has picked by hand is left alone by autodetection.
+            # A list the user has ticked by hand is left alone by autodetection.
             self.manual = {"ref": False, "target": False}
-            self._auto_setting = False
 
             root = QtWidgets.QVBoxLayout(self)
             root.setContentsMargins(12, 12, 12, 12)
@@ -1396,18 +1569,16 @@ def make_dialog_class():
             root.addLayout(close_row)
 
             self.apply_mode(reset=False)
+            self.refresh_lists()
             # Set when run from the GMD CO Processing panel. That combo often just holds the first
-            # layer, so it is used only if it looks at least as much like an EA layer as the best match.
+            # layer, so it is used only if it looks like an EA layer.
             panel_layer = globals().get("ea_layer")
-            if panel_layer is not None and self.target.findText(panel_layer.name()) >= 0:
-                detected = best_layer(self.target, 0)
-                best_score = layer_scores(detected)[0] if detected is not None else 0
-                if layer_scores(panel_layer)[0] >= max(best_score, 1):
-                    self.target.setLayer(panel_layer)
-                    self.manual["target"] = True
+            if panel_layer is not None and panel_layer.id() in self.target.likely_ids():
+                self.target.set_ticks([panel_layer.id()])
+                self.manual["target"] = True
             self.autodetect_layers()
-            self.ref.layerChanged.connect(lambda _l: self.on_layer_picked("ref"))
-            self.target.layerChanged.connect(lambda _l: self.on_layer_picked("target"))
+            self.ref.changed.connect(lambda: self.on_layer_picked("ref"))
+            self.target.changed.connect(lambda: self.on_layer_picked("target"))
             QgsProject.instance().layersAdded.connect(self.on_layers_added)
             QgsProject.instance().layersRemoved.connect(self.on_layers_added)
             self.apply_theme()
@@ -1446,20 +1617,20 @@ def make_dialog_class():
             ll.addWidget(box)
 
             self.target_box, lay = group()
-            self.target = layer_combo()
-            self.target.setToolTip("The layer that is checked. Only this layer is edited by Snap Selected.")
-            lay.addWidget(self.target)
+            self.target = LayerChecklist("Click a layer to tick / untick it. The ticked layers are scanned\n"
+                                         "together, and only they are edited by Snap Selected.")
+            lay.addWidget(self.target, 1)
             self.target_hint = self._hint()
             lay.addWidget(self.target_hint)
-            ll.addWidget(self.target_box)
+            ll.addWidget(self.target_box, 1)
 
             self.ref_box, lay = group()
-            self.ref = layer_combo()
-            self.ref.setToolTip("The fixed reference boundary. It is never changed.")
-            lay.addWidget(self.ref)
+            self.ref = LayerChecklist("Click a layer to tick / untick it. The ticked layers are the fixed\n"
+                                      "reference boundary. They are never changed.")
+            lay.addWidget(self.ref, 1)
             self.ref_hint = self._hint()
             lay.addWidget(self.ref_hint)
-            ll.addWidget(self.ref_box)
+            ll.addWidget(self.ref_box, 1)
 
             box, lay = group("Settings")
             srow = QtWidgets.QHBoxLayout()
@@ -1495,7 +1666,13 @@ def make_dialog_class():
             self.progress.setValue(0)
             self.progress.setFixedHeight(18)
             ll.addWidget(self.progress)
-            ll.addStretch(1)
+            left.setMinimumHeight(560)
+            left_scroll = QtWidgets.QScrollArea()  # the two layer lists need room on small screens
+            left_scroll.setWidget(left)
+            left_scroll.setWidgetResizable(True)
+            left_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            left_scroll.setFixedWidth(LEFT_WIDTH + 18)
 
             # ── RIGHT: discrepancy list, snap panel, log ──
             right = QtWidgets.QWidget()
@@ -1577,7 +1754,7 @@ def make_dialog_class():
             self.log_view.setFixedHeight(150)
             rl.addWidget(self.log_view)
 
-            root.addWidget(left)
+            root.addWidget(left_scroll)
             root.addWidget(right, 1)
             return tab
 
@@ -1613,8 +1790,8 @@ def make_dialog_class():
             return "ea_bgy"
 
         def self_check(self):
-            """True when the chosen mode runs on the checked layer alone (no reference picked)."""
-            return not MODES[self.mode()]["ref_required"] and self.ref.currentLayer() is None
+            """True when the chosen mode runs on the checked layers alone (no reference ticked)."""
+            return not MODES[self.mode()]["ref_required"] and not self.ref.checked_ids()
 
         def current_issues(self):
             if self.scan_result is not None:
@@ -1642,6 +1819,7 @@ def make_dialog_class():
                 self.scan_result = None
                 self.table.setRowCount(0)
                 self.manual = {"ref": False, "target": False}
+                self.refresh_lists()
                 self.autodetect_layers()
                 self.validate_inputs()
                 self.update_summary()
@@ -1676,6 +1854,8 @@ def make_dialog_class():
             self.summary.setStyleSheet(f"font-size:13px; font-weight:600; color:{t['summary']};")
             self.log_view.setStyleSheet(t["log"])
             self.table.setStyleSheet(t["table"])
+            self.target.list.setStyleSheet(t["list"])
+            self.ref.list.setStyleSheet(t["list"])
             self.legend.setStyleSheet(f"font-size:11px; color:{t['hint']}; padding:2px 0;")
             html = HELP_HTML
             if self.is_dark:
@@ -1695,6 +1875,7 @@ def make_dialog_class():
 
         # ──────────────── teardown ────────────────
         def _teardown(self):
+            self.clear_highlight()
             prj = QgsProject.instance()
             for sig in (prj.layersAdded, prj.layersRemoved):
                 try:
@@ -1711,76 +1892,75 @@ def make_dialog_class():
             super().closeEvent(event)
 
         # ──────────────── layers ────────────────
+        def refresh_lists(self):
+            """Rebuild both layer lists for the current mode and project, keeping valid ticks."""
+            mode = self.mode()
+            self.target.fill(mode, "target")
+            self.ref.fill(mode, "ref")
+            self.sync_lists()
+
+        def sync_lists(self):
+            """A layer ticked in one list cannot be ticked in the other."""
+            self.ref.block_layers(self.target.checked_ids())
+            self.target.block_layers(self.ref.checked_ids())
+
         def autodetect_layers(self):
-            """Pick the layers from their fields (then their names), never the same layer for both.
-            Combos the user set by hand are kept. An optional reference is left empty (self check)."""
+            """A list the user has not touched gets a tick only when exactly one layer fits it, so a single
+            pair of layers is ready to scan. With several candidates the user ticks them (or Select All).
+            An optional reference is left empty (self check)."""
             m = MODES[self.mode()]
-            self._auto_setting = True
-            try:
-                if not self.manual["target"]:
-                    exclude = self.ref.currentLayer() if self.manual["ref"] else None
-                    self.target.setLayer(best_layer(self.target, SCORE[m["target"]], exclude))
-                if not self.manual["ref"]:
-                    self.ref.setLayer(best_layer(self.ref, SCORE[m["ref"]], self.target.currentLayer())
-                                      if m["ref_required"] else None)
-            finally:
-                self._auto_setting = False
+            if not self.manual["target"]:
+                others = self.ref.checked_ids() if self.manual["ref"] else set()
+                likely = [i for i in self.target.likely_ids() if i not in others]
+                self.target.set_ticks(likely if len(likely) == 1 else [])
+            if not self.manual["ref"]:
+                likely = [i for i in self.ref.likely_ids() if i not in self.target.checked_ids()]
+                self.ref.set_ticks(likely if m["ref_required"] and len(likely) == 1 else [])
+            self.sync_lists()
 
         def on_layer_picked(self, which):
-            if self._auto_setting:
-                return
-            combo = self.target if which == "target" else self.ref
-            self.manual[which] = combo.currentLayer() is not None
-            self.autodetect_layers()  # re-pick the other combo if it was autodetected
+            box = self.target if which == "target" else self.ref
+            self.manual[which] = bool(box.checked_ids())
+            self.sync_lists()
+            self.autodetect_layers()  # re-pick the other list if it was autodetected
             self.validate_inputs()
             if self.scan_result is None:
                 self.refresh_issue_widgets()  # self check <-> reference changes the issue names
 
         def on_layers_added(self, *_args):
             if not self.running:
+                self.refresh_lists()
                 self.autodetect_layers()
                 self.validate_inputs()
 
         def validate_inputs(self):
-            """Hints under the layer pickers; Scan is enabled only when the layers are usable."""
-            mode = self.mode()
-            m = MODES[mode]
-            target, ref = self.target.currentLayer(), self.ref.currentLayer()
-            ok = True
+            """Hints under the layer lists; Scan is enabled only when the needed layers are ticked."""
+            m = MODES[self.mode()]
+            targets, refs = self.target.layers(), self.ref.layers()
 
-            def check(layer, role, hint):
-                fields = needed_fields(mode, role)
-                if not layer_fields(layer) & {f.lower() for f in fields}:
-                    self.set_hint(hint, f"No geocode field. Expected one of: {', '.join(fields)}.", "error")
-                    return False
-                self.set_hint(hint, f"{layer.featureCount():,} feature(s).", "ok")
-                return True
+            def ticked(layers, box):
+                count = sum(max(lyr.featureCount(), 0) for lyr in layers)
+                return f"{len(layers)} of {box.list.count()} layer(s) ticked, {count:,} feature(s)."
 
-            if target is None:
-                self.set_hint(self.target_hint, f"Pick the {m['unit']} layer to check.")
-                ok = False
+            if targets:
+                self.set_hint(self.target_hint, ticked(targets, self.target), "ok")
             else:
-                ok = check(target, "target", self.target_hint) and ok
-
-            if ref is None:
-                if m["ref_required"]:
-                    self.set_hint(self.ref_hint, f"Pick the {m['ref_unit']} layer.")
-                    ok = False
-                else:
-                    self.set_hint(self.ref_hint, f"None: the {m['unit']}s are checked against each other "
-                                                 "(overlaps and gaps). Pick a layer to compare with it instead.")
+                self.set_hint(self.target_hint, f"Tick the {m['unit']} layer(s) to check.")
+            if refs:
+                self.set_hint(self.ref_hint, ticked(refs, self.ref), "ok")
+            elif m["ref_required"]:
+                self.set_hint(self.ref_hint, f"Tick the {m['ref_unit']} layer(s).")
             else:
-                ok = check(ref, "ref", self.ref_hint) and ok
+                self.set_hint(self.ref_hint, f"None: the {m['unit']}s are checked against each other "
+                                             "(overlaps and gaps). Tick layers to compare with them instead.")
 
-            if ref is not None and ref == target:
-                self.set_hint(self.run_hint, "The checked layer and the reference layer must be different.", "error")
-                ok = False
-            elif ok:
-                what = (f"overlaps and gaps between the {m['unit']}s" if ref is None
-                        else f"{m['unit']}s vs '{ref.name()}'")
+            ok = bool(targets) and (bool(refs) or not m["ref_required"])
+            if ok:
+                what = (f"overlaps and gaps between the {m['unit']}s of {len(targets)} layer(s)" if not refs
+                        else f"{len(targets)} layer(s) vs {len(refs)} reference layer(s)")
                 self.set_hint(self.run_hint, f"Ready: {m['label']}, {what}. Click Scan.", "ok")
             else:
-                self.set_hint(self.run_hint, "Choose the layers to enable Scan.")
+                self.set_hint(self.run_hint, "Tick the layers to enable Scan.")
             self._inputs_ok = ok
             self.update_buttons()
 
@@ -1794,6 +1974,7 @@ def make_dialog_class():
         def clear_all(self):
             if self.running:
                 return
+            self.clear_highlight()
             self.scan_result = None
             self.table.setRowCount(0)
             self.log_view.clear()
@@ -1859,20 +2040,25 @@ def make_dialog_class():
                 return
             mode = self.mode()
             m = MODES[mode]
-            target, ref = self.target.currentLayer(), self.ref.currentLayer()
+            targets, refs = self.target.layers(), self.ref.layers()
 
-            self.remove_old_layers(keep=[lyr for lyr in (target, ref) if lyr is not None])
+            self.remove_old_layers(keep=targets + refs)
+            self.clear_highlight()
             self.scan_result = None
             self.table.setRowCount(0)
             self.summary.setText("Scanning…")
             self.log("=" * 50)
-            against = f"reference '{ref.name()}'" if ref is not None else "itself (overlaps and gaps)"
-            self.log(f"Scan {m['label']}: '{target.name()}' vs {against}, slivers < {self.min_area.value():g} sqm")
+            against = f"{len(refs)} reference layer(s)" if refs else "each other (overlaps and gaps)"
+            self.log(f"Scan {m['label']}: {len(targets)} layer(s) vs {against}, "
+                     f"slivers < {self.min_area.value():g} sqm")
+            self.log("  Checked: " + ", ".join(lyr.name() for lyr in targets))
+            if refs:
+                self.log("  Reference: " + ", ".join(lyr.name() for lyr in refs))
             self.set_busy(True)
             stream = _LogStream(self.log)
             try:
                 with redirect_stdout(stream), redirect_stderr(stream):
-                    scan = run_check(ref, target, self.min_area.value(), mode=mode)
+                    scan = run_check(refs, targets, self.min_area.value(), mode=mode)
                 stream.flush()
             except Exception as e:  # noqa: BLE001 - report every failure in the log
                 stream.flush()
@@ -2003,13 +2189,95 @@ def make_dialog_class():
                     extent.combineExtentWith(box)
             if extent is None:
                 return
+            if max(extent.width(), extent.height()) < MIN_ZOOM_DEG:  # e.g. a 1 sqm piece: keep some context
+                c, h = extent.center(), MIN_ZOOM_DEG / 2
+                extent = QgsRectangle(c.x() - h, c.y() - h, c.x() + h, c.y() + h)
             canvas = self.iface.mapCanvas()
             to_canvas = QgsCoordinateTransform(layer.crs(), canvas.mapSettings().destinationCrs(), QgsProject.instance())
             extent = to_canvas.transformBoundingBox(extent)
             extent.scale(1.5)  # a little context around the discrepancy
             canvas.setExtent(extent)
             canvas.refresh()
-            canvas.flashFeatureIds(layer, fids)
+            canvas.flashFeatureIds(layer, fids, QColor(255, 0, 0, 255), QColor(255, 0, 0, 0), 6, 400)
+            self.highlight_rows(rows)
+
+        # ------------------------------------------------- map highlight
+        def clear_highlight(self):
+            """Remove the dotted outlines / markers and stop their blinking."""
+            if self._blink is not None:
+                self._blink.stop()
+                self._blink = None
+            for b in self.bands:
+                try:
+                    b.scene().removeItem(b) if b.scene() is not None else None
+                except RuntimeError:  # canvas already gone
+                    pass
+            self.bands = []
+
+        def highlight_rows(self, rows):
+            """Blink a dotted outline and a circle marker on each discrepancy, and a dotted green outline
+            of how its Fix feature will look after Snap Selected. They stay drawn after blinking until the
+            next zoom, scan, snap or Clear."""
+            self.clear_highlight()
+            if self.iface is None or self.scan_result is None or not rows:
+                return
+            from qgis.gui import QgsRubberBand
+
+            canvas = self.iface.mapCanvas()
+            to_canvas = QgsCoordinateTransform(QgsCoordinateReferenceSystem(DATA_CRS),
+                                               canvas.mapSettings().destinationCrs(), QgsProject.instance())
+
+            def band(geom, colour, style, width, kind=QgsWkbTypes.PolygonGeometry, alpha=70):
+                g = QgsGeometry()
+                g.fromWkb(shapely.to_wkb(shapely.force_2d(geom)))
+                g.transform(to_canvas)
+                b = QgsRubberBand(canvas, kind)
+                b.setToGeometry(g, None)
+                fill = QColor(colour)
+                fill.setAlpha(alpha)
+                b.setStrokeColor(QColor(colour))
+                b.setFillColor(fill)
+                b.setWidth(width)
+                b.setLineStyle(style)
+                if kind == QgsWkbTypes.PointGeometry:
+                    b.setIcon(QgsRubberBand.ICON_CIRCLE)
+                    b.setIconSize(22)
+                self.bands.append(b)
+
+            d, ea = self.scan_result.discrepancies, self.scan_result.ea
+            df_rows = [self.df_row(r) for r in rows]
+            todo = {}
+            for r in df_rows:
+                colour = HIGHLIGHT_COLOURS.get(d.at[r, "_kind"], HIGHLIGHT_COLOURS["none"])
+                band(d.geometry[r], colour, Qt.DashLine, 3)
+                band(d.geometry[r].representative_point(), colour, Qt.SolidLine, 3, QgsWkbTypes.PointGeometry, 0)
+                if d.at[r, "Status"] != STATUS_DONE and bool(d.at[r, "_snappable"]):
+                    todo.setdefault(int(d.at[r, "_ea_idx"]), []).append(r)
+            previews = 0
+            for idx, rs in list(todo.items())[:MAX_PREVIEWS]:
+                new, _why = snapped_geometry(ea.geometry[idx],
+                                             [d.geometry[r] for r in rs if d.at[r, "_kind"] == "cut"],
+                                             [d.geometry[r] for r in rs if d.at[r, "_kind"] == "add"],
+                                             self.scan_result.min_area)
+                if new is not None:
+                    band(new, HIGHLIGHT_COLOURS["after"], Qt.DotLine, 3, alpha=35)
+                    previews += 1
+
+            state = {"ticks": 0}
+
+            def blink():
+                state["ticks"] += 1
+                show = state["ticks"] % 2 == 0 or state["ticks"] >= BLINKS
+                for b in self.bands:
+                    b.setVisible(show)
+                if state["ticks"] >= BLINKS and self._blink is not None:
+                    self._blink.stop()
+
+            self._blink = QTimer(self)
+            self._blink.timeout.connect(blink)
+            self._blink.start(300)
+            what = f"; dotted green = {previews} feature(s) after Snap Selected" if previews else ""
+            self.log(f"Map: dotted outline + circle = the discrepancy (orange cut, red add){what}.")
 
         # ----------------------------------------------------- switch fix
         def switch_selected(self):
@@ -2041,9 +2309,7 @@ def make_dialog_class():
                 return
             table_rows = self.selected_rows()
             by_df_row = {self.df_row(r): r for r in table_rows}
-            if QgsProject.instance().mapLayer(self.scan_result.ea_layer.id()) is None:
-                self.log("The checked layer was removed from the project. Scan again.")
-                return
+            self.clear_highlight()  # the "after snap" preview no longer applies
 
             self.log("-" * 50)
             self.log(f"Snapping {len(by_df_row):,} selected discrepanc{'y' if len(by_df_row) == 1 else 'ies'}...")
@@ -2067,8 +2333,12 @@ def make_dialog_class():
             failed = sum(1 for s, _ in outcome.values() if s != STATUS_DONE)
             self.log(f"Snapped {done:,}, not snapped {failed:,} (hover a Status cell to see why).")
             if done:
-                self.log(f"The changes are UNSAVED edits in '{self.scan_result.ea_layer.name()}'. "
-                         f"Keep: Save Layer Edits. Undo: Edit > Undo.")
+                d, ea = self.scan_result.discrepancies, self.scan_result.ea
+                ids = {ea.at[int(d.at[r, "_ea_idx"]), "src_layer"] for r, (s, _) in outcome.items()
+                       if s == STATUS_DONE}
+                names = sorted(lyr.name() for lyr in map(QgsProject.instance().mapLayer, ids) if lyr is not None)
+                self.log(f"The changes are UNSAVED edits in {len(names)} layer(s): {', '.join(names)}. "
+                         "Keep: Layer > Current Edits > Save for All Layers. Undo: Edit > Undo (per layer).")
             self.apply_filter()
 
     return CheckDialog
