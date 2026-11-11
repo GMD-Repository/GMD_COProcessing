@@ -165,6 +165,7 @@ Unticking **Choose EAs inside the covering barangay** (or loading an EA MBI Chec
 | *No EA found in the selected EA layers* | Tick the EA layer of that barangay, then Load again. Check its geocodes share the barangay's first 8 digits. |
 | Fewer cases than MBIs | MBIs still pending in the Barangay Selector are skipped. A shared overlap gives one case per barangay, so there can also be more. |
 | Barangay column shows only a geocode | No name found for it in the MBI layer or the EA layers — tick an EA layer with a `barangay` / `bgy_name` field. |
+| Can tick only one EA of an overlap | The log after **Load MBI Cases** lists each such case under *overlap case(s) where only ONE EA can be ticked*, with the reason — usually no EA of the barangay holds more than 0.5 m² of the MBI (the EAs only touch it or lie within the search distance). Check that the EA layer lines up with the MBI on the map. Gaps always take one EA. |
 | Stays *Partly covered* | Select the case row to see the orange leftover, then tick the EA that contains it. |
 | Load MBI Cases greyed out | Pick a layer with `case_uuid` and tick at least one EA layer. |
 | Made a mistake | Before Apply: **Reset Choices** or untick. After Apply: **Edit › Undo** or **Discard Edits**. |

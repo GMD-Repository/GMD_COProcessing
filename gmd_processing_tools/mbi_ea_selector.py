@@ -337,6 +337,7 @@ class MBICase:
         self.geom = None         # MBI geometry (MBI layer CRS)
         self.area = 0.0          # m²
         self.split = False       # overlap shared out: each covering EA keeps only its part
+        self.no_split_reason = ""   # why several EAs cannot be ticked (logged on Load)
         self.bldg_geoms = None   # building points inside the MBI (MBI CRS), when counted
         self.covered = 0.0       # share of the MBI kept by the covering EA(s)
         self.unassigned = None   # part of the MBI no covering EA keeps yet
@@ -956,6 +957,11 @@ HELP_HTML = """
 
   <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">If Something Looks Wrong</h3>
   <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
+    <tr><td width="110" style="font-weight:bold; vertical-align:top;">Can tick only one EA of an overlap</td>
+        <td>After <i>Load MBI Cases</i>, the log lists every such case under <i>overlap case(s) where only ONE EA
+        can be ticked</i>, with the reason. Usually no EA of the barangay holds more than 0.5 m² of the MBI — the
+        EAs only touch it or lie within the search distance — so one EA takes the whole MBI. Check that the EA
+        layer lines up with the MBI on the map. Gaps always take one EA.</td></tr>
     <tr><td width="110" style="font-weight:bold; vertical-align:top;">Load MBI Cases is greyed out</td>
         <td>Pick the <i>ppp_mbi</i> layer of the MBI Barangay Selector (it needs <i>case_uuid</i>) and tick at least
         one EA layer with an <i>ea_geocode</i> field.</td></tr>
@@ -2340,16 +2346,19 @@ def make_dialog_class():
                 engine = QgsGeometry.createGeometryEngine(case.geom.constGet())
                 engine.prepareGeometry()
                 scored = []   # [code, name, part, part_area, dist_m, geom]
+                best_raw = 0.0   # largest area of the MBI inside one EA (even below SLIVER_M2)
                 for code, name, g in infos:
                     touches = engine.intersects(g.constGet())
                     part, part_area = None, 0.0
                     if touches and not is_gap:
                         part = _polygonal(case.geom.intersection(g))
                         part_area = _area(part, self.da)
+                        best_raw = max(best_raw, part_area)
                         if part_area <= SLIVER_M2:
                             part, part_area = None, 0.0
                     scored.append([code, name, part, part_area, 0.0 if touches else None, g])
                 chosen = sorted((s for s in scored if s[2] is not None), key=lambda s: -s[3])
+                path = "inside"
                 if chosen:
                     n["inside"] += 1
                 else:
@@ -2361,9 +2370,11 @@ def make_dialog_class():
                     chosen = sorted((s for s in scored if s[4] <= max_m), key=lambda s: s[4])
                     if chosen:
                         n["near"] += 1
+                        path = "near"
                     else:
                         chosen = sorted(scored, key=lambda s: s[4])[:NEAREST_FALLBACK]
                         n["nearest"] += 1
+                        path = "nearest"
                 for code, name, part, part_area, dist, _g in chosen:
                     cand = case.candidates[code] = EACandidate(code)
                     cand.name, cand.geocode = name, case.bgy_code
@@ -2372,6 +2383,27 @@ def make_dialog_class():
                 case.split = (not is_gap and len(case.candidates) > 1
                               and all(c.part is not None for c in case.candidates.values())
                               and sum(c.part_area for c in case.candidates.values()) > SLIVER_M2)
+                case.no_split_reason = ""
+                if not case.split and len(case.candidates) > 1:
+                    k = len(case.candidates)
+                    if is_gap:
+                        case.no_split_reason = "a gap is absorbed whole by one EA"
+                    elif path == "near":
+                        case.no_split_reason = (
+                            f"no EA of {case.bgy_label} holds more than {SLIVER_M2:g} m² of the MBI "
+                            f"(largest: {best_raw:,.2f} m²) — the {k} EA(s) offered only touch it or lie "
+                            f"within {max_m:g} m, so one EA takes the whole MBI. Check that the EA layer "
+                            "lines up with the MBI on the map.")
+                    elif path == "nearest":
+                        case.no_split_reason = (
+                            f"no EA of {case.bgy_label} holds or touches the MBI (none within "
+                            f"{max_m:g} m) — only the {k} nearest EA(s) are offered, so one EA takes "
+                            "the whole MBI.")
+                    else:
+                        case.no_split_reason = (
+                            f"the EAs' parts of the MBI add up to {SLIVER_M2:g} m² or less, "
+                            "so one EA takes the whole MBI.")
+            self.log_no_split(cases)
             self.log(f"  EA candidates: {n['inside']:,} case(s) with EAs holding the MBI, "
                      f"{n['near']:,} with EAs within {max_m:g} m"
                      + (f", {n['nearest']:,} with only the {NEAREST_FALLBACK} nearest EAs (none within "
@@ -2382,6 +2414,24 @@ def make_dialog_class():
                 self.log(f"  {split:,} case(s) can be shared out between EAs of the barangay "
                          "(each covering EA keeps only its part)")
             return lookup
+
+        def log_no_split(self, cases, limit=20):
+            """Log why several EAs cannot be ticked, for every case with 2+ EAs where only one
+            can cover the MBI. Gaps are summarised in one line (one EA always absorbs a gap)."""
+            gaps = [c for c in cases.values() if c.no_split_reason and c.mbi_type.lower() == "gap"]
+            others = [c for c in cases.values() if c.no_split_reason and c.mbi_type.lower() != "gap"]
+            if gaps:
+                self.log(f"  {len(gaps):,} gap case(s) with several EAs: tick ONE EA — it absorbs the "
+                         "whole gap.")
+            if not others:
+                return
+            self.log(f"  {len(others):,} overlap case(s) where only ONE EA can be ticked:")
+            for case in others[:limit]:
+                where = f" ({case.bgy_label})" if case.bgy_code else ""
+                self.log(f"    • {case.mbi_type or 'MBI'} {case.case_uuid[:8]}{where}: "
+                         f"{case.no_split_reason}")
+            if len(others) > limit:
+                self.log(f"    … and {len(others) - limit:,} more")
 
         def compute_parts(self, cases, mbi_layer, lookup):
             """Clip each case's MBI to every involved EA (MBI ∩ EA). An overlap whose
@@ -2427,15 +2477,28 @@ def make_dialog_class():
                 case.split = (is_overlap and case.geom is not None and len(cands) > 1
                               and all(c.part is not None for c in cands)
                               and sum(c.part_area for c in cands) > SLIVER_M2)
+                case.no_split_reason = ""
                 if case.split:
                     split += 1
-                elif is_overlap and len(cands) > 1:
-                    unsplit += 1
+                elif len(cands) > 1:
+                    if not is_overlap:
+                        case.no_split_reason = "a gap is absorbed whole by one EA"
+                    else:
+                        unsplit += 1
+                        missing = [c.code for c in cands if c.part is None]
+                        if case.geom is None:
+                            case.no_split_reason = "the MBI has no geometry, so one EA takes it whole."
+                        elif missing:
+                            case.no_split_reason = (
+                                f"EA(s) {', '.join(missing)} hold no part of the MBI (not in the selected "
+                                f"EA layers, or {SLIVER_M2:g} m² or less inside them), so one EA takes "
+                                "the whole MBI.")
+                        else:
+                            case.no_split_reason = (f"the EAs' parts add up to {SLIVER_M2:g} m² or less, "
+                                                    "so one EA takes the whole MBI.")
             self.log(f"  {split:,} overlap case(s) can be shared out between their EAs "
                      "(each covering EA keeps only its part)")
-            if unsplit:
-                self.log(f"  {unsplit:,} overlap case(s) have an involved EA missing from the "
-                         "selected layers — one EA covers the whole MBI there")
+            self.log_no_split(cases)
 
         def count_buildings(self, cases, mbi_layer, bldg_layer, gc_field=None):
             """Case: building points inside the MBI area. EA: those of them whose geocode
