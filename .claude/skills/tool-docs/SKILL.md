@@ -17,6 +17,20 @@ Each tool script in `gmd_processing_tools/` has one GitHub page in `docs/tools/<
   (document them inside the page of the tool that uses them, e.g. `earf_post_processing.md`).
 - After adding a page, add a row to the table in `docs/README.md` (Tool · Script · What it does).
 
+## Agent workflow
+
+Run the steps below through three subagents, in order. Give each one the script path and this skill's path.
+
+1. **`docs-researcher`** (read-only) does step 1. It returns a fact sheet: labels, fields, constants
+   with their values, outputs, stages, and any mismatch between `HELP_HTML` and the code.
+2. **`docs-writer`** gets the fact sheet and does steps 2, 3, 5 and 6. It writes `docs/tools/<script>.md`,
+   the row in `docs/README.md`, and `HELP_HTML` plus the docstring when they are out of date.
+3. **`docs-verifier`** (read-only) does step 4 and the Style checks on what the writer produced.
+   If it reports FAIL items, send them back to `docs-writer`, then run the verifier again (2 rounds at most).
+
+After that, give the user a summary: which files changed, the verifier's verdict, and the release
+warning from "Before committing" if it applies. For a one-line docs fix, skip the agents and edit directly.
+
 ## Steps
 
 1. **Read the source of truth**, in this order: the script's module docstring, its `HELP_HTML`
