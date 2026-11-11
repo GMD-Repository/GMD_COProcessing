@@ -661,9 +661,12 @@ def mode_kinds(mode):
 #     layer with 'mbi_type' and drops its Disputed footprints) — that would hide the very
 #     remaining Disputed MBIs being counter-checked.
 #   • Building points are optional (counts are 0 without them).
+#   • Slivers: a finding of 0.10 m² or less is dropped only when no building point is inside
+#     (GEMMA drops it regardless) — same rule as the National-Level and EA MBI Checkers, and
+#     measured the same way as their $area (project ellipsoid; planar EPSG:3857 if none).
 #   • The Gaps / Overlaps / Disputed layers are returned instead of loaded into the project.
 CHECKER_VERSION = "v13 (GEMMA) + counter-check adjustments"
-CHECKER_MIN_M2 = 0.10        # findings this small (m², EPSG:3857) are slivers — not reported
+CHECKER_MIN_M2 = 0.10        # findings this small (m², project ellipsoid like $area) WITH NO BUILDING are slivers
 CHECKER_GAP_BUFFER = 0.50    # m: polygons this close to a gap / disputed area are involved
 
 
@@ -674,10 +677,10 @@ def run_mbi_checker(polygon_layers, building_layers, mode, feedback=None):
     (RUN_MODES index) looks for — always emitted, empty when nothing is found."""
     import uuid as _uuid
     import processing
-    from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeature,
-                           QgsFeatureRequest, QgsField, QgsFields, QgsGeometry,
+    from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsDistanceArea,
+                           QgsFeature, QgsFeatureRequest, QgsField, QgsFields, QgsGeometry,
                            QgsProcessingContext, QgsProcessingFeedback, QgsProject,
-                           QgsSpatialIndex, QgsVectorLayer, QgsWkbTypes)
+                           QgsSpatialIndex, QgsUnitTypes, QgsVectorLayer, QgsWkbTypes)
     from qgis.PyQt.QtCore import QVariant
 
     if not polygon_layers:
@@ -806,6 +809,29 @@ def run_mbi_checker(polygon_layers, building_layers, mode, feedback=None):
                 pass
         return n
 
+    # Sliver area is measured like QGIS $area in the National-Level / EA MBI Checkers:
+    # on the project's ellipsoid, or planar in EPSG:3857 when the project has none.
+    sliver_da = QgsDistanceArea()
+    sliver_da.setSourceCrs(target_crs, QgsProject.instance().transformContext())
+    _ellipsoid = QgsProject.instance().ellipsoid()
+    if _ellipsoid and _ellipsoid.upper() != "NONE":
+        sliver_da.setEllipsoid(_ellipsoid)
+
+    def mbi_area_m2(geom):
+        if geom is None or geom.isEmpty():
+            return 0.0
+        try:
+            return sliver_da.convertAreaMeasurement(sliver_da.measureArea(geom),
+                                                    QgsUnitTypes.AreaSquareMeters)
+        except Exception:
+            return safe_area(geom)
+
+    def is_sliver(geom):
+        """Dropped as a sliver: CHECKER_MIN_M2 or smaller AND no building point inside
+        (same rule and same area measure as the National-Level / EA MBI Checkers).
+        A tiny MBI holding a building is kept."""
+        return mbi_area_m2(geom) <= CHECKER_MIN_M2 and count_points(geom) == 0
+
     def get_involved(finding, near=False, by_feature=False):
         """Polygons taking part in a finding. near=True (gaps, disputed): every polygon within
         CHECKER_GAP_BUFFER, grouped by barangay label; otherwise polygons sharing > 0.01 m²
@@ -929,7 +955,7 @@ def run_mbi_checker(polygon_layers, building_layers, mode, feedback=None):
                     if not geom1.intersects(info2["geometry"]):
                         continue
                     for part in polygon_parts(geom1.intersection(info2["geometry"])):
-                        if safe_area(part) <= CHECKER_MIN_M2:
+                        if is_sliver(part):
                             continue
                         involved = get_involved(part, by_feature=True)
                         if len(involved) < 2:
@@ -966,7 +992,7 @@ def run_mbi_checker(polygon_layers, building_layers, mode, feedback=None):
         feats = []
         for feat in gaps.getFeatures():
             geom = feat.geometry()
-            if geom is None or geom.isEmpty() or safe_area(geom) <= CHECKER_MIN_M2:
+            if geom is None or geom.isEmpty() or is_sliver(geom):
                 continue
             if disputed_union is not None and not disputed_union.isEmpty():
                 try:
@@ -974,7 +1000,7 @@ def run_mbi_checker(polygon_layers, building_layers, mode, feedback=None):
                 except Exception:
                     pass
             for part in polygon_parts(geom):
-                if safe_area(part) <= CHECKER_MIN_M2:
+                if is_sliver(part):
                     continue
                 involved = get_involved(part, near=True)
                 if involved:
@@ -1376,9 +1402,12 @@ HELP_HTML = """
         found as several pieces gives one case per piece.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Built-in MBI Checker</td>
         <td>A copy of GEMMA's MBI Checker (v13) inside this tool: barangay layers are merged, reprojected to
-        EPSG:3857 and fixed; <b>overlaps</b> are intersecting polygon pairs over 0.10 m² (<i>2_Overlap</i>);
-        <b>gaps</b> are holes between the dissolved barangays over 0.10 m², involving every barangay within 0.50 m
-        (<i>1_Gap</i>); the MBI level comes from region / province / city / barangay. Adjusted for the counter-check:
+        EPSG:3857 and fixed; <b>overlaps</b> are intersecting polygon pairs (<i>2_Overlap</i>);
+        <b>gaps</b> are holes between the dissolved barangays, involving every barangay within 0.50 m
+        (<i>1_Gap</i>); the MBI level comes from region / province / city / barangay. A finding of
+        <b>0.10 m² or less with no building point inside</b> is dropped as a sliver; a tiny one holding a building
+        is kept. This area is measured on the project's ellipsoid (as QGIS <i>$area</i>, like the National-Level
+        and EA MBI Checkers), or planar in EPSG:3857 when the project has no ellipsoid. Adjusted for the counter-check:
         <b>disputed areas</b> are reported again (<i>3_Disputed</i>: polygons whose <i>boundary</i> is
         <i>Contested</i>, involving the contested polygon and every barangay within 0.50 m, so a covering barangay can
         be chosen; their footprint is left out of the gaps, as in GEMMA); the remaining MBIs are <b>not</b> subtracted
