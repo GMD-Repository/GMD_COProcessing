@@ -383,6 +383,7 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
     for r in records:
         if is_summary_header_record(r):
             r["recoded_ean"] = ""
+            r["final_ean"] = ""
             continue
         gc = str(r.get("geocode", "") or "").strip()
         brgy_code = str(r.get("barangay_code", "") or "").strip()
@@ -481,6 +482,7 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
         if len(unique_entities) <= 1:
             for r, ent_key, kind, norm_nean, old_ean in record_entities:
                 r["recoded_ean"] = "000000"
+                r["final_ean"] = "000000"
             continue
 
         # Rule B & D: Multi-EA Barangay
@@ -510,7 +512,9 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
             recoding_map[ent_key] = f"{k:03d}000"
 
         for r, ent_key, kind, norm_nean, old_ean in record_entities:
-            r["recoded_ean"] = recoding_map.get(ent_key, f"{len(ordered_all_entities):03d}000")
+            code_res = recoding_map.get(ent_key, f"{len(ordered_all_entities):03d}000")
+            r["recoded_ean"] = code_res
+            r["final_ean"] = code_res
 
     return records
 
@@ -736,6 +740,48 @@ def export_matched_to_excel(
         if not is_summary_header_record(r):
             pure_records.append(r)
     records = pure_records
+
+    # Reconcile duplicate / unmerged partner rows (e.g. UNMATCHED_EARF and UNMATCHED_GPKG
+    # representing the same physical split EA within the same barangay).
+    # Group by (Barangay, Prelim EA / New EAN / Code):
+    deduped_records = []
+    seen_brgy_entries = {}
+    for r in records:
+        gc = str(r.get("geocode", "") or "").strip()
+        brgy_c = str(r.get("barangay_code", "") or (gc[5:8] if len(gc) >= 8 else "")).strip().zfill(3)
+        prov_c = str(r.get("province_code", "") or (gc[:3] if len(gc) >= 3 else "")).strip().zfill(3)
+        mun_c = str(r.get("city_mun_code", "") or (gc[3:5] if len(gc) >= 5 else "")).strip().zfill(2)
+        nean = str(r.get("new_enumeration_area_code") or r.get("new_ean") or r.get("code") or "").strip().replace(".0", "")
+        if nean.isdigit() and len(nean) < 6:
+            nean = f"{int(nean):03d}000" if len(nean) <= 3 else f"{int(nean):06d}"
+        
+        # If this row is unmatched and has a prelim/new_ean, check if we already have an entry for this EA in the barangay
+        b_key = (prov_c, mun_c, brgy_c, nean) if (brgy_c != "000" and nean) else None
+        
+        if b_key and b_key in seen_brgy_entries:
+            prev_r = seen_brgy_entries[b_key]
+            # Merge information into the previous record
+            for k in ("household_count", "earf_household_count", "building_count", "earf_building_count", "ea_type", "source_year", "remarks", "earf_remarks"):
+                if not prev_r.get(k) and r.get(k):
+                    prev_r[k] = r.get(k)
+            # If current record has GPKG or geometry, ensure flags and counts are reflected
+            if r.get("in_gpkg") or r.get("has_geometry"):
+                prev_r["in_gpkg"] = 1
+                prev_r["has_geometry"] = r.get("has_geometry")
+                if r.get("household_count"):
+                    prev_r["household_count"] = r.get("household_count")
+                if r.get("building_count"):
+                    prev_r["building_count"] = r.get("building_count")
+            if r.get("in_earf"):
+                prev_r["in_earf"] = 1
+            if prev_r.get("in_earf") and prev_r.get("in_gpkg"):
+                prev_r["match_status"] = "MATCHED_ALL" if prev_r.get("in_popcen") else "UNMATCHED_GPKG_EARF"
+            continue
+        
+        if b_key:
+            seen_brgy_entries[b_key] = r
+        deduped_records.append(r)
+    records = deduped_records
 
     # Ensure recoded_ean is populated across records
     if any(not r.get("recoded_ean") for r in records):

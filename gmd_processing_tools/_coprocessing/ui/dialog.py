@@ -6416,12 +6416,19 @@ class COProcessingDialog(QDialog):
                     if "RETAIN" in v_up:
                         item.setBackground(QColor("#dcfce7"))
                         item.setForeground(QColor("#15803d"))
-                    elif "SPLIT" in v_up:
+                    elif "SPLIT" in v_up or "DELIN" in v_up:
                         item.setBackground(QColor("#dbeafe"))
                         item.setForeground(QColor("#1d4ed8"))
                     elif "MERG" in v_up:
                         item.setBackground(QColor("#ffedd5"))
                         item.setForeground(QColor("#c2410c"))
+                elif col_low == "final_ean":
+                    item.setTextAlignment(Qt.AlignCenter)
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#1d4ed8"))
+                    item.setBackground(QColor("#eff6ff"))
 
                 self.table_earf.setItem(row_idx, col_idx + 2, item)
 
@@ -7311,6 +7318,17 @@ class COProcessingDialog(QDialog):
             return
 
         df = df.copy()
+        if "final_ean" not in df.columns or df["final_ean"].isna().all():
+            try:
+                recs = df.to_dict("records")
+                if hasattr(self.db, "compute_recoded_enumeration_areas"):
+                    self.db.compute_recoded_enumeration_areas(recs)
+                elif "compute_recoded_enumeration_areas" in globals():
+                    compute_recoded_enumeration_areas(recs)
+                df["final_ean"] = [str(r.get("final_ean") or r.get("recoded_ean") or "").strip() for r in recs]
+            except Exception:
+                pass
+
         if "source_files" in df.columns and "source_file" in df.columns:
             has_multi = df["source_files"].astype(str).str.contains(",", na=False)
             df.loc[has_multi, "source_file"] = df.loc[has_multi, "source_files"]
@@ -7331,6 +7349,7 @@ class COProcessingDialog(QDialog):
             "bldgcount",
             "sy",
             "new_ean",
+            "final_ean",
             "hh_count",
             "bldg_count",
             "ea_type",
@@ -7470,12 +7489,19 @@ class COProcessingDialog(QDialog):
                     if "RETAIN" in v_up:
                         item.setBackground(QColor("#dcfce7"))
                         item.setForeground(QColor("#15803d"))
-                    elif "SPLIT" in v_up:
+                    elif "SPLIT" in v_up or "DELIN" in v_up:
                         item.setBackground(QColor("#dbeafe"))
                         item.setForeground(QColor("#1d4ed8"))
                     elif "MERG" in v_up:
                         item.setBackground(QColor("#ffedd5"))
                         item.setForeground(QColor("#c2410c"))
+                elif col_low == "final_ean":
+                    item.setTextAlignment(Qt.AlignCenter)
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#1d4ed8"))
+                    item.setBackground(QColor("#eff6ff"))
 
                 self.table_gpkg.setItem(row_idx, col_idx + 2, item)
 
