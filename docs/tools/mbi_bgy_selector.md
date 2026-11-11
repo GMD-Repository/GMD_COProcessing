@@ -114,6 +114,19 @@ Each MBI is **one row per involved barangay** in the `ppp_mbi` layer (same `case
 most of the buildings inside the MBI (needs Building Points). Shared overlaps go to every barangay with
 tagged buildings, most first. No tagged buildings or a tie stays Pending.
 
+**What the Role / Status column says** — it spells out what each tick does:
+
+| Row | Text |
+|-----|------|
+| Not decided yet | **☐ Tick if this barangay covers it** · case row **Pending — tick the covering barangay below** (peach) |
+| Ticked barangay | **✔ Covers — keeps the overlap** / **✔ Covers — its boundary is extended over the gap** / **✔ Covers its part (x% of the MBI)** (green) |
+| Other barangays | **✖ Gives up the overlap — cut out of it** / **Not extended — stays as it is** (grey) |
+| Case row when done | **✔ Done — covered by …** (green), or **Partly covered (x%) — tick another barangay** (cream) |
+
+The **MBI Level** column uses its own cool colours (lavender = Inter-Region → periwinkle → sky blue →
+pale aqua → slate = Within-Barangay), so it never looks like a status. Both colour keys are in the legend
+under the list.
+
 Click a row to select it on the map, double-click to zoom, right-click for more options.
 
 ---

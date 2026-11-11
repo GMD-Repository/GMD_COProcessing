@@ -97,12 +97,14 @@ flowchart LR
 
 | Case | Ticked EA | Others |
 |------|-----------|--------|
-| Overlap | **Keeps overlap** | Releases (clip) |
-| Shared overlap | **Keeps its part (x%)** — first-ticked wins a shared piece | Releases, or *Releases x% · candidate* |
-| Gap | **Absorbs gap** | Not extended |
+| Overlap | **✔ Covers — keeps the overlap** | ✖ Gives up the overlap — cut out of it |
+| Shared overlap | **✔ Covers its part (x% of the MBI)** — first-ticked wins a shared piece | ✖ Gives up, or *Gives up x% · tick to keep the rest* |
+| Gap | **✔ Covers — its boundary is extended over the gap** | Not extended — stays as it is |
 
-Case status in the list: **Pending** (orange) → **Covered by …** (green), or **Partly covered (x%)**
-(yellow) when the ticked EAs do not fill the MBI yet.
+Before you tick, each EA row reads **☐ Tick if this EA covers it**. Case status: **Pending — tick the covering EA below**
+(peach) → **✔ Done — covered by …** (green), or **Partly covered (x%) — tick another EA** (cream) when the
+ticked EAs do not fill the MBI yet. The **MBI Level** column has its own cool colours (lavender → blue → aqua
+→ slate), shown in the legend under the list.
 
 **Auto-Assign Pending:** single-EA cases go to that EA; others to the EA owning most of the buildings
 inside the MBI (needs Building Points); shared overlaps to every EA with tagged buildings, most first.
