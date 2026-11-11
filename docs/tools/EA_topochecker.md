@@ -55,7 +55,8 @@ flowchart LR
    - `involved_areas` / `involved_bgys` / `involved_eas`;
    - the **MBI level** — the most severe boundary the pair crosses (region › province › city/municipality ›
      barangay › within barangay).
-5. **Buildings.** The building points inside each piece are counted (`num_bldg_pts`).
+5. **Buildings.** The building points inside each piece are counted (`num_bldg_pts`). A piece of
+   **0.1 m² or less with no building** is dropped as a sliver; a tiny piece holding a building is kept.
 6. **Output.** The Overlaps and Gaps layers are added to the project as scratch layers and styled.
 
 ---

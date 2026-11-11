@@ -2,7 +2,8 @@
 
 One page per tool in [`gmd_processing_tools/`](../gmd_processing_tools/). Every tool opens from the
 **GMD CO Processing** menu (**EA Tools** submenu) or from the plugin panel (pick it, then **Run**).
-Each tool window also has a **Help and Information** tab with the same guidance.
+Each tool window also has a **Help and Information** tab with the same guidance (the two MBI checkers open
+as Processing dialogs, with their help in the dialog's side panel).
 
 Every page has a **How it works** section — a flowchart plus step-by-step explanation of what the tool does
 to your data (the rules, thresholds and matching keys it uses).
@@ -10,6 +11,7 @@ to your data (the rules, thresholds and matching keys it uses).
 | Tool | Script | What it does |
 |------|--------|--------------|
 | [EA MBI Checker](tools/EA_topochecker.md) | `EA_topochecker.py` | Finds gaps and overlaps between EA polygons and counts the buildings inside each |
+| [National-Level MBI Checker](tools/national_mbi_checker.md) | `national_mbi_checker.py` | Finds gaps and overlaps between barangay polygons (up to national scale), with the MBI level of each pair |
 | [EA vs Barangay Check](tools/ea_versus_bgy.md) | `ea_versus_bgy.py` | Compares EAs with their barangay (or barangays / EAs with each other) and snaps the mismatches |
 | [MBI Barangay Selector](tools/mbi_bgy_selector.md) | `mbi_bgy_selector.py` | Counter-checks the remaining MBIs and chooses the barangay that covers each one |
 | [MBI EA Selector](tools/mbi_ea_selector.md) | `mbi_ea_selector.py` | Chooses the EA that covers each MBI inside its covering barangay, and writes the coverage status |
@@ -44,6 +46,12 @@ The tools use the PSA 14-digit geocode:
 
 A barangay and its EAs are matched on the first 8 digits. An EA numbered `000000` has the same
 geocode as its barangay.
+
+## Reviews
+
+| Review | Topic |
+|--------|-------|
+| [Sliver rule in the MBI checks](reviews/sliver_rule_comparison.md) | When a tiny gap / overlap is dropped (0.1 m² and no building) |
 
 ## Adding or changing a tool
 
