@@ -37,6 +37,30 @@ Requires `geopandas`, `pandas`, `pyogrio` and `shapely` in the QGIS Python.
    same for several rows. Untick **Blinking dotted outline and snap preview on zoom** (Snap panel) to get
    only the plain red flash.
 6. Select the rows to fix (**Switch Fix** changes which feature takes them) and press **Snap Selected**.
+   Changed your mind? **Undo Last Snap** takes it back.
+
+### The list and buttons
+
+The **Discrepancies** list has the columns **Issue**, **Status**, **EA Geocode**, **Fix EA**, **EA**,
+**Barangay**, **City/Municipality**, **Area (sqm)** and **Note**. In BGY vs BGY mode they read **BGY Geocode**,
+**Fix BGY** and **Name**. Use the **Show** list (All issues, one issue, or one status) and the search box to
+narrow it; the magnifier button next to them zooms to the selected rows.
+
+| Status | Meaning |
+|--------|---------|
+| **Not snapped** | Ready to snap. |
+| **Snapped** | The feature was changed (unsaved edit). |
+| **Failed** | The feature was left untouched; hover the cell for the reason. |
+| **Fix manually** | Cannot be snapped automatically. |
+
+| Button | What it does |
+|--------|--------------|
+| **Select Not Snapped** | Selects every listed row that can still be snapped. |
+| **Zoom to Selected** | Zooms to the selected rows (with the blinking outlines if ticked). |
+| **Switch Fix** | Gives the selected row to the next feature that could take it. |
+| **Snap Selected** | Changes the features named in **Fix** for the selected rows. |
+| **Undo Last Snap** | Takes back the last snap (see Safety checks and saving). |
+| **Clear** (left column) | Clears the list and the log. |
 
 ### Ticking layers
 
@@ -117,6 +141,11 @@ untouched.
 Only geometry changes — attributes such as household counts stay as they are. Each snap edits the
 feature's own layer, and the changed layers are left in edit mode (the Log names them):
 
+- **Undo Last Snap:** the button next to **Snap Selected** takes back the last snap (features return to
+  their old shape, rows to the status they had before, normally *Not snapped*); press again for the snap
+  before. It is refused, changing nothing, if those layers were edited or **Edit › Undo** was used
+  afterwards. Once their edits are saved or discarded (or a layer is removed) the snaps can no longer be
+  undone here.
 - **Keep:** Save Layer Edits, or **Layer › Current Edits › Save for All Layers** for several layers.
 - **Revert:** Toggle Editing › Discard, or **Edit › Undo** (one undo step per layer per Snap Selected).
 

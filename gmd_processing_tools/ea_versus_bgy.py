@@ -37,7 +37,14 @@ scanned together, so discrepancies between two layers are found too, and each sn
 The changed layers are left in edit mode and nothing is written to their files until you save:
 
   Keep    Save Layer Edits, or Layer > Current Edits > Save for All Layers
-  Revert  Toggle Editing > Discard, or Edit > Undo (one undo step per layer per Snap Selected)
+  Revert  "Undo Last Snap" (press again for the snap before), Edit > Undo, or Toggle Editing > Discard.
+          Undo Last Snap is refused if the layers were edited or Edit > Undo was used after the snap, and
+          is no longer possible once their edits are saved or discarded.
+
+Clicking a row flashes it on the map; double-click (or Zoom to Selected) zooms to it and, with the "Blinking dotted
+outline and snap preview on zoom" box ticked, blinks a dotted outline + circle on the discrepancy (orange cut,
+red add, grey fix by hand) and a dotted green outline of the Fix feature as it will be after Snap Selected.
+Unticked, only the plain flash is shown.
 
 Only the geometry is changed: attributes such as household counts stay as they are.
 Each scan also removes any "Discrepancies ..." scratch layers left in the project by older versions.
@@ -786,6 +793,7 @@ class Scan:
         self.issues = mode_issues(mode, self_check)
         self.unit = MODES[mode]["unit"]
         self.messages = {}                  # row -> why it failed / what changed
+        self.history = []                   # one entry per Snap Selected that changed something (for undo)
 
 
 def _set_layer_values(scan, rows, columns):
@@ -844,6 +852,7 @@ def snap_rows(scan, rows):
             todo.setdefault(int(d.at[r, "_ea_idx"]), []).append(r)
 
     edits = {}  # layer id -> the edits to make in that layer
+    undo_layers, undo_geoms = [], {}  # for undo_last_snap: (layer id, edit command), feature -> old geometry
     for idx, ea_rows in todo.items():
         code = ea.at[idx, "EA Geocode"]
 
@@ -893,32 +902,93 @@ def snap_rows(scan, rows):
         edits.setdefault(layer_id, []).append((idx, ea_rows, fid, geom, new, old_area, new_area))
 
     what = "overlaps / gaps" if scan.self_check else f"{MODES[scan.mode]['ref_unit']} boundaries"
-    for layer_id, layer_edits in edits.items():
-        ea_layer = QgsProject.instance().mapLayer(layer_id)
-        if not ea_layer.isEditable() and not ea_layer.startEditing():
-            for _, ea_rows, *_ in layer_edits:
-                outcome.update({r: (STATUS_FAILED, f"'{ea_layer.name()}' cannot be edited") for r in ea_rows})
-            continue
-        ea_layer.beginEditCommand(f"Snap {len(layer_edits)} {unit}(s) to {what}")
-        for idx, ea_rows, fid, geom, new, old_area, new_area in layer_edits:
-            code = ea.at[idx, "EA Geocode"]
-            if ea_layer.changeGeometry(fid, geom):
-                ea.at[idx, "geometry"] = new
-                ea.at[idx, "src_hash"] = geometry_hash(ea_layer.getFeature(fid).geometry())
-                msg = f"{Unit} {code} snapped: {old_area:,.0f} -> {new_area:,.0f} sqm"
-                outcome.update({r: (STATUS_DONE, msg) for r in ea_rows})
-            else:
-                outcome.update({r: (STATUS_FAILED, f"{Unit} {code} not changed: the layer refused the edit")
-                                for r in ea_rows})
-        ea_layer.endEditCommand()
-        ea_layer.triggerRepaint()
-
-    # Record the result in the scan, and in the Discrepancies layer's Status field.
-    for r, (status, message) in outcome.items():
-        d.at[r, "Status"] = status
-        scan.messages[r] = message
-    _set_layer_values(scan, list(outcome), ["Status"])
+    try:
+        for layer_id, layer_edits in edits.items():
+            ea_layer = QgsProject.instance().mapLayer(layer_id)
+            if not ea_layer.isEditable() and not ea_layer.startEditing():
+                for _, ea_rows, *_ in layer_edits:
+                    outcome.update({r: (STATUS_FAILED, f"'{ea_layer.name()}' cannot be edited") for r in ea_rows})
+                continue
+            command = f"Snap {len(layer_edits)} {unit}(s) to {what}"
+            ea_layer.beginEditCommand(command)
+            changed = False
+            try:
+                for idx, ea_rows, fid, geom, new, old_area, new_area in layer_edits:
+                    code = ea.at[idx, "EA Geocode"]
+                    old_geom = ea.at[idx, "geometry"]
+                    if ea_layer.changeGeometry(fid, geom):
+                        ea.at[idx, "geometry"] = new
+                        ea.at[idx, "src_hash"] = geometry_hash(ea_layer.getFeature(fid).geometry())
+                        msg = f"{Unit} {code} snapped: {old_area:,.0f} -> {new_area:,.0f} sqm"
+                        outcome.update({r: (STATUS_DONE, msg) for r in ea_rows})
+                        undo_geoms[idx] = old_geom
+                        changed = True
+                    else:
+                        outcome.update({r: (STATUS_FAILED, f"{Unit} {code} not changed: the layer refused the edit")
+                                        for r in ea_rows})
+            finally:
+                ea_layer.endEditCommand()  # never leave the layer inside an open edit command
+                ea_layer.triggerRepaint()
+            if changed:
+                # the stack position after the snap: Undo Last Snap needs the layer to still be exactly here
+                undo_layers.append((layer_id, command, ea_layer.undoStack().index()))
+    finally:
+        # Record what was done even if a later layer failed, so the finished layers can still be undone.
+        done_rows = {r: (d.at[r, "Status"], scan.messages.get(r))
+                     for r, (s, _) in outcome.items() if s == STATUS_DONE}
+        for r, (status, message) in outcome.items():
+            d.at[r, "Status"] = status
+            scan.messages[r] = message
+        _set_layer_values(scan, list(outcome), ["Status"])
+        if undo_layers:
+            scan.history.append({"layers": undo_layers, "rows": done_rows, "geoms": undo_geoms})
     return outcome
+
+
+def undo_last_snap(scan):
+    """Take back the last Snap Selected: undoes its edit command in each layer, puts the features'
+    geometries and the rows' statuses back to what they were before it. Returns (rows restored, None) or
+    (None, why it cannot be undone).
+
+    Refused, with nothing changed, if a layer's undo stack is not exactly where the snap left it (another
+    edit, or an Edit > Undo, was made afterwards). If a layer was removed or its edits were saved /
+    discarded, the snap can never be undone from here, so the history is dropped."""
+    from qgis.core import QgsProject
+
+    if not scan.history:
+        return None, "There is no snap to undo."
+    entry = scan.history[-1]
+    layers = []
+    for layer_id, command, position in entry["layers"]:
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if layer is None or not layer.isEditable():
+            scan.history.clear()
+            why = "was removed from the project" if layer is None else "had its edits saved or discarded"
+            return None, ("A layer that was snapped " + why + ", so the snaps can no longer be undone here. "
+                          "The rows keep their status.")
+        stack = layer.undoStack()
+        if stack.index() != position or stack.undoText() != command:
+            return None, (f"'{layer.name()}' was edited, or Edit > Undo was used, after the snap. "
+                          "Put it back as the snap left it first, or use Edit > Undo for that layer.")
+        layers.append(layer)
+    for layer in layers:
+        layer.undoStack().undo()
+        layer.triggerRepaint()
+
+    d, ea = scan.discrepancies, scan.ea
+    for idx, geom in entry["geoms"].items():
+        layer = QgsProject.instance().mapLayer(ea.at[idx, "src_layer"])
+        ea.at[idx, "geometry"] = geom
+        ea.at[idx, "src_hash"] = geometry_hash(layer.getFeature(int(ea.at[idx, "src_fid"])).geometry())
+    for r, (status, message) in entry["rows"].items():
+        d.at[r, "Status"] = status
+        if message is None:
+            scan.messages.pop(r, None)
+        else:
+            scan.messages[r] = message
+    _set_layer_values(scan, list(entry["rows"]), ["Status"])
+    scan.history.pop()
+    return list(entry["rows"]), None
 
 
 # ================= QGIS OUTPUT =================
@@ -1197,7 +1267,7 @@ HELP_HTML = f"""
         <b>Select All</b> in each list. All ticked layers are scanned together.</li>
     <li>Click <b>Scan</b>. Progress and warnings appear in the Log.</li>
     <li>Review the <b>Discrepancies</b> list: click a row to flash it on the map, double-click to zoom. The zoom
-        blinks a <b>dotted outline with a circle</b> on the discrepancy (orange = cut off, red = added) and a
+        blinks a <b>dotted outline with a circle</b> on the discrepancy (orange = cut off, red = added, grey = fix by hand) and a
         <b>dotted green outline</b> of the Fix feature as it will be after <b>Snap Selected</b>, so even a
         1 sqm piece is easy to see and check before snapping. <b>Zoom to Selected</b> does the same for
         several rows. Untick <b>Blinking dotted outline and snap preview on zoom</b> (Snap panel) for the plain
@@ -1263,6 +1333,11 @@ HELP_HTML = f"""
                      "to the next feature that could take it. Also lets you snap a row marked <i>Fix manually</i> "
                      "because no feature had most of its border."),
       ("Snap Selected", "Changes the features named in Fix for the selected rows. Unsaved, undoable edits."),
+      ("Undo Last Snap", "Takes back the last <b>Snap Selected</b>: the features return to their shape before it and "
+                         "its rows to the status they had before it (normally <i>Not snapped</i>). Press again to "
+                         "undo the snap before that. It is refused (nothing changes) if you edited those layers or "
+                         "used Edit &gt; Undo afterwards; if their edits were saved or discarded, or a layer was "
+                         "removed, the snaps can no longer be undone here."),
       ("Clear", "Clears the list and the log."),
   ])}
 
@@ -1738,10 +1813,18 @@ def make_dialog_class():
                                         "Changes are unsaved edits in the checked layer (Edit > Undo to take "
                                         "them back).")
             self.snap_button.clicked.connect(self.snap_selected)
+            self.undo_btn = button("Undo Last Snap", 32, "/mActionUndo.svg")
+            self.undo_btn.setToolTip(
+                "Take back the last Snap Selected: the features go back to their shape before it and\n"
+"their rows to their earlier status (normally 'Not snapped'). Press again for the snap\n"
+                "before that. Refused if you edited those layers or used Edit > Undo afterwards; not\n"
+                "possible once their edits were saved or discarded.")
+            self.undo_btn.clicked.connect(self.undo_snap)
             arow.addWidget(self.select_btn, 1)
             arow.addWidget(self.zoom_button, 1)
             arow.addWidget(self.switch_btn, 1)
             arow.addWidget(self.snap_button, 2)
+            arow.addWidget(self.undo_btn, 1)
             gf.addLayout(arow)
             self.highlight_chk = QtWidgets.QCheckBox("Blinking dotted outline and snap preview on zoom")
             self.highlight_chk.setChecked(True)
@@ -1751,7 +1834,7 @@ def make_dialog_class():
                 "Off: only the plain red flash.")
             self.highlight_chk.toggled.connect(lambda on: None if on else self.clear_highlight())
             gf.addWidget(self.highlight_chk)
-            self.snap_hint =self._hint("Snapping leaves the checked layer in edit mode: Save Layer Edits to keep "
+            self.snap_hint = self._hint("Snapping leaves the checked layer in edit mode: Save Layer Edits to keep "
                                         "the changes, Edit > Undo to take them back.")
             gf.addWidget(self.snap_hint)
             self.snap_group.setEnabled(False)
@@ -1823,6 +1906,7 @@ def make_dialog_class():
             fix_col = COL["Fix EA"]
             self.table.horizontalHeaderItem(fix_col).setToolTip("The feature that Snap Selected changes for this row.")
             if reset:
+                self.clear_highlight()
                 if self.scan_result is not None or self.table.rowCount():
                     self.log(f"Check mode changed to {MODES[mode]['label']}: previous results cleared.")
                 self.scan_result = None
@@ -2024,6 +2108,7 @@ def make_dialog_class():
             self.zoom_btn.setEnabled(bool(rows) and idle)
             self.zoom_button.setEnabled(bool(rows) and idle)
             self.snap_button.setEnabled(bool(statuses & snappable) and idle)
+            self.undo_btn.setEnabled(idle and self.scan_result is not None and bool(self.scan_result.history))
             self.select_btn.setEnabled(has_rows and idle)
             self.switch_btn.setEnabled(idle and self.scan_result is not None
                                        and any(self.can_switch(r) for r in rows))
@@ -2219,10 +2304,13 @@ def make_dialog_class():
             """Remove the dotted outlines / markers and stop their blinking."""
             if self._blink is not None:
                 self._blink.stop()
+                self._blink.deleteLater()
                 self._blink = None
             for b in self.bands:
                 try:
-                    b.scene().removeItem(b) if b.scene() is not None else None
+                    b.reset()
+                    if b.scene() is not None:
+                        b.scene().removeItem(b)
                 except RuntimeError:  # canvas already gone
                     pass
             self.bands = []
@@ -2281,8 +2369,12 @@ def make_dialog_class():
             def blink():
                 state["ticks"] += 1
                 show = state["ticks"] % 2 == 0 or state["ticks"] >= BLINKS
-                for b in self.bands:
-                    b.setVisible(show)
+                try:
+                    for b in self.bands:
+                        b.setVisible(show)
+                except RuntimeError:  # canvas items already deleted (project closed)
+                    self.clear_highlight()
+                    return
                 if state["ticks"] >= BLINKS and self._blink is not None:
                     self._blink.stop()
 
@@ -2290,7 +2382,7 @@ def make_dialog_class():
             self._blink.timeout.connect(blink)
             self._blink.start(300)
             what = f"; dotted green = {previews} feature(s) after Snap Selected" if previews else ""
-            self.log(f"Map: dotted outline + circle = the discrepancy (orange cut, red add){what}.")
+            self.log(f"Map: dotted outline + circle = the discrepancy (orange cut, red add, grey fix by hand){what}.")
 
         # ----------------------------------------------------- switch fix
         def switch_selected(self):
@@ -2298,6 +2390,8 @@ def make_dialog_class():
                 return
             d = self.scan_result.discrepancies
             changed = 0
+            self.clear_highlight()  # the "after snap" preview was drawn for the old Fix feature
+            self.table.setSortingEnabled(False)  # repainting a Status cell must not re-sort the rows under us
             for r in self.selected_rows():
                 if not self.can_switch(r):
                     continue
@@ -2312,6 +2406,7 @@ def make_dialog_class():
                 note.setToolTip(note.text())
                 self.paint_status(r)
                 self.log(f"  {d.at[row, 'Issue']} ({d.at[row, 'Area (sqm)']:,.0f} sqm): Fix is now {code}")
+            self.table.setSortingEnabled(True)
             if changed:
                 self.log(f"Switched the Fix of {changed:,} row(s). Press Snap Selected to apply.")
             self.apply_filter()
@@ -2331,7 +2426,9 @@ def make_dialog_class():
                 outcome = snap_rows(self.scan_result, sorted(by_df_row))
             except Exception as e:  # noqa: BLE001 - report every failure in the log
                 self.log(traceback.format_exc().rstrip())
-                self.log(f"Snap FAILED: {e}. The layer was not changed by this step.")
+                self.log(f"Snap FAILED: {e}. Some layers may already have been changed: check them, and "
+                         "use Undo Last Snap or Edit > Undo if needed.")
+                self.update_buttons()
                 return
             finally:
                 self.set_busy(False)
@@ -2339,9 +2436,11 @@ def make_dialog_class():
             # one log line per feature (rows of the same feature share their message)
             for message in dict.fromkeys(m for _, m in outcome.values()):
                 self.log(f"  {message}")
+            self.table.setSortingEnabled(False)  # repainting a Status cell must not re-sort the rows
             for df_row, r in by_df_row.items():
                 if df_row in outcome:
                     self.paint_status(r)
+            self.table.setSortingEnabled(True)
             done = sum(1 for s, _ in outcome.values() if s == STATUS_DONE)
             failed = sum(1 for s, _ in outcome.values() if s != STATUS_DONE)
             self.log(f"Snapped {done:,}, not snapped {failed:,} (hover a Status cell to see why).")
@@ -2352,6 +2451,27 @@ def make_dialog_class():
                 names = sorted(lyr.name() for lyr in map(QgsProject.instance().mapLayer, ids) if lyr is not None)
                 self.log(f"The changes are UNSAVED edits in {len(names)} layer(s): {', '.join(names)}. "
                          "Keep: Layer > Current Edits > Save for All Layers. Undo: Edit > Undo (per layer).")
+            self.apply_filter()
+
+        def undo_snap(self):
+            """Undo Last Snap: takes back the last Snap Selected and gives its rows their earlier status."""
+            if self.running or self.scan_result is None:
+                return
+            self.clear_highlight()
+            rows, why = undo_last_snap(self.scan_result)
+            if rows is None:
+                self.log(f"Undo not done: {why}")
+                self.update_buttons()
+                return
+            self.table.setSortingEnabled(False)  # repainting a Status cell must not re-sort the rows
+            table_of = {self.df_row(r): r for r in range(self.table.rowCount())}
+            for df_row in rows:
+                if df_row in table_of:
+                    self.paint_status(table_of[df_row])
+            self.table.setSortingEnabled(True)
+            left = len(self.scan_result.history)
+            self.log(f"Undid the last snap: {len(rows):,} row(s) are back to their status before it "
+                     f"(normally Not snapped); {left} earlier snap(s) can still be undone.")
             self.apply_filter()
 
     return CheckDialog
