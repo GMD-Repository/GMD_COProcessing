@@ -3499,10 +3499,17 @@ class POPCENDatabase:
     # ----------------------------------------------------------------------
     # Preliminary EARF Completeness & Consistency Check Engine
     # ----------------------------------------------------------------------
-    def run_earf_consistency_checks(self, check_popcen: bool = True, progress_callback=None) -> Dict[str, Any]:
+    def run_earf_consistency_checks(
+        self,
+        check_popcen: bool = True,
+        city_mun_code: Optional[str] = None,
+        progress_callback=None
+    ) -> Dict[str, Any]:
         """
         Executes full Completeness & Consistency validation across earf_records
         evaluating the 13 official validation rules (Sheets 1–14).
+        If city_mun_code is provided (5-digit pppmm), only records belonging to that
+        city/municipality are validated.
         """
         results = {
             "total_checked": 0,
@@ -3522,7 +3529,13 @@ class POPCENDatabase:
             try:
                 with self._get_connection() as pop_conn:
                     pop_cur = pop_conn.cursor()
-                    pop_cur.execute("SELECT * FROM popcen_records")
+                    if city_mun_code:
+                        pop_cur.execute(
+                            "SELECT * FROM popcen_records WHERE SUBSTR(geocode, 1, 5) = ?",
+                            (city_mun_code,)
+                        )
+                    else:
+                        pop_cur.execute("SELECT * FROM popcen_records")
                     cols = [d[0] for d in pop_cur.description]
                     popcen_rows = [dict(zip(cols, r)) for r in pop_cur.fetchall()]
             except Exception:
@@ -3530,12 +3543,28 @@ class POPCENDatabase:
 
         with self._get_earf_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM earf_records")
-            total = cur.fetchone()[0]
-            if total == 0:
-                return results
+            if city_mun_code:
+                p_code = city_mun_code[:3] if len(city_mun_code) >= 3 else city_mun_code
+                m_code = city_mun_code[3:5] if len(city_mun_code) >= 5 else ""
+                cur.execute(
+                    "SELECT COUNT(*) FROM earf_records WHERE SUBSTR(geocode, 1, 5) = ? OR (prov = ? AND mun = ?)",
+                    (city_mun_code, p_code, m_code)
+                )
+                total = cur.fetchone()[0]
+                if total == 0:
+                    return results
 
-            cur.execute("SELECT * FROM earf_records")
+                cur.execute(
+                    "SELECT * FROM earf_records WHERE SUBSTR(geocode, 1, 5) = ? OR (prov = ? AND mun = ?)",
+                    (city_mun_code, p_code, m_code)
+                )
+            else:
+                cur.execute("SELECT COUNT(*) FROM earf_records")
+                total = cur.fetchone()[0]
+                if total == 0:
+                    return results
+                cur.execute("SELECT * FROM earf_records")
+
             earf_rows_raw = cur.fetchall()
             cols = [d[0] for d in cur.description]
             earf_records = [dict(zip(cols, r)) for r in earf_rows_raw]
@@ -3574,13 +3603,144 @@ class POPCENDatabase:
 
         return results
 
-    def export_prelim_earf_validation_excel(self, output_path: str, progress_callback=None) -> str:
+    def export_prelim_earf_validation_excel(
+        self,
+        output_path: str,
+        city_mun_code: Optional[str] = None,
+        progress_callback=None
+    ) -> str:
         """
         Runs validations and exports the official multi-sheet Excel report
         (Summary + Sheets 2-14 per validation_id) matching the Google Spreadsheet specifications.
+        If city_mun_code is provided, filters records and validation strictly to that city/municipality.
         """
-        val_results = self.run_earf_consistency_checks(check_popcen=True, progress_callback=progress_callback)
+        val_results = self.run_earf_consistency_checks(
+            check_popcen=True,
+            city_mun_code=city_mun_code,
+            progress_callback=progress_callback
+        )
         return generate_validation_excel_report(output_path, val_results)
+
+    def get_earf_uploaded_citymuns(self) -> List[Dict[str, str]]:
+        """
+        Retrieves the list of uploaded city/municipalities in earf_records.
+        Returns list of dicts with:
+          - 'code': 5-digit pppmm code (e.g. '80601')
+          - 'pppmm': 5-digit code
+          - 'prov': 3-digit province code (e.g. '806')
+          - 'mun': 2-digit municipality code (e.g. '01')
+          - 'name': city/municipality name (e.g. 'Tondo I and II')
+          - 'clean_name': sanitized for filename (e.g. 'Tondo_I_and_II')
+          - 'filename': e.g. '80601_prelimEARF_val_Tondo_I_and_II.xlsx'
+          - 'display': '80601 - Tondo I and II'
+        """
+        if not self.is_earf_populated():
+            return []
+
+        with self._get_earf_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT prov, mun 
+                FROM earf_records 
+                WHERE prov IS NOT NULL AND mun IS NOT NULL 
+                  AND TRIM(mun) != '' AND TRIM(mun) != '00'
+                ORDER BY prov, mun
+            """)
+            pairs = cur.fetchall()
+
+        if not pairs:
+            return []
+
+        citymuns_list = []
+        for p_val, m_val in pairs:
+            p_str = str(p_val).strip()
+            if p_str.endswith(".0"):
+                p_str = p_str[:-2]
+            p_str = p_str.zfill(3)
+
+            m_str = str(m_val).strip()
+            if m_str.endswith(".0"):
+                m_str = m_str[:-2]
+            m_str = m_str.zfill(2)
+
+            pppmm = f"{p_str}{m_str}"
+
+            # 1. Check POPCEN database first (official PSGC standard naming & casing)
+            mun_name = ""
+            if self.is_populated():
+                try:
+                    with self._get_connection() as pop_conn:
+                        pop_cur = pop_conn.cursor()
+                        pop_cur.execute("""
+                            SELECT areaname 
+                            FROM popcen_records 
+                            WHERE SUBSTR(geocode, 1, 5) = ? 
+                              AND geographic_level LIKE '%3 - City%'
+                            LIMIT 1
+                        """, (pppmm,))
+                        row_pop = pop_cur.fetchone()
+                        if row_pop and row_pop[0]:
+                            mun_name = str(row_pop[0]).strip()
+                except Exception:
+                    pass
+
+            # 2. Check earf_records for municipality row (brgy = '000')
+            if not mun_name:
+                with self._get_earf_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT areaname 
+                        FROM earf_records 
+                        WHERE prov = ? AND mun = ? 
+                          AND (brgy = '000' OR SUBSTR(geocode, 6, 3) = '000')
+                          AND areaname IS NOT NULL AND TRIM(areaname) != ''
+                        LIMIT 1
+                    """, (p_str, m_str))
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        raw_name = str(row[0]).strip()
+                        mun_name = raw_name.title() if raw_name.isupper() else raw_name
+
+            # 3. Check GeoPackage database
+            if not mun_name and self.is_gpkg_populated():
+                try:
+                    with self._get_gpkg_connection() as g_conn:
+                        g_cur = g_conn.cursor()
+                        g_cur.execute("""
+                            SELECT city_mun 
+                            FROM gpkg_records 
+                            WHERE SUBSTR(geocode, 1, 5) = ? 
+                              AND city_mun IS NOT NULL AND TRIM(city_mun) != ''
+                            LIMIT 1
+                        """, (pppmm,))
+                        row_g = g_cur.fetchone()
+                        if row_g and row_g[0]:
+                            mun_name = str(row_g[0]).strip()
+                except Exception:
+                    pass
+
+            if not mun_name:
+                mun_name = f"CityMun_{pppmm}"
+
+            clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
+            clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_')
+            if not clean_cm:
+                clean_cm = f"CityMun_{pppmm}"
+
+            filename = f"{pppmm}_prelimEARF_val_{clean_cm}.xlsx"
+
+            citymuns_list.append({
+                "code": pppmm,
+                "pppmm": pppmm,
+                "prov": p_str,
+                "mun": m_str,
+                "name": mun_name,
+                "clean_name": clean_cm,
+                "filename": filename,
+                "display": f"{pppmm} - {mun_name}",
+            })
+
+        return citymuns_list
 
     def _build_earf_where_clause(
         self,
@@ -4744,12 +4904,13 @@ class POPCENDatabase:
                 cur = conn.cursor()
                 for c in missing_codes:
                     cur.execute("""
-                        SELECT city_mun, province 
+                        SELECT areaname 
                         FROM earf_records 
-                        WHERE SUBSTR(geocode, 1, 5) = ? 
-                          AND city_mun IS NOT NULL AND city_mun != '' 
+                        WHERE (SUBSTR(geocode, 1, 5) = ? OR (prov = ? AND mun = ?))
+                          AND (brgy = '000' OR SUBSTR(geocode, 6, 3) = '000')
+                          AND areaname IS NOT NULL AND TRIM(areaname) != '' 
                         LIMIT 1
-                    """, (c,))
+                    """, (c, c[:3], c[3:5]))
                     row = cur.fetchone()
                     if row and row[0]:
                         names_map[c] = str(row[0]).strip()
@@ -4823,12 +4984,13 @@ class POPCENDatabase:
                 cur = conn.cursor()
                 for c in missing_codes:
                     cur.execute("""
-                        SELECT city_mun, province 
+                        SELECT areaname 
                         FROM earf_records 
-                        WHERE SUBSTR(geocode, 1, 5) = ? 
-                          AND city_mun IS NOT NULL AND city_mun != '' 
+                        WHERE (SUBSTR(geocode, 1, 5) = ? OR (prov = ? AND mun = ?))
+                          AND (brgy = '000' OR SUBSTR(geocode, 6, 3) = '000')
+                          AND areaname IS NOT NULL AND TRIM(areaname) != '' 
                         LIMIT 1
-                    """, (c,))
+                    """, (c, c[:3], c[3:5]))
                     row = cur.fetchone()
                     if row and row[0]:
                         names_map[c] = str(row[0]).strip()

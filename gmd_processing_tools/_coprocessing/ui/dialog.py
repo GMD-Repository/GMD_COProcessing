@@ -50,6 +50,7 @@ from qgis.PyQt.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMenu,
@@ -6665,7 +6666,7 @@ class COProcessingDialog(QDialog):
             QMessageBox.critical(self, "Export Error", f"Export failed:\n{e}")
 
     def _export_earf_validation_excel(self):
-        """Exports the official multi-sheet Excel validation report (Summary + Sheets 2–14)."""
+        """Exports the official multi-sheet Excel validation report by City/Municipality (Summary + Sheets 2–14)."""
         if self.cmb_earf_source_mode.currentIndex() != 0:
             QMessageBox.information(
                 self,
@@ -6679,46 +6680,158 @@ class COProcessingDialog(QDialog):
             QMessageBox.warning(self, "No Records", "No Preliminary EARF records found in the database.")
             return
 
-        f, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Completeness & Consistency Validation Report",
-            "prelim_earf_validation_report.xlsx",
-            "Excel Files (*.xlsx)"
-        )
-        if not f:
-            return
+        citymuns = self.db.get_earf_uploaded_citymuns()
 
-        try:
-            QApplication.setOverrideCursor(Qt.WaitCursor)
-            if self.progress_bar:
-                self.progress_bar.setValue(10)
-            self.lbl_earf_table_info.setText("Generating multi-sheet Excel validation report...")
+        if len(citymuns) <= 1:
+            # Single municipality or fallback
+            default_filename = citymuns[0]["filename"] if citymuns else "prelim_earf_validation_report.xlsx"
+            city_code = citymuns[0]["code"] if citymuns else None
+            city_disp = citymuns[0]["display"] if citymuns else "All Records"
 
-            out_path = self.db.export_prelim_earf_validation_excel(
-                f,
-                progress_callback=lambda p, m: ((self.progress_bar.setValue(p) if self.progress_bar else None), self.lbl_earf_table_info.setText(m))
-            )
-
-            if self.progress_bar:
-                self.progress_bar.setValue(100)
-            self.lbl_earf_table_info.setText(f"Validation report exported: {os.path.basename(out_path)}")
-            QApplication.restoreOverrideCursor()
-
-            # Refresh table display with newly saved consistency tags
-            self._fetch_and_render_earf_db_page()
-
-            QMessageBox.information(
+            f, _ = QFileDialog.getSaveFileName(
                 self,
-                "Export Success",
-                f"Official Completeness & Consistency Validation Report successfully generated!\n\n"
-                f"File: {out_path}\n\n"
-                f"Includes:\n"
-                f" • Sheet 1: Summary (List of Inconsistencies & Frequencies)\n"
-                f" • Sheets 2–14: Individual validation tables per validation_id"
+                f"Export Completeness & Consistency Validation Report ({city_disp})",
+                default_filename,
+                "Excel Files (*.xlsx)"
             )
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "Export Error", f"Failed to generate validation report:\n{e}")
+            if not f:
+                return
+
+            try:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                if self.progress_bar:
+                    self.progress_bar.setValue(10)
+                self.lbl_earf_table_info.setText("Generating multi-sheet Excel validation report...")
+
+                out_path = self.db.export_prelim_earf_validation_excel(
+                    f,
+                    city_mun_code=city_code,
+                    progress_callback=lambda p, m: ((self.progress_bar.setValue(p) if self.progress_bar else None), self.lbl_earf_table_info.setText(m))
+                )
+
+                if self.progress_bar:
+                    self.progress_bar.setValue(100)
+                self.lbl_earf_table_info.setText(f"Validation report exported: {os.path.basename(out_path)}")
+                QApplication.restoreOverrideCursor()
+
+                # Refresh table display with newly saved consistency tags
+                self._fetch_and_render_earf_db_page()
+
+                QMessageBox.information(
+                    self,
+                    "Export Success",
+                    f"Official Completeness & Consistency Validation Report successfully generated!\n\n"
+                    f"File: {out_path}\n\n"
+                    f"Includes:\n"
+                    f" • Sheet 1: Summary (List of Inconsistencies & Frequencies)\n"
+                    f" • Sheets 2–14: Individual validation tables per validation_id"
+                )
+            except Exception as e:
+                QApplication.restoreOverrideCursor()
+                QMessageBox.critical(self, "Export Error", f"Failed to generate validation report:\n{e}")
+
+        else:
+            # Multiple municipalities in database: offer batch or individual export
+            items = [f"All Municipalities (Batch Export to Folder - {len(citymuns)} files)"] + [
+                f"{cm['display']} ({cm['filename']})" for cm in citymuns
+            ]
+            choice, ok = QInputDialog.getItem(
+                self,
+                "Select City/Municipality",
+                f"There are {len(citymuns)} city/municipalities in the database.\nChoose how to export validation reports:",
+                items,
+                0,
+                False
+            )
+            if not ok or not choice:
+                return
+
+            if choice.startswith("All Municipalities"):
+                folder = QFileDialog.getExistingDirectory(
+                    self,
+                    "Select Target Directory for Validation Reports"
+                )
+                if not folder:
+                    return
+
+                try:
+                    QApplication.setOverrideCursor(Qt.WaitCursor)
+                    exported_files = []
+                    total_cm = len(citymuns)
+                    for idx, cm in enumerate(citymuns):
+                        out_path = os.path.join(folder, cm["filename"])
+                        p_base = int((idx / total_cm) * 100)
+                        self.lbl_earf_table_info.setText(f"Exporting {cm['display']} ({idx + 1}/{total_cm})...")
+                        if self.progress_bar:
+                            self.progress_bar.setValue(p_base)
+
+                        self.db.export_prelim_earf_validation_excel(
+                            out_path,
+                            city_mun_code=cm["code"]
+                        )
+                        exported_files.append(out_path)
+
+                    if self.progress_bar:
+                        self.progress_bar.setValue(100)
+                    self.lbl_earf_table_info.setText(f"Exported {len(exported_files)} validation reports")
+                    QApplication.restoreOverrideCursor()
+
+                    self._fetch_and_render_earf_db_page()
+
+                    files_preview = "\n".join(f" • {os.path.basename(p)}" for p in exported_files[:10])
+                    if len(exported_files) > 10:
+                        files_preview += f"\n ... and {len(exported_files) - 10} more"
+
+                    QMessageBox.information(
+                        self,
+                        "Batch Export Success",
+                        f"Successfully generated {len(exported_files)} validation report(s) in:\n{folder}\n\n"
+                        f"Files:\n{files_preview}"
+                    )
+                except Exception as e:
+                    QApplication.restoreOverrideCursor()
+                    QMessageBox.critical(self, "Export Error", f"Failed during batch validation export:\n{e}")
+
+            else:
+                # Single municipality chosen from dialog
+                selected_cm = next((cm for cm in citymuns if f"{cm['display']} ({cm['filename']})" == choice), citymuns[0])
+                f, _ = QFileDialog.getSaveFileName(
+                    self,
+                    f"Export Validation Report - {selected_cm['display']}",
+                    selected_cm["filename"],
+                    "Excel Files (*.xlsx)"
+                )
+                if not f:
+                    return
+
+                try:
+                    QApplication.setOverrideCursor(Qt.WaitCursor)
+                    if self.progress_bar:
+                        self.progress_bar.setValue(10)
+                    self.lbl_earf_table_info.setText(f"Generating validation report for {selected_cm['name']}...")
+
+                    out_path = self.db.export_prelim_earf_validation_excel(
+                        f,
+                        city_mun_code=selected_cm["code"],
+                        progress_callback=lambda p, m: ((self.progress_bar.setValue(p) if self.progress_bar else None), self.lbl_earf_table_info.setText(m))
+                    )
+
+                    if self.progress_bar:
+                        self.progress_bar.setValue(100)
+                    self.lbl_earf_table_info.setText(f"Validation report exported: {os.path.basename(out_path)}")
+                    QApplication.restoreOverrideCursor()
+
+                    self._fetch_and_render_earf_db_page()
+
+                    QMessageBox.information(
+                        self,
+                        "Export Success",
+                        f"Validation Report for {selected_cm['display']} successfully generated!\n\n"
+                        f"File: {out_path}"
+                    )
+                except Exception as e:
+                    QApplication.restoreOverrideCursor()
+                    QMessageBox.critical(self, "Export Error", f"Failed to generate validation report:\n{e}")
 
     # ----------------------------------------------------------------------
     # Preliminary EARF Record Selection & Removal Logic
