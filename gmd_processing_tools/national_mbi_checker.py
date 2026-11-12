@@ -1,9 +1,11 @@
-"""National-Level MBI Checker (Gaps & Overlaps) - checks barangay boundaries and building points.
+"""National-Level MBI Checker (Gaps, Overlaps & Disputed Areas) - checks barangay boundaries and building points.
 
 Identifies boundary discrepancies (MBIs) between barangay polygons, at any scale up to the
 whole country (merge as many barangay layers as needed):
   - Overlaps: land inside two barangay polygons
   - Gaps: holes enclosed by the barangays but inside none of them
+  - Disputed areas: barangay polygons whose 'boundary' field is 'Contested'. Only when
+    'Include Disputed Areas' is ticked; unticked, they are dropped before the check runs
   - One row per ordered pair of involved areas (A -> B and B -> A), with the MBI level
     between them (Inter-Region, Inter-Province, Inter-City/Mun, Inter-Barangay, Within-Barangay)
   - Counts building points inside each overlap / gap
@@ -23,6 +25,7 @@ TOOL_NAME = "National-Level MBI Checker"
 TOOL_GROUP = "EA Tools"
 TOOL_ICON = "icons/mbi_checker.svg"
 
+import math
 import os
 import re
 from datetime import datetime
@@ -63,7 +66,15 @@ import processing
 BGY_LAYER_NAMES = []      # e.g. ['Barangay_R1', 'Barangay_R2']
 BLDG_LAYER_NAMES = []     # e.g. ['BldgPts_R1', 'BldgPts_R2']
 
-# 0 = Overlaps and Gaps, 1 = Overlaps Only, 2 = Gaps Only
+# Take the disputed (boundary = Contested) polygons into account.
+# False: they are removed from the barangay layers before anything is checked -
+#        the run behaves as if those polygons had never been digitised.
+# True:  they are reported as Disputed Areas, kept out of the gaps and still
+#        scanned for overlaps (as in GEMMA's checker).
+INCLUDE_DISPUTED = False
+
+# 0 = Overlaps and Gaps, 1 = Overlaps Only, 2 = Gaps Only,
+# 3 = Disputed Only (needs INCLUDE_DISPUTED = True)
 RUN_MODE = 0
 
 # Export the merged MBI layer as GPKG to EXPORT_FOLDER (only when RUN_MODE = 0)
@@ -99,6 +110,26 @@ HH_FIELD_CANDIDATES = ['est_hhcount', 'hhcount', 'hh_count', 'est_hh', 'househol
                        'households', 'no_hh', 'num_hh']
 HH_WEIGHT = 'gmd_hh_w'   # internal numeric copy of that field
 
+# 'Analysis to Run' entries. The last one needs 'Include Disputed Areas' ticked;
+# QGIS cannot hide an entry of a Processing dropdown, so it says so in its label.
+RUN_MODE_LABELS = ['Overlaps and Gaps (plus Disputed Areas when included)',
+                   'Overlaps Only',
+                   'Gaps Only',
+                   'Disputed Only (needs Include Disputed Areas)']
+DISPUTED_MODE = 3
+
+# Disputed Areas: barangay polygons whose 'boundary' field holds this value (any case).
+# They are reported as their own MBI type and their footprint is kept out of the gaps.
+# Written to every exported row: the MBI types this run looked for. It lets a tool
+# reading the export (the MBI Barangay Selector) tell 'was not looked for' from 'was
+# looked for and not found' - without it, ignored disputed areas read as resolved.
+SCOPE_FIELD = 'mbi_scope'
+
+DISPUTED_FIELD = 'boundary'
+DISPUTED_VALUE = 'contested'
+# A barangay within this distance (metres, EPSG:3857) of a disputed area is involved in it.
+DISPUTED_NEAR_M = 0.50
+
 # A gap must share at least this much edge (metres, EPSG:3857) with an area
 # for that area to count as involved; corner-only touches are ignored.
 SHARED_EDGE_MIN_M = 0.01
@@ -125,6 +156,40 @@ def area_attrs(feat):
     return out
 
 
+def resolve_field(layer, name):
+    """The layer's field called 'name', whatever its letter case - or None."""
+    return next((n for n in layer.fields().names() if n.lower() == name.lower()), None)
+
+
+def webmerc_metre(geom):
+    """EPSG:3857 map units in one real metre at this geometry's latitude.
+    Web Mercator stretches distances by 1 / cos(latitude)."""
+    try:
+        pt = geom.centroid().asPoint()
+        lat = math.atan(math.sinh(pt.y() / 6378137.0))
+        return 1.0 / max(math.cos(lat), 1e-6)
+    except Exception:
+        return 1.0
+
+
+def is_disputed(feat, field=DISPUTED_FIELD):
+    """True when the polygon's DISPUTED_FIELD marks it as a disputed (contested) area."""
+    v = _val(feat, field)
+    return v is not None and str(v).strip().lower() == DISPUTED_VALUE
+
+
+def not_disputed_expression(field=DISPUTED_FIELD):
+    """QGIS expression selecting the polygons that are NOT disputed."""
+    return ("coalesce(lower(trim(to_string(\"%s\"))), '') <> '%s'"
+            % (field, DISPUTED_VALUE))
+
+
+def disputed_expression(field=DISPUTED_FIELD):
+    """QGIS expression selecting the disputed polygons."""
+    return ("coalesce(lower(trim(to_string(\"%s\"))), '') = '%s'"
+            % (field, DISPUTED_VALUE))
+
+
 def piece_attrs(feat):
     return {k: _val(feat, k) for k in ('gmd_uuid', 'mbi_area', 'num_bldg_pts', 'est_hhcount')}
 
@@ -143,6 +208,28 @@ def pair_level(a, b):
             if a[key] != b[key]:
                 return level
     return '5_Within-Barangay'
+
+
+def group_level(areas):
+    """MBI level across every involved area (used where there is no A -> B pair)."""
+    for key, level in (('region', '1_Inter-Region'), ('province', '2_Inter-Province'),
+                       ('city_mun', '3_Inter-City/Municipality'), ('barangay', '4_Inter-Barangay')):
+        if len({a[key] for a in areas}) > 1:
+            return level
+    return '5_Within-Barangay'
+
+
+def unique_areas(areas):
+    """Drop repeats, keeping the order. Multipart barangays come back as several
+    polygons; they are one involved area, not several."""
+    out, seen = [], set()
+    for a in areas:
+        key = tuple(a[k] for k in AREA_KEYS)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+    return out
 
 
 def province_file_base(code, name):
@@ -211,6 +298,7 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
 
     INPUT1 = 'INPUT1'
     INPUT2 = 'INPUT2'
+    INCLUDE_DISPUTED = 'INCLUDE_DISPUTED'
     RUN_MODE = 'RUN_MODE'
     EXPORT_MBI = 'EXPORT_MBI'
     EXPORT_DIR = 'EXPORT_DIR'
@@ -226,16 +314,29 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
         return 'National-Level MBI Checker'
 
     def shortHelpString(self):
-        return ("Finds gaps and overlaps (MBIs) between barangay polygons and counts the "
+        return ("Finds gaps, overlaps and disputed areas (MBIs) between barangay polygons "
+                "and counts the "
                 "building points inside each one.\n\n"
-                "Output: 'Overlaps' and 'Gaps' layers with one row per pair of involved "
+                "Include Disputed Areas (barangay polygons whose 'boundary' field is "
+                "'Contested'):\n"
+                "  - unticked (default): those polygons are removed before anything is "
+                "checked, so the run behaves as if they had never been digitised - no "
+                "Disputed Areas layer, and the ground they cover can come out as a gap.\n"
+                "  - ticked: they are reported whole, one row each, with every barangay "
+                "within 0.50 m of them listed as involved; their footprint is kept out of "
+                "the gaps and, as in GEMMA's checker, they are still scanned for overlaps. "
+                "'Disputed Only' needs this ticked.\n\n"
+                "Output: 'Overlaps', 'Gaps' and (when included) 'Disputed Areas' layers with "
+                "one row per pair of involved "
                 "barangays and the MBI level between them (Inter-Region ... Within-Barangay). "
                 "Slivers of 0.1 m² or less with no building are dropped.\n\n"
-                "Export (Overlaps and Gaps mode only): one GPKG per province, named "
+                "Export (first mode only): one GPKG per province, named "
                 "<province code>_<province>_mbi.gpkg (e.g. 027_Ifugao_mbi.gpkg), saved to the "
-                "chosen Export folder. Each holds the overlap and gap rows of that province's "
-                "barangays (an inter-province MBI is in both provinces' files), plus mbi_type, "
-                "mbi_status and mbi_remarks.\n\n"
+                "chosen Export folder. Each holds the overlap, gap and disputed rows of that "
+                "province's barangays (an inter-province MBI is in both provinces' files), "
+                "plus mbi_type (Overlap / Gap / Disputed), mbi_status (2_Pending on every "
+                "disputed row), mbi_remarks and mbi_scope (the MBI types this run looked for, "
+                "so a later counter-check can tell 'not looked for' from 'not found').\n\n"
                 "est_hhcount = sum of the household count of the building points inside the MBI "
                 "(per point: est_hhcount, or hhcount when est_hhcount is empty; also "
                 "hh_count / household_count ... if those are the only ones).")
@@ -248,22 +349,38 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
             self.INPUT1, 'Select Barangay Polygon Layer(s)', QgsProcessing.TypeVectorPolygon))
         self.addParameter(QgsProcessingParameterMultipleLayers(
             self.INPUT2, 'Select Building Point Layer(s)', QgsProcessing.TypeVectorPoint))
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.INCLUDE_DISPUTED,
+            "Include Disputed Areas (barangay polygons whose 'boundary' is Contested). "
+            "Unticked: they are ignored, as if those polygons were not there",
+            defaultValue=False))
         self.addParameter(QgsProcessingParameterEnum(
             self.RUN_MODE, 'Analysis to Run',
-            options=['Overlaps and Gaps', 'Overlaps Only', 'Gaps Only'], defaultValue=0))
+            options=RUN_MODE_LABELS, defaultValue=0))
         self.addParameter(QgsProcessingParameterBoolean(
             self.EXPORT_MBI,
-            'Export MBI layers as one GPKG per province, e.g. 027_Ifugao_mbi.gpkg (Overlaps and Gaps only)',
+            'Export MBI layers as one GPKG per province, e.g. 027_Ifugao_mbi.gpkg '
+            '(Overlaps, Gaps and Disputed only)',
             defaultValue=False))
         self.addParameter(QgsProcessingParameterFile(
             self.EXPORT_DIR, 'Export folder',
             behavior=QgsProcessingParameterFile.Folder,
             defaultValue=EXPORT_FOLDER, optional=True))
 
+    def checkParameterValues(self, parameters, context):
+        # 'Disputed Only' is meaningless while the disputed polygons are being ignored.
+        if (self.parameterAsEnum(parameters, self.RUN_MODE, context) == DISPUTED_MODE
+                and not self.parameterAsBool(parameters, self.INCLUDE_DISPUTED, context)):
+            return False, ("'%s' needs 'Include Disputed Areas' ticked - without it the "
+                           "contested polygons are ignored and there is nothing to report."
+                           % RUN_MODE_LABELS[DISPUTED_MODE])
+        return super().checkParameterValues(parameters, context)
+
     def processAlgorithm(self, parameters, context, feedback: QgsProcessingFeedback):
         bgy_list = self.parameterAsLayerList(parameters, self.INPUT1, context)
         bldg_list = self.parameterAsLayerList(parameters, self.INPUT2, context)
         run_mode = self.parameterAsEnum(parameters, self.RUN_MODE, context)
+        include_disputed = self.parameterAsBool(parameters, self.INCLUDE_DISPUTED, context)
         export_folder = (self.parameterAsFile(parameters, self.EXPORT_DIR, context)
                          if parameters.get(self.EXPORT_DIR) else '') or EXPORT_FOLDER
         style_path = STYLE_PATH
@@ -271,7 +388,8 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
         self.post_processors = []
 
         if export_enabled and run_mode != 0:
-            feedback.pushInfo("Export is only done in 'Overlaps and Gaps' mode - skipped.")
+            feedback.pushInfo("Export is only done in '%s' mode - skipped."
+                              % RUN_MODE_LABELS[0])
             export_enabled = False
         if export_enabled and not os.path.exists(export_folder):
             try:
@@ -281,10 +399,17 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
                 feedback.reportError(f"Could not create directory {export_folder}: {e}")
                 export_enabled = False
 
+        if run_mode == DISPUTED_MODE and not include_disputed:
+            raise QgsProcessingException(
+                "'%s' needs 'Include Disputed Areas' ticked." % RUN_MODE_LABELS[DISPUTED_MODE])
+
         run_overlaps = run_mode in (0, 1)
         run_gaps = run_mode in (0, 2)
+        run_disputed = include_disputed and run_mode in (0, DISPUTED_MODE)
 
-        feedback.pushInfo(f'Processing... Mode: {["Both", "Overlaps Only", "Gaps Only"][run_mode]}')
+        feedback.pushInfo('Processing... Mode: ' + RUN_MODE_LABELS[run_mode]
+                          + (' (Disputed Areas included)' if include_disputed
+                             else ' (Disputed Areas ignored)'))
 
         if not bgy_list:
             raise QgsProcessingException("Barangay Polygon Layer(s) must be selected.")
@@ -381,11 +506,14 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
             else:
                 feedback.reportError(f"Unexpected type for {layer_name}: {type(target)}")
 
-        def build_pair_layer(groups, src_crs):
+        def build_pair_layer(groups, src_crs, single_row=False):
             """groups: [(geometry in src_crs, piece_attrs, [area_attrs, ...])].
             Writes one row per ordered pair of involved areas (A->B and B->A):
             "this area" and the "other area" the overlap/gap is shared with.
-            A piece with a single involved area gets one row with no other area."""
+            A piece with a single involved area gets one row with no other area.
+            single_row=True (disputed areas): one row per piece instead, carrying the
+            first involved area (the disputed polygon itself) and the level across all
+            of them - the whole polygon is the case, so pair rows would only repeat it."""
             xform = QgsCoordinateTransform(src_crs, QgsCoordinateReferenceSystem('EPSG:4326'),
                                            context.transformContext())
             out = QgsVectorLayer("Polygon?crs=EPSG:4326", "pairs", "memory")
@@ -396,22 +524,37 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
             feats = []
             for geom, piece, areas in groups:
                 area, bldg = piece['mbi_area'], piece['num_bldg_pts']
-                # Drop slivers (<= 0.1 sq.m. with no buildings)
-                if area is not None and bldg is not None and 0 <= area <= 0.1 and bldg == 0:
+                # Drop slivers (<= 0.1 sq.m. with no buildings). A disputed area is a
+                # whole barangay polygon declared contested, so it is never a sliver.
+                if (not single_row and area is not None and bldg is not None
+                        and 0 <= area <= 0.1 and bldg == 0):
                     continue
-                areas = [a for a in areas if a['geocode'] is not None]
+                if single_row:
+                    # areas[0] is the disputed polygon itself - it stays the row's own
+                    # area even when it carries no geocode of its own.
+                    areas = unique_areas(areas)
+                else:
+                    areas = unique_areas([a for a in areas if a['geocode'] is not None])
                 if not areas:
                     continue
                 g = QgsGeometry(geom)
                 g.transform(xform)
                 case = {
                     'case_uuid': piece['gmd_uuid'],
-                    'involved_areas': ','.join(a['geocode'] for a in areas),
+                    'involved_areas': ','.join(a['geocode'] or '' for a in areas),
                     'involved_bgys': ';'.join(f"{a['barangay'] or ''}, {a['city_mun'] or ''}" for a in areas),
                     'count_involved_areas': len(areas),
                     'num_bldg_pts': bldg,
                     'est_hhcount': piece['est_hhcount'],
                 }
+                if single_row:
+                    row = dict(case, **areas[0])
+                    row['mbi_level'] = group_level(areas)
+                    f = QgsFeature(out.fields())
+                    f.setGeometry(g)
+                    f.setAttributes([row[n] for n, _ in PAIR_FIELDS])
+                    feats.append(f)
+                    continue
                 pairs = []
                 for a, b in combinations(areas, 2):
                     pairs += [(a, b), (b, a)]
@@ -475,6 +618,60 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
 
         overlap_out = None
         gap_out = None
+        disputed_out = None
+        bgy_parts = None             # reprojected_bgy exploded into single parts
+
+        def barangay_parts():
+            """The barangay polygons as single parts - built once, reused by the
+            overlap and the disputed pass (exploding them twice is expensive)."""
+            nonlocal bgy_parts
+            if bgy_parts is None:
+                bgy_parts = processing.run("native:multiparttosingleparts", {
+                    'INPUT': reprojected_bgy, 'OUTPUT': 'memory:'
+                }, context=context, feedback=feedback)['OUTPUT']
+            return bgy_parts
+
+        # --- Disputed areas (boundary = Contested) ---
+        boundary_field = resolve_field(bgy_layer, DISPUTED_FIELD)
+        has_boundary = boundary_field is not None
+        disputed_src = None          # input-CRS copy of the disputed polygons
+        disputed_count = 0
+        if not has_boundary:
+            if include_disputed:
+                feedback.pushWarning(
+                    f"No '{DISPUTED_FIELD}' field in the barangay layer(s) - disputed areas "
+                    "are not detected and nothing is kept out of the gaps.")
+            else:
+                feedback.pushInfo(f"No '{DISPUTED_FIELD}' field in the barangay layer(s) - "
+                                  "no contested polygon to ignore.")
+        else:
+            disputed_src = processing.run("native:extractbyexpression", {
+                'INPUT': bgy_layer, 'EXPRESSION': disputed_expression(boundary_field),
+                'OUTPUT': 'memory:'
+            }, context=context, feedback=feedback)['OUTPUT']
+            disputed_count = disputed_src.featureCount()
+            feedback.pushInfo(f"{disputed_count:,} disputed ({boundary_field} = "
+                              f"{DISPUTED_VALUE.title()}) polygon(s) found.")
+
+            if not include_disputed and disputed_count:
+                # 'Include Disputed Areas' is off: take the contested polygons out of
+                # both working layers, so everything below runs as if they were never
+                # digitised (the ground they cover can therefore come out as a gap).
+                keep_expr = not_disputed_expression(boundary_field)
+                bgy_layer = processing.run("native:extractbyexpression", {
+                    'INPUT': bgy_layer, 'EXPRESSION': keep_expr, 'OUTPUT': 'memory:'
+                }, context=context, feedback=feedback)['OUTPUT']
+                reprojected_bgy = processing.run("native:extractbyexpression", {
+                    'INPUT': reprojected_bgy, 'EXPRESSION': keep_expr, 'OUTPUT': 'memory:'
+                }, context=context, feedback=feedback)['OUTPUT']
+                feedback.pushInfo(f"'Include Disputed Areas' is off - {disputed_count:,} "
+                                  "contested polygon(s) removed from the check.")
+                disputed_src = None
+                disputed_count = 0
+                if not bgy_layer.featureCount():
+                    raise QgsProcessingException(
+                        "Every barangay polygon is Contested, so nothing is left to check. "
+                        "Tick 'Include Disputed Areas' to report them.")
 
         # --- OVERLAPS ---
         if run_overlaps:
@@ -482,9 +679,7 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
             progress_end = 100 if run_mode == 1 else 55
             feedback.setProgress(12)
 
-            singlepart_sf = processing.run("native:multiparttosingleparts", {
-                'INPUT': reprojected_bgy, 'OUTPUT': 'memory:'
-            }, context=context, feedback=feedback)['OUTPUT']
+            singlepart_sf = barangay_parts()
             if feedback.isCanceled():
                 return {}
             feedback.setProgress(20)
@@ -554,13 +749,97 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
                 export_layer(overlap_out, 'Overlaps')
             feedback.setProgress(progress_end)
 
+        # --- DISPUTED AREAS ---
+        if run_disputed and has_boundary and disputed_count:
+            QgsMessageLog.logMessage("Starting Disputed Areas Analysis...")
+            feedback.setProgress(10 if run_mode == 3 else 56)
+
+            disputed_parts = barangay_parts()
+            if feedback.isCanceled():
+                return {}
+
+            d_fields = QgsFields()
+            d_fields.append(QgsField('ID1', QVariant.Int))
+            d_fields.append(QgsField('ID2', QVariant.Int))
+
+            d_geom_by_fid, d_area_by_fid, d_fids = {}, {}, []
+            d_index = QgsSpatialIndex()
+            for f in disputed_parts.getFeatures():
+                if not f.hasGeometry() or f.geometry().isEmpty():
+                    continue
+                d_geom_by_fid[f.id()] = QgsGeometry(f.geometry())
+                d_area_by_fid[f.id()] = area_attrs(f)
+                d_index.addFeature(f)
+                if is_disputed(f, boundary_field):
+                    d_fids.append(f.id())
+
+            if not d_fids:
+                feedback.pushInfo("Disputed check finished: no disputed polygon with geometry.")
+            else:
+                disputed_sf = QgsVectorLayer("Polygon?crs=EPSG:3857", "temporary_disputed", "memory")
+                disputed_sf.dataProvider().addAttributes(d_fields)
+                disputed_sf.updateFields()
+                d_feats = []
+                for fid in d_fids:
+                    f = QgsFeature(d_fields)
+                    f.setGeometry(d_geom_by_fid[fid])
+                    f.setAttributes([fid, fid])
+                    d_feats.append(f)
+                disputed_sf.dataProvider().addFeatures(d_feats)
+                disputed_sf.updateExtents()
+
+                count_bldg_disputed_sf = with_uuid_and_size(disputed_sf, keep_ids=True)
+                if feedback.isCanceled():
+                    return {}
+                feedback.setProgress(60 if run_mode == 3 else 58)
+
+                # Involved areas: the disputed polygon itself plus every barangay polygon
+                # within DISPUTED_NEAR_M of it, so the barangays laying claim are listed.
+                disputed_groups = []
+                for f in count_bldg_disputed_sf.getFeatures():
+                    if feedback.isCanceled():
+                        return {}
+                    fid = f['ID1']
+                    geom = f.geometry()
+                    # EPSG:3857 stretches distances away from the equator, so the
+                    # buffer is widened to stay DISPUTED_NEAR_M real metres.
+                    search = geom.buffer(DISPUTED_NEAR_M * webmerc_metre(geom), 5)
+                    areas, seen = [], set()
+                    if fid in d_area_by_fid:
+                        areas.append(d_area_by_fid[fid])
+                        seen.add(fid)
+                    for other in d_index.intersects(search.boundingBox()):
+                        if other in seen or other not in d_geom_by_fid:
+                            continue
+                        if not search.intersects(d_geom_by_fid[other]):
+                            continue
+                        seen.add(other)
+                        areas.append(d_area_by_fid[other])
+                    disputed_groups.append((geom, piece_attrs(f), areas))
+
+                feedback.pushInfo("Writing Disputed Areas Layer")
+                disputed_out = build_pair_layer(disputed_groups, count_bldg_disputed_sf.crs(),
+                                                single_row=True)
+                export_layer(disputed_out, 'Disputed Areas')
+            feedback.setProgress(95 if run_mode == 3 else 59)
+
         # --- GAPS ---
         if run_gaps:
             QgsMessageLog.logMessage("Starting Gaps Analysis...")
             feedback.setProgress(10 if run_mode == 2 else 60)
 
+            # Disputed polygons are left out of the dissolve and their footprint is
+            # subtracted below, so a disputed area is never reported as a gap as well.
+            gap_src = bgy_layer
+            if has_boundary and disputed_count:
+                gap_src = processing.run("native:extractbyexpression", {
+                    'INPUT': bgy_layer, 'EXPRESSION': not_disputed_expression(boundary_field),
+                    'OUTPUT': 'memory:'
+                }, context=context, feedback=feedback)['OUTPUT']
+                feedback.pushInfo(f"{disputed_count:,} disputed polygon(s) kept out of the gaps.")
+
             dissolved_bgy_sf = processing.run("native:dissolve", {
-                'FIELD': '', 'INPUT': bgy_layer, 'OUTPUT': 'memory:', 'SEPARATE_DISJOINT': False
+                'FIELD': '', 'INPUT': gap_src, 'OUTPUT': 'memory:', 'SEPARATE_DISJOINT': False
             }, context=context, feedback=feedback)['OUTPUT']
             if feedback.isCanceled():
                 return {}
@@ -583,6 +862,13 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
             }, context=context, feedback=feedback)['OUTPUT']
             if feedback.isCanceled():
                 return {}
+
+            if has_boundary and disputed_count:
+                difference_bgy_sf = processing.run("native:difference", {
+                    'INPUT': difference_bgy_sf, 'OVERLAY': disputed_src, 'OUTPUT': 'memory:'
+                }, context=context, feedback=feedback)['OUTPUT']
+                if feedback.isCanceled():
+                    return {}
 
             multi_to_single_sf = processing.run("native:multiparttosingleparts", {
                 'INPUT': difference_bgy_sf, 'OUTPUT': 'memory:'
@@ -618,6 +904,8 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
                 if feedback.isCanceled():
                     return {}
                 gap_geom = gap.geometry()
+                if gap_geom is None or gap_geom.isEmpty():
+                    continue
                 touching, sharing_edge = [], []
                 for fid in bgy_index.intersects(gap_geom.boundingBox()):
                     bgy_geom = bgy_by_fid[fid].geometry()
@@ -637,27 +925,38 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
             export_layer(gap_out, 'Gaps')
             feedback.setProgress(96)
 
-        # --- EXPORT (Overlaps and Gaps mode) ---
+        # --- EXPORT (first mode only) ---
         if export_enabled:
-            self._export_merged(overlap_out, gap_out, export_folder, timestamp, context, feedback)
+            scope = ','.join(['Gap', 'Overlap'] + (['Disputed'] if include_disputed else []))
+            self._export_merged(overlap_out, gap_out, disputed_out, export_folder, timestamp,
+                                context, feedback, scope)
 
         feedback.setProgress(100)
         return {}
 
-    def _export_merged(self, overlap_layer, gap_layer, export_folder, timestamp, context, feedback):
-        """Merge Overlaps + Gaps (with mbi_type / mbi_status fields) and write one GPKG per
+    def _export_merged(self, overlap_layer, gap_layer, disputed_layer, export_folder, timestamp,
+                       context, feedback, scope='Gap,Overlap'):
+        """Merge Overlaps + Gaps + Disputed (with mbi_type / mbi_status fields) and write one GPKG per
         province (<code>_<Province>_mbi.gpkg), then load them."""
 
         def mbi_extras(mbi_type):
+            # A Disputed area is pending by definition; a gap / overlap only when the
+            # barangays involved are in different regions or provinces.
+            status = ("'2_Pending'" if mbi_type == 'Disputed' else
+                      "CASE WHEN \"mbi_level\" IN ('1_Inter-Region', '2_Inter-Province') "
+                      "THEN '2_Pending' END")
             return [
                 ('mbi_type', f"'{mbi_type}'"),
-                ('mbi_status',
-                 "CASE WHEN \"mbi_level\" IN ('1_Inter-Region', '2_Inter-Province') THEN '2_Pending' END"),
+                ('mbi_status', status),
                 ('mbi_remarks', 'NULL'),
+                # What this run looked for - so a reader can tell an MBI type that was
+                # never checked from one that was checked and not found.
+                (SCOPE_FIELD, f"'{scope}'"),
             ]
 
         parts = []
-        for layer, mbi_type in ((overlap_layer, 'Overlap'), (gap_layer, 'Gap')):
+        for layer, mbi_type in ((overlap_layer, 'Overlap'), (gap_layer, 'Gap'),
+                                (disputed_layer, 'Disputed')):
             if layer is None or layer.featureCount() == 0:
                 continue
             parts.append(processing.run("native:refactorfields", {
@@ -665,7 +964,7 @@ class NationalMBIChecker(QgsProcessingAlgorithm):
                 'FIELDS_MAPPING': pair_field_mapping(mbi_extras(mbi_type))
             }, context=context, feedback=feedback)['OUTPUT'])
         if not parts:
-            feedback.pushInfo("No gaps or overlaps found - nothing to export.")
+            feedback.pushInfo("No gaps, overlaps or disputed areas found - nothing to export.")
             return
 
         merged = processing.run("native:mergevectorlayers", {
@@ -755,7 +1054,8 @@ def load_results(context):
         print(f"Loaded layer: {details.name} ({layer.featureCount()} features)")
 
 
-def run_national_mbi_checker(bgy_layers=None, bldg_layers=None, run_mode=None, export=None, export_dir=None):
+def run_national_mbi_checker(bgy_layers=None, bldg_layers=None, run_mode=None, export=None,
+                            export_dir=None, include_disputed=None):
     """Run without a dialog (layer objects, or the CONFIG layer names when not given)."""
     if bgy_layers is None:
         bgy_layers = _resolve_layers(BGY_LAYER_NAMES, QgsWkbTypes.PolygonGeometry, 'Barangay polygon')
@@ -777,6 +1077,8 @@ def run_national_mbi_checker(bgy_layers=None, bldg_layers=None, run_mode=None, e
     params = {
         'INPUT1': bgy_layers,
         'INPUT2': bldg_layers,
+        'INCLUDE_DISPUTED': (INCLUDE_DISPUTED if include_disputed is None
+                             else include_disputed),
         'RUN_MODE': RUN_MODE if run_mode is None else run_mode,
         'EXPORT_MBI': EXPORT_MBI if export is None else export,
         'EXPORT_DIR': export_dir or EXPORT_FOLDER,

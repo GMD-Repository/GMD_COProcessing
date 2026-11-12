@@ -11,7 +11,7 @@ to your data (the rules, thresholds and matching keys it uses).
 | Tool | Script | What it does |
 |------|--------|--------------|
 | [EA MBI Checker](tools/EA_topochecker.md) | `EA_topochecker.py` | Finds gaps and overlaps between EA polygons and counts the buildings inside each |
-| [National-Level MBI Checker](tools/national_mbi_checker.md) | `national_mbi_checker.py` | Finds gaps and overlaps between barangay polygons (up to national scale), with the MBI level of each pair |
+| [National-Level MBI Checker](tools/national_mbi_checker.md) | `national_mbi_checker.py` | Finds gaps, overlaps and disputed areas between barangay polygons (up to national scale), with the MBI level of each pair |
 | [EA vs Barangay Check](tools/ea_versus_bgy.md) | `ea_versus_bgy.py` | Compares EAs with their barangay (or barangays / EAs with each other) and snaps the mismatches |
 | [MBI Barangay Selector](tools/mbi_bgy_selector.md) | `mbi_bgy_selector.py` | Counter-checks the remaining MBIs and chooses the barangay that covers each one |
 | [MBI EA Selector](tools/mbi_ea_selector.md) | `mbi_ea_selector.py` | Chooses the EA that covers each MBI inside its covering barangay, and writes the coverage status |
