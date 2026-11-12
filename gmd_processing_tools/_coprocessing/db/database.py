@@ -4239,10 +4239,17 @@ class POPCENDatabase:
 
             return len(updates)
 
-    def run_gpkg_consistency_checks(self, check_popcen: bool = True, progress_callback=None) -> Dict[str, Any]:
+    def run_gpkg_consistency_checks(
+        self,
+        check_popcen: bool = True,
+        city_mun_code: Optional[str] = None,
+        progress_callback=None
+    ) -> Dict[str, Any]:
         """
         Executes multi-file consistency, overlap, multipart, and attribute duplication analysis,
         and evaluates the 13 official GeoPackage Completeness & Consistency validation rules.
+        If city_mun_code is provided (5-digit pppmm), only records belonging to that
+        city/municipality are validated.
         """
         results = {
             "total_checked": 0,
@@ -4266,7 +4273,15 @@ class POPCENDatabase:
         try:
             with self._get_earf_connection() as earf_conn:
                 earf_cur = earf_conn.cursor()
-                earf_cur.execute("SELECT * FROM earf_records")
+                if city_mun_code:
+                    p_code = city_mun_code[:3] if len(city_mun_code) >= 3 else city_mun_code
+                    m_code = city_mun_code[3:5] if len(city_mun_code) >= 5 else ""
+                    earf_cur.execute(
+                        "SELECT * FROM earf_records WHERE SUBSTR(geocode, 1, 5) = ? OR (prov = ? AND mun = ?)",
+                        (city_mun_code, p_code, m_code)
+                    )
+                else:
+                    earf_cur.execute("SELECT * FROM earf_records")
                 cols = [d[0] for d in earf_cur.description]
                 earf_rows = [dict(zip(cols, r)) for r in earf_cur.fetchall()]
         except Exception:
@@ -4278,7 +4293,13 @@ class POPCENDatabase:
             try:
                 with self._get_connection() as pop_conn:
                     pop_cur = pop_conn.cursor()
-                    pop_cur.execute("SELECT * FROM popcen_records")
+                    if city_mun_code:
+                        pop_cur.execute(
+                            "SELECT * FROM popcen_records WHERE SUBSTR(geocode, 1, 5) = ?",
+                            (city_mun_code,)
+                        )
+                    else:
+                        pop_cur.execute("SELECT * FROM popcen_records")
                     cols = [d[0] for d in pop_cur.description]
                     popcen_rows = [dict(zip(cols, r)) for r in pop_cur.fetchall()]
             except Exception:
@@ -4286,17 +4307,29 @@ class POPCENDatabase:
 
         with self._get_gpkg_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM gpkg_records")
-            total = cur.fetchone()[0]
-            if total == 0:
-                return results
+            if city_mun_code:
+                cur.execute("SELECT COUNT(*) FROM gpkg_records WHERE SUBSTR(geocode, 1, 5) = ?", (city_mun_code,))
+                total = cur.fetchone()[0]
+                if total == 0:
+                    return results
 
-            results["total_checked"] = total
-            if progress_callback:
-                progress_callback(10, f"Evaluating consistency across {total:,} GPKG records...")
+                results["total_checked"] = total
+                if progress_callback:
+                    progress_callback(10, f"Evaluating consistency across {total:,} GPKG records...")
 
-            # 1. Fetch all rows
-            cur.execute("SELECT * FROM gpkg_records")
+                cur.execute("SELECT * FROM gpkg_records WHERE SUBSTR(geocode, 1, 5) = ?", (city_mun_code,))
+            else:
+                cur.execute("SELECT COUNT(*) FROM gpkg_records")
+                total = cur.fetchone()[0]
+                if total == 0:
+                    return results
+
+                results["total_checked"] = total
+                if progress_callback:
+                    progress_callback(10, f"Evaluating consistency across {total:,} GPKG records...")
+
+                cur.execute("SELECT * FROM gpkg_records")
+
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
 
@@ -4434,13 +4467,136 @@ class POPCENDatabase:
 
         return results
 
-    def export_gpkg_validation_excel(self, output_path: str, progress_callback=None) -> str:
+    def export_gpkg_validation_excel(
+        self,
+        output_path: str,
+        city_mun_code: Optional[str] = None,
+        progress_callback=None
+    ) -> str:
         """
         Runs GeoPackage validation checks and exports the official multi-sheet Excel report
         (Summary + Sheets 2–14 per validation_id) matching the Google Spreadsheet specifications.
+        If city_mun_code is provided, filters records strictly to that city/municipality.
         """
-        val_results = self.run_gpkg_consistency_checks(check_popcen=True, progress_callback=progress_callback)
+        val_results = self.run_gpkg_consistency_checks(
+            check_popcen=True,
+            city_mun_code=city_mun_code,
+            progress_callback=progress_callback
+        )
         return generate_gpkg_validation_excel_report(output_path, val_results)
+
+    def get_gpkg_uploaded_citymuns(self) -> List[Dict[str, str]]:
+        """
+        Retrieves the list of uploaded city/municipalities in gpkg_records.
+        Returns list of dicts with:
+          - 'code': 5-digit pppmm code (e.g. '80601')
+          - 'pppmm': 5-digit code
+          - 'prov': 3-digit province code (e.g. '806')
+          - 'mun': 2-digit municipality code (e.g. '01')
+          - 'name': city/municipality name (e.g. 'Tondo I and II')
+          - 'clean_name': sanitized for filename (e.g. 'Tondo_I_and_II')
+          - 'filename': e.g. '80601_prelimEARF_val_Tondo_I_and_II.xlsx'
+          - 'display': '80601 - Tondo I and II'
+        """
+        if not self.is_gpkg_populated():
+            return []
+
+        with self._get_gpkg_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT SUBSTR(geocode, 1, 5) 
+                FROM gpkg_records 
+                WHERE geocode IS NOT NULL 
+                  AND LENGTH(geocode) >= 5 
+                  AND SUBSTR(geocode, 4, 2) != '00'
+                ORDER BY SUBSTR(geocode, 1, 5)
+            """)
+            codes = [str(r[0]).strip() for r in cur.fetchall() if r[0]]
+
+        if not codes:
+            return []
+
+        citymuns_list = []
+        for pppmm in codes:
+            p_str = pppmm[:3]
+            m_str = pppmm[3:5]
+
+            # 1. Check POPCEN database first (official PSGC standard naming & casing)
+            mun_name = ""
+            if self.is_populated():
+                try:
+                    with self._get_connection() as pop_conn:
+                        pop_cur = pop_conn.cursor()
+                        pop_cur.execute("""
+                            SELECT areaname 
+                            FROM popcen_records 
+                            WHERE SUBSTR(geocode, 1, 5) = ? 
+                              AND geographic_level LIKE '%3 - City%'
+                            LIMIT 1
+                        """, (pppmm,))
+                        row_pop = pop_cur.fetchone()
+                        if row_pop and row_pop[0]:
+                            mun_name = str(row_pop[0]).strip()
+                except Exception:
+                    pass
+
+            # 2. Check gpkg_records
+            if not mun_name:
+                with self._get_gpkg_connection() as g_conn:
+                    g_cur = g_conn.cursor()
+                    g_cur.execute("""
+                        SELECT city_mun 
+                        FROM gpkg_records 
+                        WHERE SUBSTR(geocode, 1, 5) = ? 
+                          AND city_mun IS NOT NULL AND TRIM(city_mun) != ''
+                        LIMIT 1
+                    """, (pppmm,))
+                    row_g = g_cur.fetchone()
+                    if row_g and row_g[0]:
+                        mun_name = str(row_g[0]).strip()
+
+            # 3. Check earf_records
+            if not mun_name and self.is_earf_populated():
+                try:
+                    with self._get_earf_connection() as earf_conn:
+                        earf_cur = earf_conn.cursor()
+                        earf_cur.execute("""
+                            SELECT areaname 
+                            FROM earf_records 
+                            WHERE prov = ? AND mun = ? 
+                              AND (brgy = '000' OR SUBSTR(geocode, 6, 3) = '000')
+                              AND areaname IS NOT NULL AND TRIM(areaname) != ''
+                            LIMIT 1
+                        """, (p_str, m_str))
+                        row_earf = earf_cur.fetchone()
+                        if row_earf and row_earf[0]:
+                            raw_name = str(row_earf[0]).strip()
+                            mun_name = raw_name.title() if raw_name.isupper() else raw_name
+                except Exception:
+                    pass
+
+            if not mun_name:
+                mun_name = f"CityMun_{pppmm}"
+
+            clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
+            clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_')
+            if not clean_cm:
+                clean_cm = f"CityMun_{pppmm}"
+
+            filename = f"{pppmm}_prelimEARF_val_{clean_cm}.xlsx"
+
+            citymuns_list.append({
+                "code": pppmm,
+                "pppmm": pppmm,
+                "prov": p_str,
+                "mun": m_str,
+                "name": mun_name,
+                "clean_name": clean_cm,
+                "filename": filename,
+                "display": f"{pppmm} - {mun_name}",
+            })
+
+        return citymuns_list
 
     def _build_gpkg_where_clause(
         self,
