@@ -3742,60 +3742,144 @@ class COProcessingDialog(QDialog):
             self._start_deliverables_export(tasks, is_batch=True, post_action_ask_canvas=False)
 
     def _export_output_summary_excel(self):
-        """Exports formal Output Summary Excel report (.xlsx) with 2 sheets: Output Summary & Validation Flags."""
+        """Exports formal Output Summary Excel report (.xlsx) per citymunicipality with naming convention <pppmm>_<citymun name>_summary."""
         cm = getattr(self, "cmb_match_citymun_filter", None)
         selected_cm = cm.currentData() if cm else None
         flag_val = getattr(self, "cmb_match_flag_filter", None)
         selected_flag = flag_val.currentText() if flag_val else None
 
-        default_name = "Output_Summary_Report.xlsx"
+        export_dir = self.txt_match_export_dir.text().strip() if hasattr(self, "txt_match_export_dir") else ""
+        root_dir = getattr(self, "_final_export_root_dir", None) or DEFAULT_FINAL_EXPORT_ROOT
+        if not os.path.exists(root_dir):
+            if export_dir and os.path.exists(export_dir):
+                root_dir = export_dir
+            else:
+                root_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+
+        # Case 1: A specific City/Municipality is selected in the filter
         if selected_cm:
-            pppmm = selected_cm[:5] if len(selected_cm) >= 5 else selected_cm
-            mun_name = cm.currentText()
+            target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, selected_cm)
+            if not target_folder:
+                target_folder = export_dir if (export_dir and os.path.exists(export_dir)) else root_dir
+            os.makedirs(target_folder, exist_ok=True)
+
+            mun_name = hier.get("city_mun") or cm.currentText()
             clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
             clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
-            if clean_cm:
-                default_name = f"{pppmm}_output_summary_{clean_cm}.xlsx"
+            if not clean_cm:
+                clean_cm = "citymun"
+            pppmm = selected_cm[:5] if len(selected_cm) >= 5 else selected_cm
+            default_name = f"{pppmm}_{clean_cm}_summary.xlsx"
+            default_path = os.path.join(target_folder, default_name)
 
-        f, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Output Summary & Validation Flags",
-            default_name,
-            "Excel Workbook (*.xlsx)"
-        )
-        if not f:
-            return
-        if not f.lower().endswith(".xlsx"):
-            f += ".xlsx"
+            f, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Output Summary & Validation Flags",
+                default_path,
+                "Excel Workbook (*.xlsx)"
+            )
+            if not f:
+                return
+            if not f.lower().endswith(".xlsx"):
+                f += ".xlsx"
 
-        try:
-            res = self.db.export_output_summary_to_excel(
-                out_excel=f,
-                search=self.search_match.text().strip(),
-                status=self.cmb_match_status_filter.currentText(),
-                ea_lifecycle=self.cmb_match_lifecycle_filter.currentText(),
-                flag_filter=selected_flag,
-                city_mun=selected_cm,
-                metadata={
-                    "municipality": cm.currentText() if cm else "All",
-                    "province": getattr(self, "_active_province", ""),
-                    "region": getattr(self, "_active_region", "")
-                }
+            try:
+                res = self.db.export_output_summary_to_excel(
+                    out_excel=f,
+                    search=self.search_match.text().strip(),
+                    status=self.cmb_match_status_filter.currentText(),
+                    ea_lifecycle=self.cmb_match_lifecycle_filter.currentText(),
+                    flag_filter=selected_flag,
+                    city_mun=selected_cm,
+                    metadata={
+                        "municipality": mun_name,
+                        "province": hier.get("province") or getattr(self, "_active_province", ""),
+                        "region": hier.get("region") or getattr(self, "_active_region", "")
+                    }
+                )
+                if not res or not isinstance(res, dict):
+                    res = {"total_rows": 0, "total_flagged": 0}
+                flagged = res.get("total_flagged", 0)
+                rows = res.get("total_rows", 0)
+                msg = (
+                    f"Successfully exported Output Summary table to:\n{f}\n\n"
+                    f"City/Municipality: {mun_name} ({pppmm})\n"
+                    f"Records Audited: {rows:,}\n"
+                    f"Validation Flags Recorded: {flagged:,}\n\n"
+                    f"Sheet 1: 'Output Summary' (Hierarchical rollups & Flag counts)\n"
+                    f"Sheet 2: 'Validation Flags & Exceptions' (Itemized flag details & corrective notes)"
+                )
+                QMessageBox.information(self, "Export Complete", msg)
+            except Exception as e:
+                QMessageBox.critical(self, "Export Failed", f"Failed to export Output Summary: {e}")
+
+        # Case 2: No specific City/Mun selected -> batch export per City/Municipality
+        else:
+            processed_citymuns = self.db.get_processed_citymuns()
+            if not processed_citymuns:
+                QMessageBox.warning(
+                    self,
+                    "No Processed Records",
+                    "No processed City/Municipality records found in the database to export.\n\n"
+                    "Please ensure matching / reconciliation has been performed first."
+                )
+                return
+
+            reply = QMessageBox.question(
+                self,
+                "Export Output Summary Per City/Municipality",
+                f"No specific City/Municipality is selected in the filter.\n\n"
+                f"Would you like to export Output Summary Excel files for all {len(processed_citymuns)} processed City/Municipalities into their respective folders?\n\n"
+                f"File format: <pppmm>_<citymun name>_summary.xlsx",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
             )
-            if not res or not isinstance(res, dict):
-                res = {"total_rows": 0, "total_flagged": 0}
-            flagged = res.get("total_flagged", 0)
-            rows = res.get("total_rows", 0)
-            msg = (
-                f"Successfully exported Output Summary table to:\n{f}\n\n"
-                f"Records Audited: {rows:,}\n"
-                f"Validation Flags Recorded: {flagged:,}\n\n"
-                f"Sheet 1: 'Output Summary' (Hierarchical rollups & Flag counts)\n"
-                f"Sheet 2: 'Validation Flags & Exceptions' (Itemized flag details & corrective notes)"
-            )
-            QMessageBox.information(self, "Export Complete", msg)
-        except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Failed to export Output Summary: {e}")
+            if reply != QMessageBox.Yes:
+                return
+
+            exported_files = []
+            errors = []
+            for cm_item in processed_citymuns:
+                c_code = cm_item["code"]
+                target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, c_code)
+                if not target_folder:
+                    target_folder = export_dir if (export_dir and os.path.exists(export_dir)) else root_dir
+                os.makedirs(target_folder, exist_ok=True)
+
+                m_name = hier.get("city_mun") or cm_item["name"]
+                clean_cm = re.sub(r'\s*\([^)]*\)', '', m_name)
+                clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
+                if not clean_cm:
+                    clean_cm = "citymun"
+                pppmm = c_code[:5] if len(c_code) >= 5 else c_code
+                out_summary_filename = f"{pppmm}_{clean_cm}_summary.xlsx"
+                out_summary_path = os.path.join(target_folder, out_summary_filename)
+
+                try:
+                    self.db.export_output_summary_to_excel(
+                        out_excel=out_summary_path,
+                        search=self.search_match.text().strip(),
+                        status=self.cmb_match_status_filter.currentText(),
+                        ea_lifecycle=self.cmb_match_lifecycle_filter.currentText(),
+                        flag_filter=selected_flag,
+                        city_mun=c_code,
+                        metadata={
+                            "municipality": m_name,
+                            "province": hier.get("province") or getattr(self, "_active_province", ""),
+                            "region": hier.get("region") or getattr(self, "_active_region", "")
+                        }
+                    )
+                    exported_files.append(out_summary_path)
+                except Exception as ex:
+                    errors.append(f"{m_name} ({pppmm}): {ex}")
+
+            if exported_files:
+                msg = f"Successfully exported Output Summary for {len(exported_files)} City/Municipalities (<pppmm>_<citymun name>_summary.xlsx)."
+                if errors:
+                    msg += f"\n\nEncountered errors in {len(errors)} municipalities:\n" + "\n".join(errors[:5])
+                QMessageBox.information(self, "Export Complete", msg)
+            elif errors:
+                QMessageBox.critical(self, "Export Failed", "Failed to export Output Summaries:\n" + "\n".join(errors[:5]))
 
     def _export_matching_csv(self):
         """Compatibility wrapper forwarding to Output Summary Excel export."""
