@@ -51,6 +51,35 @@ except (ImportError, ValueError):
                     pass
                 return s
 
+try:
+    from ..core.prelim_earf_validator import (
+        VALIDATION_SPECS,
+        VALIDATION_MAP,
+        run_prelim_earf_validations,
+        generate_validation_excel_report,
+    )
+except (ImportError, ValueError):
+    try:
+        from core.prelim_earf_validator import (
+            VALIDATION_SPECS,
+            VALIDATION_MAP,
+            run_prelim_earf_validations,
+            generate_validation_excel_report,
+        )
+    except (ImportError, ValueError):
+        try:
+            from prelim_earf_validator import (
+                VALIDATION_SPECS,
+                VALIDATION_MAP,
+                run_prelim_earf_validations,
+                generate_validation_excel_report,
+            )
+        except (ImportError, ValueError):
+            VALIDATION_SPECS = []
+            VALIDATION_MAP = {}
+            def run_prelim_earf_validations(*args, **kwargs): return {}
+            def generate_validation_excel_report(*args, **kwargs): return ""
+
 
 POPCEN_DB_FILENAME = "popcen_database.db"
 EARF_DB_FILENAME = "earf_database.db"
@@ -3439,13 +3468,12 @@ class POPCENDatabase:
         return len(all_records)
 
     # ----------------------------------------------------------------------
-    # Preliminary EARF Consistency Check Engine
+    # Preliminary EARF Completeness & Consistency Check Engine
     # ----------------------------------------------------------------------
     def run_earf_consistency_checks(self, check_popcen: bool = True, progress_callback=None) -> Dict[str, Any]:
         """
-        Executes focused consistency validation across all records in earf_records:
-          - R1: Geocode format & structure check (14-digit numeric validation & admin segments)
-          - R6: Cross-validation against 2024 POPCEN database (geocode presence)
+        Executes full Completeness & Consistency validation across earf_records
+        evaluating the 13 official validation rules (Sheets 1–14).
         """
         results = {
             "total_checked": 0,
@@ -3455,17 +3483,21 @@ class POPCENDatabase:
             "missing_popcen": 0,
             "invalid_geocodes": 0,
             "pass_rate": 0.0,
+            "summary": [],
+            "issues_by_rule": {},
         }
 
-        # 1. Fetch POPCEN geocodes set if available from popcen_database.db
-        popcen_geocodes = set()
-        popcen_available = False
+        # 1. Fetch POPCEN records if available from popcen_database.db
+        popcen_rows = []
         if check_popcen and self.is_populated():
-            with self._get_connection() as pop_conn:
-                pop_cur = pop_conn.cursor()
-                pop_cur.execute("SELECT geocode FROM popcen_records WHERE geocode IS NOT NULL AND geocode != ''")
-                popcen_geocodes = {r[0] for r in pop_cur.fetchall()}
-                popcen_available = len(popcen_geocodes) > 0
+            try:
+                with self._get_connection() as pop_conn:
+                    pop_cur = pop_conn.cursor()
+                    pop_cur.execute("SELECT * FROM popcen_records")
+                    cols = [d[0] for d in pop_cur.description]
+                    popcen_rows = [dict(zip(cols, r)) for r in pop_cur.fetchall()]
+            except Exception:
+                popcen_rows = []
 
         with self._get_earf_connection() as conn:
             cur = conn.cursor()
@@ -3474,73 +3506,52 @@ class POPCENDatabase:
             if total == 0:
                 return results
 
+            cur.execute("SELECT * FROM earf_records")
+            earf_rows_raw = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            earf_records = [dict(zip(cols, r)) for r in earf_rows_raw]
             results["total_checked"] = total
 
-            # 2. Read all rows for R1 & R6 evaluation
-            cur.execute("""
-                SELECT id, geocode, prov, mun, brgy, ea, areaname
-                FROM earf_records
-            """)
-            rows = cur.fetchall()
+            # Run validator engine
+            val_out = run_prelim_earf_validations(
+                earf_records=earf_records,
+                popcen_records=popcen_rows,
+                progress_callback=progress_callback,
+            )
+
+            stats = val_out.get("stats", {})
+            results["passed"] = stats.get("passed", 0)
+            results["warnings"] = stats.get("warnings", 0)
+            results["errors"] = stats.get("errors", 0)
+            results["pass_rate"] = stats.get("pass_rate", 0.0)
+            results["summary"] = val_out.get("summary", [])
+            results["issues_by_rule"] = val_out.get("issues_by_rule", {})
+            results["missing_popcen"] = len(val_out.get("issues_by_rule", {}).get("earf_missing_geo", []))
+            results["invalid_geocodes"] = len(val_out.get("issues_by_rule", {}).get("inv_new_ean", []))
+
+            # Bulk update earf_records
+            row_status = val_out.get("row_status", {})
+            row_notes = val_out.get("row_notes", {})
 
             updates = []
-            for idx, r in enumerate(rows):
+            for r in earf_records:
                 rec_id = r["id"]
-                gc = str(r["geocode"]).strip() if r["geocode"] else ""
-                prov = str(r["prov"]).strip() if r["prov"] else ""
-                mun = str(r["mun"]).strip() if r["mun"] else ""
-                brgy = str(r["brgy"]).strip() if r["brgy"] else ""
-                ea = str(r["ea"]).strip() if r["ea"] else ""
+                st = row_status.get(rec_id, "PASS")
+                nt = row_notes.get(rec_id, "")
+                updates.append((st, nt, rec_id))
 
-                status = "PASS"
-                notes = []
-
-                # ---- R1: Geocode format & structure (14-digit numeric string) ----
-                is_r1_valid = True
-                if not gc or len(gc) != 14 or not gc.isdigit():
-                    is_r1_valid = False
-                    status = "ERROR"
-                    notes.append("R1: Invalid geocode format (expected 14-digit numeric string)")
-                    results["invalid_geocodes"] += 1
-                elif not (prov and mun and brgy and ea):
-                    is_r1_valid = False
-                    status = "ERROR"
-                    notes.append("R1: Incomplete administrative codes (Prov, Mun, Brgy, or EA missing)")
-                    results["invalid_geocodes"] += 1
-
-                # ---- R6: Cross-validation with POPCEN Database ----
-                if is_r1_valid:
-                    if popcen_available:
-                        if gc not in popcen_geocodes:
-                            status = "WARNING"
-                            notes.append("R6: Geocode not found in 2024 POPCEN database")
-                            results["missing_popcen"] += 1
-                        else:
-                            notes.append("R1 & R6 passed (Valid format & matched in POPCEN)")
-                    else:
-                        notes.append("R1 passed (POPCEN database not loaded to check R6)")
-
-                updates.append((status, "; ".join(notes), rec_id))
-
-                if status == "PASS":
-                    results["passed"] += 1
-                elif status == "WARNING":
-                    results["warnings"] += 1
-                elif status == "ERROR":
-                    results["errors"] += 1
-
-                if progress_callback and idx % 1000 == 0:
-                    pct = int((idx / total) * 100)
-                    if progress_callback(pct, f"Evaluating R1 & R6 consistency ({idx:,} / {total:,})...") is False:
-                        break
-
-            # Bulk update consistency columns
             cur.executemany("UPDATE earf_records SET consistency_status = ?, consistency_notes = ? WHERE id = ?", updates)
             conn.commit()
 
-        results["pass_rate"] = round((results["passed"] / results["total_checked"]) * 100, 1) if results["total_checked"] > 0 else 0.0
-
         return results
+
+    def export_prelim_earf_validation_excel(self, output_path: str, progress_callback=None) -> str:
+        """
+        Runs validations and exports the official multi-sheet Excel report
+        (Summary + Sheets 2-14 per validation_id) matching the Google Spreadsheet specifications.
+        """
+        val_results = self.run_earf_consistency_checks(check_popcen=True, progress_callback=progress_callback)
+        return generate_validation_excel_report(output_path, val_results)
 
     def _build_earf_where_clause(
         self,
@@ -3583,7 +3594,11 @@ class POPCENDatabase:
                 params.append(f"%{ea_type.upper()}%")
 
         if consistency_filter and consistency_filter != "All Records":
-            if "PASS" in consistency_filter:
+            # Check for specific validation rule ID
+            matched_rule = next((spec["id"] for spec in VALIDATION_SPECS if f"[{spec['id']}]" in consistency_filter or consistency_filter.strip().startswith(spec["id"])), None)
+            if matched_rule:
+                conditions.append(f"consistency_notes LIKE '%[{matched_rule}]%'")
+            elif "PASS" in consistency_filter:
                 conditions.append("consistency_status = 'PASS'")
             elif "All Issues" in consistency_filter:
                 conditions.append("consistency_status IN ('WARNING', 'ERROR')")

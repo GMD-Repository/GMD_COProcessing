@@ -18,6 +18,12 @@ from .algorithm import (
     CODE_WIDTHS,
 )
 from .excel_utils import patch_openpyxl
+from .prelim_earf_validator import (
+    VALIDATION_SPECS,
+    VALIDATION_MAP,
+    run_prelim_earf_validations,
+    generate_validation_excel_report,
+)
 
 __all__ = [
     "CoProcessingEarfMatch",
@@ -30,5 +36,9 @@ __all__ = [
     "GPKG_EARF_FIELDS",
     "CODE_WIDTHS",
     "patch_openpyxl",
+    "VALIDATION_SPECS",
+    "VALIDATION_MAP",
+    "run_prelim_earf_validations",
+    "generate_validation_excel_report",
 ]
 

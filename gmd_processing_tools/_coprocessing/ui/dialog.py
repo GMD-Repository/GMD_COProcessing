@@ -4218,11 +4218,17 @@ class COProcessingDialog(QDialog):
         self.btn_consolidate_earf.clicked.connect(self._consolidate_folder_prompt)
         folder_layout.addWidget(self.btn_consolidate_earf)
 
-        self.btn_run_consistency = QPushButton("Run Consistency Check")
+        self.btn_run_consistency = QPushButton("Run Validation Checks")
         self.btn_run_consistency.setObjectName("primaryBtn")
-        self.btn_run_consistency.setToolTip("Run R1 (Geocode Format) & R6 (POPCEN Match) consistency checks across consolidated records")
+        self.btn_run_consistency.setToolTip("Run 13 completeness & consistency validation rules across consolidated EARF records")
         self.btn_run_consistency.clicked.connect(self._run_consistency_check_prompt)
         folder_layout.addWidget(self.btn_run_consistency)
+
+        self.btn_export_validation_excel = QPushButton("Export Validation Report (Excel)")
+        self.btn_export_validation_excel.setObjectName("actionBtn")
+        self.btn_export_validation_excel.setToolTip("Export official multi-sheet Excel validation report (Summary + Sheets 2–14 per validation_id)")
+        self.btn_export_validation_excel.clicked.connect(self._export_earf_validation_excel)
+        folder_layout.addWidget(self.btn_export_validation_excel)
 
         self.btn_earf_stop = QPushButton("Stop")
         self.btn_earf_stop.setObjectName("stopBtn")
@@ -4324,13 +4330,23 @@ class COProcessingDialog(QDialog):
 
         filter_bar.addWidget(QLabel("Consistency:"))
         self.cmb_earf_consistency_filter = QComboBox()
-        self.cmb_earf_consistency_filter.addItems([
+        earf_filter_items = [
             "All Records",
             "Passed (PASS)",
             "All Issues (Warnings & Errors)",
-            "R6: Missing in POPCEN (Warning)",
-            "R1: Invalid Geocode (Error)",
-        ])
+        ]
+        try:
+            from ..core.prelim_earf_validator import VALIDATION_SPECS
+            for spec in VALIDATION_SPECS:
+                earf_filter_items.append(f"[{spec['id']}] {spec['title']}")
+        except Exception:
+            try:
+                from core.prelim_earf_validator import VALIDATION_SPECS
+                for spec in VALIDATION_SPECS:
+                    earf_filter_items.append(f"[{spec['id']}] {spec['title']}")
+            except Exception:
+                pass
+        self.cmb_earf_consistency_filter.addItems(earf_filter_items)
         self.cmb_earf_consistency_filter.currentIndexChanged.connect(self._on_earf_filter_changed)
         filter_bar.addWidget(self.cmb_earf_consistency_filter)
 
@@ -6096,16 +6112,23 @@ class COProcessingDialog(QDialog):
         err_cnt = results.get("errors", 0)
         rate = results.get("pass_rate", 0.0)
 
+        summary = results.get("summary", [])
+        top_issues = [f"  • {s['title']} ({s['validation_id']}): {s['frequency']:,}" for s in summary if s.get("frequency", 0) > 0]
+        issue_str = "\n".join(top_issues) if top_issues else "  • Zero validation issues detected!"
+
         msg = (
-            f"Consistency Check Complete (R1 & R6)!\n\n"
+            f"Completeness & Consistency Check Complete!\n\n"
             f"• Total Records Evaluated: {total:,}\n"
-            f"• Passed (R1 & R6): {passed:,}\n"
-            f"• R6 Warnings (Missing in POPCEN): {warn:,}\n"
-            f"• R1 Errors (Invalid Geocode): {err_cnt:,}\n\n"
-            f"Pass Rate: {rate}%\n\n"
-            "Use the 'Consistency' filter dropdown to isolate records missing in POPCEN or with invalid geocodes."
+            f"• Passed Cleanly: {passed:,}\n"
+            f"• Warning Records: {warn:,}\n"
+            f"• Error Records: {err_cnt:,}\n\n"
+            f"Overall Pass Rate: {rate}%\n\n"
+            f"Rule Inconsistencies Detected:\n{issue_str}\n\n"
+            f"Tips:\n"
+            f"• Use the 'Consistency' dropdown to filter by specific validation rules.\n"
+            f"• Click 'Export Validation Report (Excel)' for the multi-sheet breakdown (Sheets 1–14)."
         )
-        QMessageBox.information(self, "Consistency Results", msg)
+        QMessageBox.information(self, "Validation Results", msg)
 
     def _fetch_and_render_earf_db_page(self):
         search_txt = self.search_earf.text().strip()
@@ -6623,6 +6646,62 @@ class COProcessingDialog(QDialog):
             QMessageBox.information(self, "Export Success", f"Consistency issues report exported to:\n{f}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Export failed:\n{e}")
+
+    def _export_earf_validation_excel(self):
+        """Exports the official multi-sheet Excel validation report (Summary + Sheets 2–14)."""
+        if self.cmb_earf_source_mode.currentIndex() != 0:
+            QMessageBox.information(
+                self,
+                "Database Mode Required",
+                "Please switch to 'Consolidated Database (SQLite: earf_database.db)' mode to export validation reports."
+            )
+            return
+
+        count = self.db.earf_record_count()
+        if count == 0:
+            QMessageBox.warning(self, "No Records", "No Preliminary EARF records found in the database.")
+            return
+
+        f, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Completeness & Consistency Validation Report",
+            "prelim_earf_validation_report.xlsx",
+            "Excel Files (*.xlsx)"
+        )
+        if not f:
+            return
+
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            if self.progress_bar:
+                self.progress_bar.setValue(10)
+            self.lbl_earf_table_info.setText("Generating multi-sheet Excel validation report...")
+
+            out_path = self.db.export_prelim_earf_validation_excel(
+                f,
+                progress_callback=lambda p, m: ((self.progress_bar.setValue(p) if self.progress_bar else None), self.lbl_earf_table_info.setText(m))
+            )
+
+            if self.progress_bar:
+                self.progress_bar.setValue(100)
+            self.lbl_earf_table_info.setText(f"Validation report exported: {os.path.basename(out_path)}")
+            QApplication.restoreOverrideCursor()
+
+            # Refresh table display with newly saved consistency tags
+            self._fetch_and_render_earf_db_page()
+
+            QMessageBox.information(
+                self,
+                "Export Success",
+                f"Official Completeness & Consistency Validation Report successfully generated!\n\n"
+                f"File: {out_path}\n\n"
+                f"Includes:\n"
+                f" • Sheet 1: Summary (List of Inconsistencies & Frequencies)\n"
+                f" • Sheets 2–14: Individual validation tables per validation_id"
+            )
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Export Error", f"Failed to generate validation report:\n{e}")
 
     # ----------------------------------------------------------------------
     # Preliminary EARF Record Selection & Removal Logic
