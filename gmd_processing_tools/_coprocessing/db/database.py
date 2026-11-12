@@ -80,6 +80,35 @@ except (ImportError, ValueError):
             def run_prelim_earf_validations(*args, **kwargs): return {}
             def generate_validation_excel_report(*args, **kwargs): return ""
 
+try:
+    from ..core.gpkg_validator import (
+        GPKG_VALIDATION_SPECS,
+        GPKG_VALIDATION_MAP,
+        run_gpkg_validations,
+        generate_gpkg_validation_excel_report,
+    )
+except (ImportError, ValueError):
+    try:
+        from core.gpkg_validator import (
+            GPKG_VALIDATION_SPECS,
+            GPKG_VALIDATION_MAP,
+            run_gpkg_validations,
+            generate_gpkg_validation_excel_report,
+        )
+    except (ImportError, ValueError):
+        try:
+            from gpkg_validator import (
+                GPKG_VALIDATION_SPECS,
+                GPKG_VALIDATION_MAP,
+                run_gpkg_validations,
+                generate_gpkg_validation_excel_report,
+            )
+        except (ImportError, ValueError):
+            GPKG_VALIDATION_SPECS = []
+            GPKG_VALIDATION_MAP = {}
+            def run_gpkg_validations(*args, **kwargs): return {}
+            def generate_gpkg_validation_excel_report(*args, **kwargs): return ""
+
 
 POPCEN_DB_FILENAME = "popcen_database.db"
 EARF_DB_FILENAME = "earf_database.db"
@@ -4052,8 +4081,8 @@ class POPCENDatabase:
 
     def run_gpkg_consistency_checks(self, check_popcen: bool = True, progress_callback=None) -> Dict[str, Any]:
         """
-        Executes multi-file consistency, overlap, multipart, and attribute duplication analysis
-        across all records currently stored in gpkg_records, updating their consistency statuses.
+        Executes multi-file consistency, overlap, multipart, and attribute duplication analysis,
+        and evaluates the 13 official GeoPackage Completeness & Consistency validation rules.
         """
         results = {
             "total_checked": 0,
@@ -4064,7 +4093,36 @@ class POPCENDatabase:
             "missing_geometry": 0,
             "invalid_geocodes": 0,
             "status_level": "CLEAN",
+            "passed": 0,
+            "warnings": 0,
+            "errors": 0,
+            "pass_rate": 0.0,
+            "summary": [],
+            "issues_by_rule": {},
         }
+
+        # 1. Fetch Prelim EARF records for cross-validation rule: missing_geo
+        earf_rows = []
+        try:
+            with self._get_earf_connection() as earf_conn:
+                earf_cur = earf_conn.cursor()
+                earf_cur.execute("SELECT * FROM earf_records")
+                cols = [d[0] for d in earf_cur.description]
+                earf_rows = [dict(zip(cols, r)) for r in earf_cur.fetchall()]
+        except Exception:
+            earf_rows = []
+
+        # 2. Fetch POPCEN records if available
+        popcen_rows = []
+        if check_popcen and self.is_populated():
+            try:
+                with self._get_connection() as pop_conn:
+                    pop_cur = pop_conn.cursor()
+                    pop_cur.execute("SELECT * FROM popcen_records")
+                    cols = [d[0] for d in pop_cur.description]
+                    popcen_rows = [dict(zip(cols, r)) for r in pop_cur.fetchall()]
+            except Exception:
+                popcen_rows = []
 
         with self._get_gpkg_connection() as conn:
             cur = conn.cursor()
@@ -4078,12 +4136,25 @@ class POPCENDatabase:
                 progress_callback(10, f"Evaluating consistency across {total:,} GPKG records...")
 
             # 1. Fetch all rows
-            cur.execute("""
-                SELECT id, geocode, layer_source, source_file, geom_status, ea_type,
-                       region, province, city_mun, barangay, ean, hh_count, bldg_count
-                FROM gpkg_records
-            """)
-            rows = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT * FROM gpkg_records")
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # Run 13-rule GeoPackage validator
+            val_out = run_gpkg_validations(
+                gpkg_records=rows,
+                earf_records=earf_rows,
+                popcen_records=popcen_rows,
+                progress_callback=lambda p, m: progress_callback(10 + int(p * 0.4), m) if progress_callback else None,
+            )
+
+            stats = val_out.get("stats", {})
+            results["passed"] = stats.get("passed", 0)
+            results["warnings"] = stats.get("warnings", 0)
+            results["errors"] = stats.get("errors", 0)
+            results["pass_rate"] = stats.get("pass_rate", 0.0)
+            results["summary"] = val_out.get("summary", [])
+            results["issues_by_rule"] = val_out.get("issues_by_rule", {})
 
             # 2. Count geocodes and files
             import collections
@@ -4117,10 +4188,13 @@ class POPCENDatabase:
             missing_geom_cnt = 0
             invalid_gc_cnt = 0
 
+            row_status = val_out.get("row_status", {})
+            row_notes = val_out.get("row_notes", {})
+
             for idx, r in enumerate(rows):
                 if progress_callback and idx % 1000 == 0:
-                    pct = 10 + int((idx / total) * 50)
-                    if progress_callback(pct, f"Evaluating GPKG consistency ({idx:,} / {total:,})...") is False:
+                    pct = 50 + int((idx / total) * 40)
+                    if progress_callback(pct, f"Saving GPKG consistency ({idx:,} / {total:,})...") is False:
                         break
                 rid = r["id"]
                 gc = str(r.get("geocode") or "").strip()
@@ -4134,32 +4208,40 @@ class POPCENDatabase:
                 is_missing_geom = (not geom or "No Geometry" in geom or "none" in geom.lower())
                 is_invalid_gc = (not gc or len(gc) < 9 or not gc.isalnum())
 
+                details = []
+                r_st = row_status.get(rid, "PASS")
+                r_nt = row_notes.get(rid, "")
+                if r_nt:
+                    details.append(r_nt)
+
                 if is_invalid_gc:
                     st = "INVALID_GEOCODE"
-                    dt = "Geocode is empty or malformed (<9 chars)"
+                    details.append("Geocode is empty or malformed (<9 chars)")
                     invalid_gc_cnt += 1
                 elif is_missing_geom:
                     st = "NO_GEOMETRY"
-                    dt = "Feature lacks valid geometry or has empty polygon"
+                    details.append("Feature lacks valid geometry or has empty polygon")
                     missing_geom_cnt += 1
                 elif gc in conflict_geocodes:
                     st = "CONFLICTING_DATA"
-                    dt = f"Attribute mismatch across duplicates ({conflict_notes.get(gc, '')})"
+                    details.append(f"Attribute mismatch across duplicates ({conflict_notes.get(gc, '')})")
                     if file_count > 1:
                         cross_file_set.add(gc)
                 elif file_count > 1:
                     st = "CROSS_FILE_DUP"
-                    dt = f"Geocode appears in {file_count} separate files: {source_files_str}"
+                    details.append(f"Geocode appears in {file_count} separate files: {source_files_str}")
                     cross_file_set.add(gc)
                 elif dup_count > 1:
                     st = "MULTIPART_PARTS"
-                    dt = f"Appears {dup_count} times in same file (multipart EA polygon parts)"
+                    details.append(f"Appears {dup_count} times in same file (multipart EA polygon parts)")
                     multipart_set.add(gc)
                 else:
-                    st = "UNIQUE"
-                    dt = "Unique single-part EA record"
+                    st = "UNIQUE" if r_st == "PASS" else r_st
+                    if not details:
+                        details.append("Unique single-part EA record")
 
-                updates.append((st, dt, dup_count, file_count, source_files_str, rid))
+                final_dt = "; ".join(details)
+                updates.append((st, final_dt, dup_count, file_count, source_files_str, rid))
 
             results["cross_file_overlaps"] = len(cross_file_set)
             results["multipart_geocodes"] = len(multipart_set)
@@ -4168,13 +4250,13 @@ class POPCENDatabase:
 
             if results["cross_file_overlaps"] > 0 or results["attribute_conflicts"] > 0:
                 results["status_level"] = "OVERLAPS_FOUND"
-            elif results["multipart_geocodes"] > 0 or missing_geom_cnt > 0 or invalid_gc_cnt > 0:
+            elif results["multipart_geocodes"] > 0 or missing_geom_cnt > 0 or invalid_gc_cnt > 0 or results["errors"] > 0 or results["warnings"] > 0:
                 results["status_level"] = "WARNING"
             else:
                 results["status_level"] = "CLEAN"
 
             if progress_callback:
-                progress_callback(60, "Writing consistency updates to database...")
+                progress_callback(90, "Writing consistency updates to database...")
 
             batch_size = 5000
             for i in range(0, len(updates), batch_size):
@@ -4191,6 +4273,14 @@ class POPCENDatabase:
                 conn.commit()
 
         return results
+
+    def export_gpkg_validation_excel(self, output_path: str, progress_callback=None) -> str:
+        """
+        Runs GeoPackage validation checks and exports the official multi-sheet Excel report
+        (Summary + Sheets 2–14 per validation_id) matching the Google Spreadsheet specifications.
+        """
+        val_results = self.run_gpkg_consistency_checks(check_popcen=True, progress_callback=progress_callback)
+        return generate_gpkg_validation_excel_report(output_path, val_results)
 
     def _build_gpkg_where_clause(
         self,
@@ -4228,8 +4318,13 @@ class POPCENDatabase:
                 params.append(f"%{ea_type.upper()}%")
 
         if issue_filter and issue_filter != "All Records":
-            if issue_filter == "Any Issue / Duplicate":
-                conditions.append("consistency_status != 'UNIQUE'")
+            matched_rule = next((spec["id"] for spec in GPKG_VALIDATION_SPECS if f"[{spec['id']}]" in issue_filter or issue_filter.strip().startswith(spec["id"])), None)
+            if matched_rule:
+                conditions.append(f"consistency_detail LIKE '%[{matched_rule}]%'")
+            elif issue_filter in ("Passed (PASS)", "Unique & Clean Only"):
+                conditions.append("consistency_status IN ('UNIQUE', 'PASS') AND (consistency_detail IS NULL OR consistency_detail NOT LIKE '%[%]%')")
+            elif issue_filter in ("All Issues (Warnings & Errors)", "Any Issue / Duplicate"):
+                conditions.append("(consistency_status NOT IN ('UNIQUE', 'PASS') OR consistency_detail LIKE '%[%]%')")
             elif issue_filter == "Cross-File Overlaps Only":
                 conditions.append("consistency_status IN ('CROSS_FILE_DUP', 'CONFLICTING_DATA') AND file_count > 1")
             elif issue_filter == "Intra-File Multipart Only":

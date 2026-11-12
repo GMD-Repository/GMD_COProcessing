@@ -4467,9 +4467,15 @@ class COProcessingDialog(QDialog):
 
         self.btn_run_gpkg_consistency = QPushButton("Run Consistency Check")
         self.btn_run_gpkg_consistency.setObjectName("primaryBtn")
-        self.btn_run_gpkg_consistency.setToolTip("Run multi-file consistency, cross-file duplicate, and multipart checks across consolidated records")
+        self.btn_run_gpkg_consistency.setToolTip("Run multi-file consistency, overlap, and 13 completeness/consistency rules across consolidated records")
         self.btn_run_gpkg_consistency.clicked.connect(self._run_gpkg_consistency_check_prompt)
         folder_layout.addWidget(self.btn_run_gpkg_consistency)
+
+        self.btn_export_gpkg_validation_excel = QPushButton("Export Validation Report (Excel)")
+        self.btn_export_gpkg_validation_excel.setObjectName("actionBtn")
+        self.btn_export_gpkg_validation_excel.setToolTip("Export official multi-sheet Excel validation report for GeoPackage (Summary + Sheets 2–14)")
+        self.btn_export_gpkg_validation_excel.clicked.connect(self._export_gpkg_validation_excel)
+        folder_layout.addWidget(self.btn_export_gpkg_validation_excel)
 
         self.btn_gpkg_stop = QPushButton("Stop")
         self.btn_gpkg_stop.setObjectName("stopBtn")
@@ -4568,15 +4574,26 @@ class COProcessingDialog(QDialog):
 
         filter_bar.addWidget(QLabel("Consistency:"))
         self.cmb_gpkg_issue_filter = QComboBox()
-        self.cmb_gpkg_issue_filter.addItems([
+        gpkg_filter_items = [
             "All Records",
-            "Any Issue / Duplicate",
+            "Passed (PASS)",
+            "All Issues (Warnings & Errors)",
             "Cross-File Overlaps Only",
             "Intra-File Multipart Only",
-            "Conflicting Data Only",
             "Missing Geometry Only",
-            "Unique & Clean Only",
-        ])
+        ]
+        try:
+            from ..core.gpkg_validator import GPKG_VALIDATION_SPECS
+            for spec in GPKG_VALIDATION_SPECS:
+                gpkg_filter_items.append(f"[{spec['id']}] {spec['title']}")
+        except Exception:
+            try:
+                from core.gpkg_validator import GPKG_VALIDATION_SPECS
+                for spec in GPKG_VALIDATION_SPECS:
+                    gpkg_filter_items.append(f"[{spec['id']}] {spec['title']}")
+            except Exception:
+                pass
+        self.cmb_gpkg_issue_filter.addItems(gpkg_filter_items)
         self.cmb_gpkg_issue_filter.currentIndexChanged.connect(self._on_gpkg_filter_changed)
         filter_bar.addWidget(self.cmb_gpkg_issue_filter)
 
@@ -7140,17 +7157,25 @@ class COProcessingDialog(QDialog):
         conflicts = results.get("attribute_conflicts", 0)
         missing_geom = results.get("missing_geometry", 0)
         invalid_gc = results.get("invalid_geocodes", 0)
+        passed = results.get("passed", 0)
+        rate = results.get("pass_rate", 0.0)
+
+        summary = results.get("summary", [])
+        top_issues = [f"  • {s['title']} ({s['validation_id']}): {s['frequency']:,}" for s in summary if s.get("frequency", 0) > 0]
+        issue_str = "\n".join(top_issues) if top_issues else "  • Zero validation issues detected!"
 
         msg = (
             f"EA GeoPackage Consistency Check Complete!\n\n"
             f"• Total Features Checked: {total:,}\n"
             f"• Unique Geocodes: {unique:,}\n"
+            f"• Passed Cleanly: {passed:,} ({rate}%)\n"
             f"• Cross-File Overlaps: {overlaps:,}\n"
             f"• Multipart EA Geocodes: {multiparts:,}\n"
-            f"• Attribute Conflicts: {conflicts:,}\n"
-            f"• Missing Geometry: {missing_geom:,}\n"
-            f"• Invalid Geocodes: {invalid_gc:,}\n\n"
-            "Use the 'Consistency' dropdown filter to isolate overlapping or conflicted records."
+            f"• Attribute Conflicts: {conflicts:,}\n\n"
+            f"Rule Inconsistencies Detected:\n{issue_str}\n\n"
+            f"Tips:\n"
+            f"• Use the 'Consistency' dropdown filter to isolate specific validation rules.\n"
+            f"• Click 'Export Validation Report (Excel)' for the multi-sheet breakdown (Sheets 1–14)."
         )
         QMessageBox.information(self, "GPKG Consistency Results", msg)
 
@@ -7820,6 +7845,62 @@ class COProcessingDialog(QDialog):
                 QMessageBox.information(self, "Export Success", f"EA GeoPackage attributes exported to:\n{f}")
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", f"Export failed:\n{e}")
+
+    def _export_gpkg_validation_excel(self):
+        """Exports the official multi-sheet Excel validation report for GeoPackage (Summary + Sheets 2–14)."""
+        if self.cmb_gpkg_source_mode.currentIndex() != 0:
+            QMessageBox.information(
+                self,
+                "Database Mode Required",
+                "Please switch to 'Consolidated Database (SQLite: gpkg_database.db)' mode to export validation reports."
+            )
+            return
+
+        count = self.db.gpkg_record_count()
+        if count == 0:
+            QMessageBox.warning(self, "No Records", "No GeoPackage records found in the database.")
+            return
+
+        f, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export GeoPackage Validation Report",
+            "gpkg_validation_report.xlsx",
+            "Excel Files (*.xlsx)"
+        )
+        if not f:
+            return
+
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            if self.progress_bar:
+                self.progress_bar.setValue(10)
+            self.lbl_gpkg_table_info.setText("Generating multi-sheet GeoPackage Excel validation report...")
+
+            out_path = self.db.export_gpkg_validation_excel(
+                f,
+                progress_callback=lambda p, m: ((self.progress_bar.setValue(p) if self.progress_bar else None), self.lbl_gpkg_table_info.setText(m))
+            )
+
+            if self.progress_bar:
+                self.progress_bar.setValue(100)
+            self.lbl_gpkg_table_info.setText(f"Validation report exported: {os.path.basename(out_path)}")
+            QApplication.restoreOverrideCursor()
+
+            # Refresh table display with newly saved consistency tags
+            self._fetch_and_render_gpkg_db_page()
+
+            QMessageBox.information(
+                self,
+                "Export Success",
+                f"Official GeoPackage Completeness & Consistency Validation Report successfully generated!\n\n"
+                f"File: {out_path}\n\n"
+                f"Includes:\n"
+                f" • Sheet 1: Summary (List of Inconsistencies & Frequencies)\n"
+                f" • Sheets 2–14: Individual validation tables per validation_id"
+            )
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Export Error", f"Failed to generate GeoPackage validation report:\n{e}")
 
     # ----------------------------------------------------------------------
     # EA GeoPackage Feature Selection & Removal Logic
