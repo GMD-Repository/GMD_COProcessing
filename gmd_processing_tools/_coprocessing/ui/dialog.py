@@ -2606,8 +2606,8 @@ class COProcessingDialog(QDialog):
             gc_item.setTextAlignment(Qt.AlignCenter)
             self.table_matching.setItem(row_idx, 1, gc_item)
 
-            # Check if this row belongs to 2024 POPCEN
-            is_in_pop = bool(r.get("in_popcen") in (1, "1", True) and r.get("geographic_name"))
+            # Check if this row has POPCEN information
+            is_in_pop = bool(r.get("geographic_name") or r.get("in_popcen") in (1, "1", True))
 
             # 2: Geographic Name
             gn_str = str(r.get("geographic_name", "") or "") if is_in_pop else ""
@@ -2909,6 +2909,7 @@ class COProcessingDialog(QDialog):
 
             # 3. Fetch POPCEN only for the uploaded citymuns
             popcen_list_dict = collections.defaultdict(list)
+            bgy_lookup = {}
             if self.cmb_source_mode.currentIndex() == 0 and self.db.is_populated():
                 if uploaded_citymun_codes:
                     with self.db._get_connection() as conn:
@@ -2916,28 +2917,41 @@ class COProcessingDialog(QDialog):
                         placeholders = ','.join('?' for _ in uploaded_citymun_codes)
                         cur.execute(f"""
                             SELECT * FROM popcen_records 
-                            WHERE geographic_level LIKE '%5 - EA%' 
-                              AND SUBSTR(geocode, 1, 5) IN ({placeholders})
+                            WHERE SUBSTR(geocode, 1, 5) IN ({placeholders})
                         """, list(uploaded_citymun_codes))
                         cols = [d[0] for d in cur.description]
                         for row in cur.fetchall():
                             r = dict(zip(cols, row))
                             gc = str(r.get("geocode", "")).strip()
-                            if gc:
-                                popcen_list_dict[gc].append(r)
+                            gl = str(r.get("geographic_level", "")).strip()
+                            if "5 - EA" in gl:
+                                if gc:
+                                    popcen_list_dict[gc].append(r)
+                            elif "4 - Barangay" in gl:
+                                bgy_key = gc[:8] if len(gc) >= 8 else gc
+                                bgy_lookup[bgy_key] = r
                 else:
-                    rows, _ = self.db.query_records(level="5 - EA", limit=500000)
+                    rows, _ = self.db.query_records(limit=500000)
                     for r in rows:
                         gc = str(r.get("geocode", "")).strip()
-                        if gc:
-                            popcen_list_dict[gc].append(r)
+                        gl = str(r.get("geographic_level", "")).strip()
+                        if "5 - EA" in gl:
+                            if gc:
+                                popcen_list_dict[gc].append(r)
+                        elif "4 - Barangay" in gl:
+                            bgy_key = gc[:8] if len(gc) >= 8 else gc
+                            bgy_lookup[bgy_key] = r
             elif not self.popcen_df.empty:
-                filtered_popcen, _ = exclude_non_ea_levels(self.popcen_df)
-                for _, r in filtered_popcen.iterrows():
+                for _, r in self.popcen_df.iterrows():
                     d = r.to_dict()
                     gc = str(d.get("geocode", "")).strip()
-                    if gc:
-                        popcen_list_dict[gc].append(d)
+                    gl = str(d.get("geographic_level", "")).strip()
+                    if "5 - EA" in gl:
+                        if gc:
+                            popcen_list_dict[gc].append(d)
+                    elif "4 - Barangay" in gl:
+                        bgy_key = gc[:8] if len(gc) >= 8 else gc
+                        bgy_lookup[bgy_key] = d
 
             if not popcen_list_dict and not earf_list_dict and not gpkg_list_dict:
                 QMessageBox.warning(self, "No Sources", "Please ensure at least one data source is loaded or configured in the EARF Post-Processing workspace.")
@@ -3042,8 +3056,6 @@ class COProcessingDialog(QDialog):
                         match_status = "UNMATCHED_EARF"
 
                     # 2024 POPCEN fields (Columns 1 to 15):
-                    # Only populated if this row genuinely belongs to 2024 POPCEN table!
-                    # If this is an additional row based on Prelim EARF inputs or GPKG, keep completely blank.
                     if in_p_row:
                         geo_name = str(p_row.get("geographic_name", "") or "").strip()
                         geo_level = str(p_row.get("geographic_level", "") or "5 - EA").strip()
@@ -3063,31 +3075,51 @@ class COProcessingDialog(QDialog):
                         gap_flag = str(p_row.get("ea_with_gap_overlap", "") or "").strip()
                         p_remarks = str(p_row.get("remarks", "") or "").strip()
                     else:
-                        geo_name = ""
-                        geo_level = ""
-                        reg_code = ""
-                        prov_code = ""
-                        mun_code = ""
-                        brgy_code = ""
-                        # For internal grouping / export support, extract PSGC codes if available
-                        if len(gc) == 14 and gc.isdigit():
-                            prov_code = gc[:3]
-                            mun_code = gc[3:5]
-                            brgy_code = gc[5:8]
-                        elif len(gc) == 16 and gc.isdigit():
-                            reg_code = gc[:2]
-                            prov_code = gc[2:5]
-                            mun_code = gc[5:7]
-                            brgy_code = gc[7:10]
-                        old_ean = ""
-                        no_eas = ""
-                        an = ""
+                        # Fallback to barangay record if this EA was not enumerated individually in POPCEN
+                        bgy_key = gc[:8] if len(gc) >= 8 else ""
+                        bgy_row = bgy_lookup.get(bgy_key, {})
+                        
+                        reg_code = str(bgy_row.get("region_code", "") or "").strip()
+                        prov_code = str(bgy_row.get("province_code", "") or "").strip()
+                        mun_code = str(bgy_row.get("city_mun_code", "") or "").strip()
+                        brgy_code = str(bgy_row.get("barangay_code", "") or "").strip()
+                        geo_name = str(bgy_row.get("geographic_name", "") or g_row.get("barangay", "") or "").strip()
+                        geo_level = "5 - EA" if geo_name else ""
+                        
+                        # Fallback for codes from geocode if still empty
+                        if not prov_code or not mun_code or not brgy_code:
+                            if len(gc) == 14 and gc.isdigit():
+                                prov_code = prov_code or gc[:3]
+                                mun_code = mun_code or gc[3:5]
+                                brgy_code = brgy_code or gc[5:8]
+                            elif len(gc) == 16 and gc.isdigit():
+                                reg_code = reg_code or gc[:2]
+                                prov_code = prov_code or gc[2:5]
+                                mun_code = mun_code or gc[5:7]
+                                brgy_code = brgy_code or gc[7:10]
+
+                        # Inferred EAN from geocode or source rows
+                        cand_ean = ""
+                        if len(gc) >= 14 and gc[-6:].isdigit() and gc[-6:] != "000000":
+                            cand_ean = gc[-6:]
+                        elif e_row.get("ea") or g_row.get("ean"):
+                            cand_ean = str(e_row.get("ea") or g_row.get("ean") or "").strip().replace(".0", "")
+                        old_ean = to_whole_number_str(cand_ean)
+                        if old_ean.isdigit() and len(old_ean) < 6:
+                            old_ean = f"{int(old_ean):03d}000" if len(old_ean) <= 3 else f"{int(old_ean):06d}"
+                        
+                        no_eas = "1" if old_ean else ""
+                        if geo_name and old_ean:
+                            an = f"{geo_name} - EA {old_ean}"
+                        else:
+                            an = str(e_row.get("areaname") or g_row.get("name") or geo_name or "").strip()
+                            
                         hh_pop = ""
                         phh = ""
-                        delin_flag = ""
-                        merge_flag = ""
-                        gap_flag = ""
-                        p_remarks = ""
+                        delin_flag = str(bgy_row.get("ea_subject_for_delineation", "") or "").strip()
+                        merge_flag = str(bgy_row.get("ea_subject_for_merging", "") or "").strip()
+                        gap_flag = str(bgy_row.get("ea_with_gap_overlap", "") or "").strip()
+                        p_remarks = str(bgy_row.get("remarks", "") or "").strip()
 
                     ehh = str(e_row.get("household_count") or e_row.get("number_of_households") or g_row.get("hhcount") or g_row.get("hh_count") or "").strip()
 
