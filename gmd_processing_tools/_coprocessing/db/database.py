@@ -51,6 +51,64 @@ except (ImportError, ValueError):
                     pass
                 return s
 
+try:
+    from ..core.prelim_earf_validator import (
+        VALIDATION_SPECS,
+        VALIDATION_MAP,
+        run_prelim_earf_validations,
+        generate_validation_excel_report,
+    )
+except (ImportError, ValueError):
+    try:
+        from core.prelim_earf_validator import (
+            VALIDATION_SPECS,
+            VALIDATION_MAP,
+            run_prelim_earf_validations,
+            generate_validation_excel_report,
+        )
+    except (ImportError, ValueError):
+        try:
+            from prelim_earf_validator import (
+                VALIDATION_SPECS,
+                VALIDATION_MAP,
+                run_prelim_earf_validations,
+                generate_validation_excel_report,
+            )
+        except (ImportError, ValueError):
+            VALIDATION_SPECS = []
+            VALIDATION_MAP = {}
+            def run_prelim_earf_validations(*args, **kwargs): return {}
+            def generate_validation_excel_report(*args, **kwargs): return ""
+
+try:
+    from ..core.gpkg_validator import (
+        GPKG_VALIDATION_SPECS,
+        GPKG_VALIDATION_MAP,
+        run_gpkg_validations,
+        generate_gpkg_validation_excel_report,
+    )
+except (ImportError, ValueError):
+    try:
+        from core.gpkg_validator import (
+            GPKG_VALIDATION_SPECS,
+            GPKG_VALIDATION_MAP,
+            run_gpkg_validations,
+            generate_gpkg_validation_excel_report,
+        )
+    except (ImportError, ValueError):
+        try:
+            from gpkg_validator import (
+                GPKG_VALIDATION_SPECS,
+                GPKG_VALIDATION_MAP,
+                run_gpkg_validations,
+                generate_gpkg_validation_excel_report,
+            )
+        except (ImportError, ValueError):
+            GPKG_VALIDATION_SPECS = []
+            GPKG_VALIDATION_MAP = {}
+            def run_gpkg_validations(*args, **kwargs): return {}
+            def generate_gpkg_validation_excel_report(*args, **kwargs): return ""
+
 
 POPCEN_DB_FILENAME = "popcen_database.db"
 EARF_DB_FILENAME = "earf_database.db"
@@ -1137,9 +1195,7 @@ def export_matched_to_excel(
                 ea_t = str(r.get("ea_type") or r.get("ea_lifecycle") or "RETAINED").strip().upper()
                 if "MERG" in ea_t:
                     ea_t = "MERGED"
-                elif "SPLIT" in ea_t:
-                    ea_t = "SPLIT"
-                elif "DELIN" in ea_t:
+                elif "SPLIT" in ea_t or "DELIN" in ea_t or "RESET" in ea_t:
                     ea_t = "DELINEATED"
                 elif "RETAIN" in ea_t:
                     ea_t = "RETAINED"
@@ -1958,12 +2014,9 @@ def export_output_summary_to_excel(
             if "RETAIN" in ea_t or (not ea_t and "RETAIN" in ea_life):
                 b_retained += 1
                 b_final_eas += 1
-            elif "SPLIT" in ea_t or "SPLIT" in ea_life:
-                b_split += 1
-                b_final_eas += 1
             elif "MERG" in ea_t or "MERG" in ea_life:
                 b_merged += 1
-            elif "DELIN" in ea_t or "RESET" in ea_t or "DELIN" in ea_life or "RESET" in ea_life:
+            elif "DELIN" in ea_t or "SPLIT" in ea_t or "RESET" in ea_t or "DELIN" in ea_life or "SPLIT" in ea_life or "RESET" in ea_life:
                 b_delin += 1
                 b_final_eas += 1
             else:
@@ -3356,7 +3409,7 @@ class POPCENDatabase:
                         "household_count": _get_val(["household count (2026)", "household count", "household_count", "hh_count", "hhcount"]),
                         "building_count": _get_val(["building count (2026)", "building count", "building_count", "bldg_count", "bldgcount"]),
                         "ea_type": _get_val(["ea type", "ea_type", "type"]),
-                        "source_year": "2024" if "retain" in _get_val(["ea type", "ea_type", "type"]).lower() else "2026",
+                        "source_year": _get_val(["source year", "source_year", "sy", "source yr", "year"]),
                         "remarks": _get_val(["remarks", "remark", "notes"]),
                         "source_file": fname,
                         "match_status": "Pending Match",
@@ -3444,13 +3497,12 @@ class POPCENDatabase:
         return len(all_records)
 
     # ----------------------------------------------------------------------
-    # Preliminary EARF Consistency Check Engine
+    # Preliminary EARF Completeness & Consistency Check Engine
     # ----------------------------------------------------------------------
     def run_earf_consistency_checks(self, check_popcen: bool = True, progress_callback=None) -> Dict[str, Any]:
         """
-        Executes focused consistency validation across all records in earf_records:
-          - R1: Geocode format & structure check (14-digit numeric validation & admin segments)
-          - R6: Cross-validation against 2024 POPCEN database (geocode presence)
+        Executes full Completeness & Consistency validation across earf_records
+        evaluating the 13 official validation rules (Sheets 1–14).
         """
         results = {
             "total_checked": 0,
@@ -3460,17 +3512,21 @@ class POPCENDatabase:
             "missing_popcen": 0,
             "invalid_geocodes": 0,
             "pass_rate": 0.0,
+            "summary": [],
+            "issues_by_rule": {},
         }
 
-        # 1. Fetch POPCEN geocodes set if available from popcen_database.db
-        popcen_geocodes = set()
-        popcen_available = False
+        # 1. Fetch POPCEN records if available from popcen_database.db
+        popcen_rows = []
         if check_popcen and self.is_populated():
-            with self._get_connection() as pop_conn:
-                pop_cur = pop_conn.cursor()
-                pop_cur.execute("SELECT geocode FROM popcen_records WHERE geocode IS NOT NULL AND geocode != ''")
-                popcen_geocodes = {r[0] for r in pop_cur.fetchall()}
-                popcen_available = len(popcen_geocodes) > 0
+            try:
+                with self._get_connection() as pop_conn:
+                    pop_cur = pop_conn.cursor()
+                    pop_cur.execute("SELECT * FROM popcen_records")
+                    cols = [d[0] for d in pop_cur.description]
+                    popcen_rows = [dict(zip(cols, r)) for r in pop_cur.fetchall()]
+            except Exception:
+                popcen_rows = []
 
         with self._get_earf_connection() as conn:
             cur = conn.cursor()
@@ -3479,73 +3535,52 @@ class POPCENDatabase:
             if total == 0:
                 return results
 
+            cur.execute("SELECT * FROM earf_records")
+            earf_rows_raw = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            earf_records = [dict(zip(cols, r)) for r in earf_rows_raw]
             results["total_checked"] = total
 
-            # 2. Read all rows for R1 & R6 evaluation
-            cur.execute("""
-                SELECT id, geocode, prov, mun, brgy, ea, areaname
-                FROM earf_records
-            """)
-            rows = cur.fetchall()
+            # Run validator engine
+            val_out = run_prelim_earf_validations(
+                earf_records=earf_records,
+                popcen_records=popcen_rows,
+                progress_callback=progress_callback,
+            )
+
+            stats = val_out.get("stats", {})
+            results["passed"] = stats.get("passed", 0)
+            results["warnings"] = stats.get("warnings", 0)
+            results["errors"] = stats.get("errors", 0)
+            results["pass_rate"] = stats.get("pass_rate", 0.0)
+            results["summary"] = val_out.get("summary", [])
+            results["issues_by_rule"] = val_out.get("issues_by_rule", {})
+            results["missing_popcen"] = len(val_out.get("issues_by_rule", {}).get("earf_missing_geo", []))
+            results["invalid_geocodes"] = len(val_out.get("issues_by_rule", {}).get("inv_new_ean", []))
+
+            # Bulk update earf_records
+            row_status = val_out.get("row_status", {})
+            row_notes = val_out.get("row_notes", {})
 
             updates = []
-            for idx, r in enumerate(rows):
+            for r in earf_records:
                 rec_id = r["id"]
-                gc = str(r["geocode"]).strip() if r["geocode"] else ""
-                prov = str(r["prov"]).strip() if r["prov"] else ""
-                mun = str(r["mun"]).strip() if r["mun"] else ""
-                brgy = str(r["brgy"]).strip() if r["brgy"] else ""
-                ea = str(r["ea"]).strip() if r["ea"] else ""
+                st = row_status.get(rec_id, "PASS")
+                nt = row_notes.get(rec_id, "")
+                updates.append((st, nt, rec_id))
 
-                status = "PASS"
-                notes = []
-
-                # ---- R1: Geocode format & structure (14-digit numeric string) ----
-                is_r1_valid = True
-                if not gc or len(gc) != 14 or not gc.isdigit():
-                    is_r1_valid = False
-                    status = "ERROR"
-                    notes.append("R1: Invalid geocode format (expected 14-digit numeric string)")
-                    results["invalid_geocodes"] += 1
-                elif not (prov and mun and brgy and ea):
-                    is_r1_valid = False
-                    status = "ERROR"
-                    notes.append("R1: Incomplete administrative codes (Prov, Mun, Brgy, or EA missing)")
-                    results["invalid_geocodes"] += 1
-
-                # ---- R6: Cross-validation with POPCEN Database ----
-                if is_r1_valid:
-                    if popcen_available:
-                        if gc not in popcen_geocodes:
-                            status = "WARNING"
-                            notes.append("R6: Geocode not found in 2024 POPCEN database")
-                            results["missing_popcen"] += 1
-                        else:
-                            notes.append("R1 & R6 passed (Valid format & matched in POPCEN)")
-                    else:
-                        notes.append("R1 passed (POPCEN database not loaded to check R6)")
-
-                updates.append((status, "; ".join(notes), rec_id))
-
-                if status == "PASS":
-                    results["passed"] += 1
-                elif status == "WARNING":
-                    results["warnings"] += 1
-                elif status == "ERROR":
-                    results["errors"] += 1
-
-                if progress_callback and idx % 1000 == 0:
-                    pct = int((idx / total) * 100)
-                    if progress_callback(pct, f"Evaluating R1 & R6 consistency ({idx:,} / {total:,})...") is False:
-                        break
-
-            # Bulk update consistency columns
             cur.executemany("UPDATE earf_records SET consistency_status = ?, consistency_notes = ? WHERE id = ?", updates)
             conn.commit()
 
-        results["pass_rate"] = round((results["passed"] / results["total_checked"]) * 100, 1) if results["total_checked"] > 0 else 0.0
-
         return results
+
+    def export_prelim_earf_validation_excel(self, output_path: str, progress_callback=None) -> str:
+        """
+        Runs validations and exports the official multi-sheet Excel report
+        (Summary + Sheets 2-14 per validation_id) matching the Google Spreadsheet specifications.
+        """
+        val_results = self.run_earf_consistency_checks(check_popcen=True, progress_callback=progress_callback)
+        return generate_validation_excel_report(output_path, val_results)
 
     def _build_earf_where_clause(
         self,
@@ -3580,13 +3615,19 @@ class POPCENDatabase:
 
         if ea_type and ea_type != "All EA Types":
             if ea_type == "Other":
-                conditions.append("UPPER(COALESCE(ea_type, '')) NOT LIKE '%RETAIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%SPLIT%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%MERG%'")
+                conditions.append("UPPER(COALESCE(ea_type, '')) NOT LIKE '%RETAIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%SPLIT%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%DELIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%MERG%'")
+            elif ea_type == "DELINEATED":
+                conditions.append("(UPPER(ea_type) LIKE '%DELIN%' OR UPPER(ea_type) LIKE '%SPLIT%')")
             else:
                 conditions.append("UPPER(ea_type) LIKE ?")
                 params.append(f"%{ea_type.upper()}%")
 
         if consistency_filter and consistency_filter != "All Records":
-            if "PASS" in consistency_filter:
+            # Check for specific validation rule ID
+            matched_rule = next((spec["id"] for spec in VALIDATION_SPECS if f"[{spec['id']}]" in consistency_filter or consistency_filter.strip().startswith(spec["id"])), None)
+            if matched_rule:
+                conditions.append(f"consistency_notes LIKE '%[{matched_rule}]%'")
+            elif "PASS" in consistency_filter:
                 conditions.append("consistency_status = 'PASS'")
             elif "All Issues" in consistency_filter:
                 conditions.append("consistency_status IN ('WARNING', 'ERROR')")
@@ -3706,7 +3747,7 @@ class POPCENDatabase:
                 cur.execute(f"SELECT COUNT(*) FROM earf_records WHERE UPPER(ea_type) LIKE '%RETAIN%'{and_clause}")
                 kpis["retained"] = cur.fetchone()[0]
 
-                cur.execute(f"SELECT COUNT(*) FROM earf_records WHERE UPPER(ea_type) LIKE '%SPLIT%'{and_clause}")
+                cur.execute(f"SELECT COUNT(*) FROM earf_records WHERE (UPPER(ea_type) LIKE '%SPLIT%' OR UPPER(ea_type) LIKE '%DELIN%'){and_clause}")
                 kpis["split"] = cur.fetchone()[0]
 
                 cur.execute(f"SELECT COUNT(*) FROM earf_records WHERE UPPER(ea_type) LIKE '%MERG%'{and_clause}")
@@ -4040,8 +4081,8 @@ class POPCENDatabase:
 
     def run_gpkg_consistency_checks(self, check_popcen: bool = True, progress_callback=None) -> Dict[str, Any]:
         """
-        Executes multi-file consistency, overlap, multipart, and attribute duplication analysis
-        across all records currently stored in gpkg_records, updating their consistency statuses.
+        Executes multi-file consistency, overlap, multipart, and attribute duplication analysis,
+        and evaluates the 13 official GeoPackage Completeness & Consistency validation rules.
         """
         results = {
             "total_checked": 0,
@@ -4052,7 +4093,36 @@ class POPCENDatabase:
             "missing_geometry": 0,
             "invalid_geocodes": 0,
             "status_level": "CLEAN",
+            "passed": 0,
+            "warnings": 0,
+            "errors": 0,
+            "pass_rate": 0.0,
+            "summary": [],
+            "issues_by_rule": {},
         }
+
+        # 1. Fetch Prelim EARF records for cross-validation rule: missing_geo
+        earf_rows = []
+        try:
+            with self._get_earf_connection() as earf_conn:
+                earf_cur = earf_conn.cursor()
+                earf_cur.execute("SELECT * FROM earf_records")
+                cols = [d[0] for d in earf_cur.description]
+                earf_rows = [dict(zip(cols, r)) for r in earf_cur.fetchall()]
+        except Exception:
+            earf_rows = []
+
+        # 2. Fetch POPCEN records if available
+        popcen_rows = []
+        if check_popcen and self.is_populated():
+            try:
+                with self._get_connection() as pop_conn:
+                    pop_cur = pop_conn.cursor()
+                    pop_cur.execute("SELECT * FROM popcen_records")
+                    cols = [d[0] for d in pop_cur.description]
+                    popcen_rows = [dict(zip(cols, r)) for r in pop_cur.fetchall()]
+            except Exception:
+                popcen_rows = []
 
         with self._get_gpkg_connection() as conn:
             cur = conn.cursor()
@@ -4066,12 +4136,25 @@ class POPCENDatabase:
                 progress_callback(10, f"Evaluating consistency across {total:,} GPKG records...")
 
             # 1. Fetch all rows
-            cur.execute("""
-                SELECT id, geocode, layer_source, source_file, geom_status, ea_type,
-                       region, province, city_mun, barangay, ean, hh_count, bldg_count
-                FROM gpkg_records
-            """)
-            rows = [dict(r) for r in cur.fetchall()]
+            cur.execute("SELECT * FROM gpkg_records")
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+
+            # Run 13-rule GeoPackage validator
+            val_out = run_gpkg_validations(
+                gpkg_records=rows,
+                earf_records=earf_rows,
+                popcen_records=popcen_rows,
+                progress_callback=lambda p, m: progress_callback(10 + int(p * 0.4), m) if progress_callback else None,
+            )
+
+            stats = val_out.get("stats", {})
+            results["passed"] = stats.get("passed", 0)
+            results["warnings"] = stats.get("warnings", 0)
+            results["errors"] = stats.get("errors", 0)
+            results["pass_rate"] = stats.get("pass_rate", 0.0)
+            results["summary"] = val_out.get("summary", [])
+            results["issues_by_rule"] = val_out.get("issues_by_rule", {})
 
             # 2. Count geocodes and files
             import collections
@@ -4105,10 +4188,13 @@ class POPCENDatabase:
             missing_geom_cnt = 0
             invalid_gc_cnt = 0
 
+            row_status = val_out.get("row_status", {})
+            row_notes = val_out.get("row_notes", {})
+
             for idx, r in enumerate(rows):
                 if progress_callback and idx % 1000 == 0:
-                    pct = 10 + int((idx / total) * 50)
-                    if progress_callback(pct, f"Evaluating GPKG consistency ({idx:,} / {total:,})...") is False:
+                    pct = 50 + int((idx / total) * 40)
+                    if progress_callback(pct, f"Saving GPKG consistency ({idx:,} / {total:,})...") is False:
                         break
                 rid = r["id"]
                 gc = str(r.get("geocode") or "").strip()
@@ -4122,32 +4208,40 @@ class POPCENDatabase:
                 is_missing_geom = (not geom or "No Geometry" in geom or "none" in geom.lower())
                 is_invalid_gc = (not gc or len(gc) < 9 or not gc.isalnum())
 
+                details = []
+                r_st = row_status.get(rid, "PASS")
+                r_nt = row_notes.get(rid, "")
+                if r_nt:
+                    details.append(r_nt)
+
                 if is_invalid_gc:
                     st = "INVALID_GEOCODE"
-                    dt = "Geocode is empty or malformed (<9 chars)"
+                    details.append("Geocode is empty or malformed (<9 chars)")
                     invalid_gc_cnt += 1
                 elif is_missing_geom:
                     st = "NO_GEOMETRY"
-                    dt = "Feature lacks valid geometry or has empty polygon"
+                    details.append("Feature lacks valid geometry or has empty polygon")
                     missing_geom_cnt += 1
                 elif gc in conflict_geocodes:
                     st = "CONFLICTING_DATA"
-                    dt = f"Attribute mismatch across duplicates ({conflict_notes.get(gc, '')})"
+                    details.append(f"Attribute mismatch across duplicates ({conflict_notes.get(gc, '')})")
                     if file_count > 1:
                         cross_file_set.add(gc)
                 elif file_count > 1:
                     st = "CROSS_FILE_DUP"
-                    dt = f"Geocode appears in {file_count} separate files: {source_files_str}"
+                    details.append(f"Geocode appears in {file_count} separate files: {source_files_str}")
                     cross_file_set.add(gc)
                 elif dup_count > 1:
                     st = "MULTIPART_PARTS"
-                    dt = f"Appears {dup_count} times in same file (multipart EA polygon parts)"
+                    details.append(f"Appears {dup_count} times in same file (multipart EA polygon parts)")
                     multipart_set.add(gc)
                 else:
-                    st = "UNIQUE"
-                    dt = "Unique single-part EA record"
+                    st = "UNIQUE" if r_st == "PASS" else r_st
+                    if not details:
+                        details.append("Unique single-part EA record")
 
-                updates.append((st, dt, dup_count, file_count, source_files_str, rid))
+                final_dt = "; ".join(details)
+                updates.append((st, final_dt, dup_count, file_count, source_files_str, rid))
 
             results["cross_file_overlaps"] = len(cross_file_set)
             results["multipart_geocodes"] = len(multipart_set)
@@ -4156,13 +4250,13 @@ class POPCENDatabase:
 
             if results["cross_file_overlaps"] > 0 or results["attribute_conflicts"] > 0:
                 results["status_level"] = "OVERLAPS_FOUND"
-            elif results["multipart_geocodes"] > 0 or missing_geom_cnt > 0 or invalid_gc_cnt > 0:
+            elif results["multipart_geocodes"] > 0 or missing_geom_cnt > 0 or invalid_gc_cnt > 0 or results["errors"] > 0 or results["warnings"] > 0:
                 results["status_level"] = "WARNING"
             else:
                 results["status_level"] = "CLEAN"
 
             if progress_callback:
-                progress_callback(60, "Writing consistency updates to database...")
+                progress_callback(90, "Writing consistency updates to database...")
 
             batch_size = 5000
             for i in range(0, len(updates), batch_size):
@@ -4179,6 +4273,14 @@ class POPCENDatabase:
                 conn.commit()
 
         return results
+
+    def export_gpkg_validation_excel(self, output_path: str, progress_callback=None) -> str:
+        """
+        Runs GeoPackage validation checks and exports the official multi-sheet Excel report
+        (Summary + Sheets 2–14 per validation_id) matching the Google Spreadsheet specifications.
+        """
+        val_results = self.run_gpkg_consistency_checks(check_popcen=True, progress_callback=progress_callback)
+        return generate_gpkg_validation_excel_report(output_path, val_results)
 
     def _build_gpkg_where_clause(
         self,
@@ -4208,14 +4310,21 @@ class POPCENDatabase:
 
         if ea_type and ea_type != "All EA Types":
             if ea_type == "Other":
-                conditions.append("UPPER(COALESCE(ea_type, '')) NOT LIKE '%RETAIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%SPLIT%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%MERG%'")
+                conditions.append("UPPER(COALESCE(ea_type, '')) NOT LIKE '%RETAIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%SPLIT%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%DELIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%MERG%'")
+            elif ea_type == "DELINEATED":
+                conditions.append("(UPPER(ea_type) LIKE '%DELIN%' OR UPPER(ea_type) LIKE '%SPLIT%')")
             else:
                 conditions.append("UPPER(ea_type) LIKE ?")
                 params.append(f"%{ea_type.upper()}%")
 
         if issue_filter and issue_filter != "All Records":
-            if issue_filter == "Any Issue / Duplicate":
-                conditions.append("consistency_status != 'UNIQUE'")
+            matched_rule = next((spec["id"] for spec in GPKG_VALIDATION_SPECS if f"[{spec['id']}]" in issue_filter or issue_filter.strip().startswith(spec["id"])), None)
+            if matched_rule:
+                conditions.append(f"consistency_detail LIKE '%[{matched_rule}]%'")
+            elif issue_filter in ("Passed (PASS)", "Unique & Clean Only"):
+                conditions.append("consistency_status IN ('UNIQUE', 'PASS') AND (consistency_detail IS NULL OR consistency_detail NOT LIKE '%[%]%')")
+            elif issue_filter in ("All Issues (Warnings & Errors)", "Any Issue / Duplicate"):
+                conditions.append("(consistency_status NOT IN ('UNIQUE', 'PASS') OR consistency_detail LIKE '%[%]%')")
             elif issue_filter == "Cross-File Overlaps Only":
                 conditions.append("consistency_status IN ('CROSS_FILE_DUP', 'CONFLICTING_DATA') AND file_count > 1")
             elif issue_filter == "Intra-File Multipart Only":
@@ -4346,7 +4455,7 @@ class POPCENDatabase:
                 cur.execute("SELECT COUNT(*) FROM gpkg_records WHERE UPPER(ea_type) LIKE '%RETAIN%'")
                 kpis["retained"] = cur.fetchone()[0]
 
-                cur.execute("SELECT COUNT(*) FROM gpkg_records WHERE UPPER(ea_type) LIKE '%SPLIT%'")
+                cur.execute("SELECT COUNT(*) FROM gpkg_records WHERE (UPPER(ea_type) LIKE '%SPLIT%' OR UPPER(ea_type) LIKE '%DELIN%')")
                 kpis["split"] = cur.fetchone()[0]
 
                 cur.execute("SELECT COUNT(*) FROM gpkg_records WHERE UPPER(ea_type) LIKE '%MERG%'")
@@ -4950,10 +5059,8 @@ class POPCENDatabase:
         if ea_lifecycle and ea_lifecycle != "All EA Types":
             if ea_lifecycle == "Retained Only":
                 conditions.append("(UPPER(ea_lifecycle) = 'RETAINED' OR UPPER(ea_type) LIKE '%RETAIN%')")
-            elif ea_lifecycle == "Reset / Delineated Only":
-                conditions.append("(is_reset = 1 OR UPPER(ea_lifecycle) IN ('RESET', 'DELINEATED') OR UPPER(ea_type) LIKE '%DELIN%')")
-            elif ea_lifecycle == "Split EAs Only":
-                conditions.append("(UPPER(ea_lifecycle) LIKE '%SPLIT%' OR UPPER(ea_type) LIKE '%SPLIT%')")
+            elif ea_lifecycle in ("Delineated / Split Only", "Reset / Delineated Only", "Split EAs Only"):
+                conditions.append("(is_reset = 1 OR UPPER(ea_lifecycle) IN ('RESET', 'DELINEATED', 'SPLIT') OR UPPER(ea_type) LIKE '%DELIN%' OR UPPER(ea_type) LIKE '%SPLIT%')")
             elif ea_lifecycle == "Merged EAs Only":
                 conditions.append("(UPPER(ea_lifecycle) LIKE '%MERG%' OR UPPER(ea_type) LIKE '%MERG%')")
             else:

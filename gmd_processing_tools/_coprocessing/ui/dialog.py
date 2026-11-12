@@ -2243,8 +2243,7 @@ class COProcessingDialog(QDialog):
         self.cmb_match_lifecycle_filter.addItems([
             "All EA Types",
             "Retained Only",
-            "Reset / Delineated Only",
-            "Split EAs Only",
+            "Delineated / Split Only",
             "Merged EAs Only",
         ])
         self.cmb_match_lifecycle_filter.currentIndexChanged.connect(self._on_matching_filter_changed)
@@ -2606,8 +2605,8 @@ class COProcessingDialog(QDialog):
             gc_item.setTextAlignment(Qt.AlignCenter)
             self.table_matching.setItem(row_idx, 1, gc_item)
 
-            # Check if this row belongs to 2024 POPCEN
-            is_in_pop = bool(r.get("in_popcen") in (1, "1", True) and r.get("geographic_name"))
+            # Check if this row has POPCEN information
+            is_in_pop = bool(r.get("geographic_name") or r.get("in_popcen") in (1, "1", True))
 
             # 2: Geographic Name
             gn_str = str(r.get("geographic_name", "") or "") if is_in_pop else ""
@@ -2733,12 +2732,10 @@ class COProcessingDialog(QDialog):
             ea_t_item.setTextAlignment(Qt.AlignCenter)
             if "RETAIN" in ea_t_val:
                 ea_t_item.setForeground(QColor("#15803d"))
-            elif "SPLIT" in ea_t_val:
+            elif "SPLIT" in ea_t_val or "DELIN" in ea_t_val or "RESET" in ea_t_val:
                 ea_t_item.setForeground(QColor("#1d4ed8"))
             elif "MERG" in ea_t_val:
                 ea_t_item.setForeground(QColor("#b45309"))
-            elif "DELIN" in ea_t_val or "RESET" in ea_t_val:
-                ea_t_item.setForeground(QColor("#b91c1c"))
             self.table_matching.setItem(row_idx, 19, ea_t_item)
 
             # 20: Source Year
@@ -2909,6 +2906,7 @@ class COProcessingDialog(QDialog):
 
             # 3. Fetch POPCEN only for the uploaded citymuns
             popcen_list_dict = collections.defaultdict(list)
+            bgy_lookup = {}
             if self.cmb_source_mode.currentIndex() == 0 and self.db.is_populated():
                 if uploaded_citymun_codes:
                     with self.db._get_connection() as conn:
@@ -2916,28 +2914,41 @@ class COProcessingDialog(QDialog):
                         placeholders = ','.join('?' for _ in uploaded_citymun_codes)
                         cur.execute(f"""
                             SELECT * FROM popcen_records 
-                            WHERE geographic_level LIKE '%5 - EA%' 
-                              AND SUBSTR(geocode, 1, 5) IN ({placeholders})
+                            WHERE SUBSTR(geocode, 1, 5) IN ({placeholders})
                         """, list(uploaded_citymun_codes))
                         cols = [d[0] for d in cur.description]
                         for row in cur.fetchall():
                             r = dict(zip(cols, row))
                             gc = str(r.get("geocode", "")).strip()
-                            if gc:
-                                popcen_list_dict[gc].append(r)
+                            gl = str(r.get("geographic_level", "")).strip()
+                            if "5 - EA" in gl:
+                                if gc:
+                                    popcen_list_dict[gc].append(r)
+                            elif "4 - Barangay" in gl:
+                                bgy_key = gc[:8] if len(gc) >= 8 else gc
+                                bgy_lookup[bgy_key] = r
                 else:
-                    rows, _ = self.db.query_records(level="5 - EA", limit=500000)
+                    rows, _ = self.db.query_records(limit=500000)
                     for r in rows:
                         gc = str(r.get("geocode", "")).strip()
-                        if gc:
-                            popcen_list_dict[gc].append(r)
+                        gl = str(r.get("geographic_level", "")).strip()
+                        if "5 - EA" in gl:
+                            if gc:
+                                popcen_list_dict[gc].append(r)
+                        elif "4 - Barangay" in gl:
+                            bgy_key = gc[:8] if len(gc) >= 8 else gc
+                            bgy_lookup[bgy_key] = r
             elif not self.popcen_df.empty:
-                filtered_popcen, _ = exclude_non_ea_levels(self.popcen_df)
-                for _, r in filtered_popcen.iterrows():
+                for _, r in self.popcen_df.iterrows():
                     d = r.to_dict()
                     gc = str(d.get("geocode", "")).strip()
-                    if gc:
-                        popcen_list_dict[gc].append(d)
+                    gl = str(d.get("geographic_level", "")).strip()
+                    if "5 - EA" in gl:
+                        if gc:
+                            popcen_list_dict[gc].append(d)
+                    elif "4 - Barangay" in gl:
+                        bgy_key = gc[:8] if len(gc) >= 8 else gc
+                        bgy_lookup[bgy_key] = d
 
             if not popcen_list_dict and not earf_list_dict and not gpkg_list_dict:
                 QMessageBox.warning(self, "No Sources", "Please ensure at least one data source is loaded or configured in the EARF Post-Processing workspace.")
@@ -3042,8 +3053,6 @@ class COProcessingDialog(QDialog):
                         match_status = "UNMATCHED_EARF"
 
                     # 2024 POPCEN fields (Columns 1 to 15):
-                    # Only populated if this row genuinely belongs to 2024 POPCEN table!
-                    # If this is an additional row based on Prelim EARF inputs or GPKG, keep completely blank.
                     if in_p_row:
                         geo_name = str(p_row.get("geographic_name", "") or "").strip()
                         geo_level = str(p_row.get("geographic_level", "") or "5 - EA").strip()
@@ -3063,31 +3072,51 @@ class COProcessingDialog(QDialog):
                         gap_flag = str(p_row.get("ea_with_gap_overlap", "") or "").strip()
                         p_remarks = str(p_row.get("remarks", "") or "").strip()
                     else:
-                        geo_name = ""
-                        geo_level = ""
-                        reg_code = ""
-                        prov_code = ""
-                        mun_code = ""
-                        brgy_code = ""
-                        # For internal grouping / export support, extract PSGC codes if available
-                        if len(gc) == 14 and gc.isdigit():
-                            prov_code = gc[:3]
-                            mun_code = gc[3:5]
-                            brgy_code = gc[5:8]
-                        elif len(gc) == 16 and gc.isdigit():
-                            reg_code = gc[:2]
-                            prov_code = gc[2:5]
-                            mun_code = gc[5:7]
-                            brgy_code = gc[7:10]
-                        old_ean = ""
-                        no_eas = ""
-                        an = ""
+                        # Fallback to barangay record if this EA was not enumerated individually in POPCEN
+                        bgy_key = gc[:8] if len(gc) >= 8 else ""
+                        bgy_row = bgy_lookup.get(bgy_key, {})
+                        
+                        reg_code = str(bgy_row.get("region_code", "") or "").strip()
+                        prov_code = str(bgy_row.get("province_code", "") or "").strip()
+                        mun_code = str(bgy_row.get("city_mun_code", "") or "").strip()
+                        brgy_code = str(bgy_row.get("barangay_code", "") or "").strip()
+                        geo_name = str(bgy_row.get("geographic_name", "") or g_row.get("barangay", "") or "").strip()
+                        geo_level = "5 - EA" if geo_name else ""
+                        
+                        # Fallback for codes from geocode if still empty
+                        if not prov_code or not mun_code or not brgy_code:
+                            if len(gc) == 14 and gc.isdigit():
+                                prov_code = prov_code or gc[:3]
+                                mun_code = mun_code or gc[3:5]
+                                brgy_code = brgy_code or gc[5:8]
+                            elif len(gc) == 16 and gc.isdigit():
+                                reg_code = reg_code or gc[:2]
+                                prov_code = prov_code or gc[2:5]
+                                mun_code = mun_code or gc[5:7]
+                                brgy_code = brgy_code or gc[7:10]
+
+                        # Inferred EAN from geocode or source rows
+                        cand_ean = ""
+                        if len(gc) >= 14 and gc[-6:].isdigit() and gc[-6:] != "000000":
+                            cand_ean = gc[-6:]
+                        elif e_row.get("ea") or g_row.get("ean"):
+                            cand_ean = str(e_row.get("ea") or g_row.get("ean") or "").strip().replace(".0", "")
+                        old_ean = to_whole_number_str(cand_ean)
+                        if old_ean.isdigit() and len(old_ean) < 6:
+                            old_ean = f"{int(old_ean):03d}000" if len(old_ean) <= 3 else f"{int(old_ean):06d}"
+                        
+                        no_eas = "1" if old_ean else ""
+                        if geo_name and old_ean:
+                            an = f"{geo_name} - EA {old_ean}"
+                        else:
+                            an = str(e_row.get("areaname") or g_row.get("name") or geo_name or "").strip()
+                            
                         hh_pop = ""
                         phh = ""
-                        delin_flag = ""
-                        merge_flag = ""
-                        gap_flag = ""
-                        p_remarks = ""
+                        delin_flag = str(bgy_row.get("ea_subject_for_delineation", "") or "").strip()
+                        merge_flag = str(bgy_row.get("ea_subject_for_merging", "") or "").strip()
+                        gap_flag = str(bgy_row.get("ea_with_gap_overlap", "") or "").strip()
+                        p_remarks = str(bgy_row.get("remarks", "") or "").strip()
 
                     ehh = str(e_row.get("household_count") or e_row.get("number_of_households") or g_row.get("hhcount") or g_row.get("hh_count") or "").strip()
 
@@ -3154,11 +3183,11 @@ class COProcessingDialog(QDialog):
                     ea_t = str(e_row.get("ea_type") or g_row.get("ea_type") or "").strip()
                     rem = str(e_row.get("remarks") or g_row.get("remarks") or (p_row.get("remarks") if in_p_row else "") or "").strip()
 
-                    if is_split_ea or "split" in ea_t.lower() or "split" in rem.lower():
-                        lifecycle = "SPLIT"
+                    if is_split_ea or "split" in ea_t.lower() or "delineat" in ea_t.lower() or "split" in rem.lower() or "delineat" in rem.lower():
+                        lifecycle = "DELINEATED"
                     elif "merg" in ea_t.lower() or "merg" in rem.lower():
                         lifecycle = "MERGED"
-                    elif is_reset == 1 or "delineat" in ea_t.lower() or "delineat" in rem.lower():
+                    elif is_reset == 1:
                         lifecycle = "RESET"
                     elif "retain" in ea_t.lower():
                         lifecycle = "RETAINED"
@@ -3191,6 +3220,8 @@ class COProcessingDialog(QDialog):
                         bldg_cnt = ""
                     ea_type_val = ea_t or lifecycle
                     gpkg_ea_type = str(g_row.get("ea_type") or g_row.get("type") or g_row.get("code") or e_row.get("ea_type") or ea_type_val or "").strip().upper()
+                    if "SPLIT" in gpkg_ea_type:
+                        gpkg_ea_type = "DELINEATED"
                     src_year = to_whole_number_str(e_row.get("source_year") or g_row.get("sy") or "")
                     if not src_year:
                         src_year = "2024" if "RETAIN" in gpkg_ea_type.upper() else "2026"
@@ -3710,60 +3741,144 @@ class COProcessingDialog(QDialog):
             self._start_deliverables_export(tasks, is_batch=True, post_action_ask_canvas=False)
 
     def _export_output_summary_excel(self):
-        """Exports formal Output Summary Excel report (.xlsx) with 2 sheets: Output Summary & Validation Flags."""
+        """Exports formal Output Summary Excel report (.xlsx) per citymunicipality with naming convention <pppmm>_<citymun name>_summary."""
         cm = getattr(self, "cmb_match_citymun_filter", None)
         selected_cm = cm.currentData() if cm else None
         flag_val = getattr(self, "cmb_match_flag_filter", None)
         selected_flag = flag_val.currentText() if flag_val else None
 
-        default_name = "Output_Summary_Report.xlsx"
+        export_dir = self.txt_match_export_dir.text().strip() if hasattr(self, "txt_match_export_dir") else ""
+        root_dir = getattr(self, "_final_export_root_dir", None) or DEFAULT_FINAL_EXPORT_ROOT
+        if not os.path.exists(root_dir):
+            if export_dir and os.path.exists(export_dir):
+                root_dir = export_dir
+            else:
+                root_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+
+        # Case 1: A specific City/Municipality is selected in the filter
         if selected_cm:
-            pppmm = selected_cm[:5] if len(selected_cm) >= 5 else selected_cm
-            mun_name = cm.currentText()
+            target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, selected_cm)
+            if not target_folder:
+                target_folder = export_dir if (export_dir and os.path.exists(export_dir)) else root_dir
+            os.makedirs(target_folder, exist_ok=True)
+
+            mun_name = hier.get("city_mun") or cm.currentText()
             clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
             clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
-            if clean_cm:
-                default_name = f"{pppmm}_output_summary_{clean_cm}.xlsx"
+            if not clean_cm:
+                clean_cm = "citymun"
+            pppmm = selected_cm[:5] if len(selected_cm) >= 5 else selected_cm
+            default_name = f"{pppmm}_{clean_cm}_summary.xlsx"
+            default_path = os.path.join(target_folder, default_name)
 
-        f, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Output Summary & Validation Flags",
-            default_name,
-            "Excel Workbook (*.xlsx)"
-        )
-        if not f:
-            return
-        if not f.lower().endswith(".xlsx"):
-            f += ".xlsx"
+            f, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Output Summary & Validation Flags",
+                default_path,
+                "Excel Workbook (*.xlsx)"
+            )
+            if not f:
+                return
+            if not f.lower().endswith(".xlsx"):
+                f += ".xlsx"
 
-        try:
-            res = self.db.export_output_summary_to_excel(
-                out_excel=f,
-                search=self.search_match.text().strip(),
-                status=self.cmb_match_status_filter.currentText(),
-                ea_lifecycle=self.cmb_match_lifecycle_filter.currentText(),
-                flag_filter=selected_flag,
-                city_mun=selected_cm,
-                metadata={
-                    "municipality": cm.currentText() if cm else "All",
-                    "province": getattr(self, "_active_province", ""),
-                    "region": getattr(self, "_active_region", "")
-                }
+            try:
+                res = self.db.export_output_summary_to_excel(
+                    out_excel=f,
+                    search=self.search_match.text().strip(),
+                    status=self.cmb_match_status_filter.currentText(),
+                    ea_lifecycle=self.cmb_match_lifecycle_filter.currentText(),
+                    flag_filter=selected_flag,
+                    city_mun=selected_cm,
+                    metadata={
+                        "municipality": mun_name,
+                        "province": hier.get("province") or getattr(self, "_active_province", ""),
+                        "region": hier.get("region") or getattr(self, "_active_region", "")
+                    }
+                )
+                if not res or not isinstance(res, dict):
+                    res = {"total_rows": 0, "total_flagged": 0}
+                flagged = res.get("total_flagged", 0)
+                rows = res.get("total_rows", 0)
+                msg = (
+                    f"Successfully exported Output Summary table to:\n{f}\n\n"
+                    f"City/Municipality: {mun_name} ({pppmm})\n"
+                    f"Records Audited: {rows:,}\n"
+                    f"Validation Flags Recorded: {flagged:,}\n\n"
+                    f"Sheet 1: 'Output Summary' (Hierarchical rollups & Flag counts)\n"
+                    f"Sheet 2: 'Validation Flags & Exceptions' (Itemized flag details & corrective notes)"
+                )
+                QMessageBox.information(self, "Export Complete", msg)
+            except Exception as e:
+                QMessageBox.critical(self, "Export Failed", f"Failed to export Output Summary: {e}")
+
+        # Case 2: No specific City/Mun selected -> batch export per City/Municipality
+        else:
+            processed_citymuns = self.db.get_processed_citymuns()
+            if not processed_citymuns:
+                QMessageBox.warning(
+                    self,
+                    "No Processed Records",
+                    "No processed City/Municipality records found in the database to export.\n\n"
+                    "Please ensure matching / reconciliation has been performed first."
+                )
+                return
+
+            reply = QMessageBox.question(
+                self,
+                "Export Output Summary Per City/Municipality",
+                f"No specific City/Municipality is selected in the filter.\n\n"
+                f"Would you like to export Output Summary Excel files for all {len(processed_citymuns)} processed City/Municipalities into their respective folders?\n\n"
+                f"File format: <pppmm>_<citymun name>_summary.xlsx",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
             )
-            if not res or not isinstance(res, dict):
-                res = {"total_rows": 0, "total_flagged": 0}
-            flagged = res.get("total_flagged", 0)
-            rows = res.get("total_rows", 0)
-            msg = (
-                f"Successfully exported Output Summary table to:\n{f}\n\n"
-                f"Records Audited: {rows:,}\n"
-                f"Validation Flags Recorded: {flagged:,}\n\n"
-                f"Sheet 1: 'Output Summary' (Hierarchical rollups & Flag counts)\n"
-                f"Sheet 2: 'Validation Flags & Exceptions' (Itemized flag details & corrective notes)"
-            )
-            QMessageBox.information(self, "Export Complete", msg)
-        except Exception as e:
-            QMessageBox.critical(self, "Export Failed", f"Failed to export Output Summary: {e}")
+            if reply != QMessageBox.Yes:
+                return
+
+            exported_files = []
+            errors = []
+            for cm_item in processed_citymuns:
+                c_code = cm_item["code"]
+                target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, c_code)
+                if not target_folder:
+                    target_folder = export_dir if (export_dir and os.path.exists(export_dir)) else root_dir
+                os.makedirs(target_folder, exist_ok=True)
+
+                m_name = hier.get("city_mun") or cm_item["name"]
+                clean_cm = re.sub(r'\s*\([^)]*\)', '', m_name)
+                clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
+                if not clean_cm:
+                    clean_cm = "citymun"
+                pppmm = c_code[:5] if len(c_code) >= 5 else c_code
+                out_summary_filename = f"{pppmm}_{clean_cm}_summary.xlsx"
+                out_summary_path = os.path.join(target_folder, out_summary_filename)
+
+                try:
+                    self.db.export_output_summary_to_excel(
+                        out_excel=out_summary_path,
+                        search=self.search_match.text().strip(),
+                        status=self.cmb_match_status_filter.currentText(),
+                        ea_lifecycle=self.cmb_match_lifecycle_filter.currentText(),
+                        flag_filter=selected_flag,
+                        city_mun=c_code,
+                        metadata={
+                            "municipality": m_name,
+                            "province": hier.get("province") or getattr(self, "_active_province", ""),
+                            "region": hier.get("region") or getattr(self, "_active_region", "")
+                        }
+                    )
+                    exported_files.append(out_summary_path)
+                except Exception as ex:
+                    errors.append(f"{m_name} ({pppmm}): {ex}")
+
+            if exported_files:
+                msg = f"Successfully exported Output Summary for {len(exported_files)} City/Municipalities (<pppmm>_<citymun name>_summary.xlsx)."
+                if errors:
+                    msg += f"\n\nEncountered errors in {len(errors)} municipalities:\n" + "\n".join(errors[:5])
+                QMessageBox.information(self, "Export Complete", msg)
+            elif errors:
+                QMessageBox.critical(self, "Export Failed", "Failed to export Output Summaries:\n" + "\n".join(errors[:5]))
 
     def _export_matching_csv(self):
         """Compatibility wrapper forwarding to Output Summary Excel export."""
@@ -4103,11 +4218,17 @@ class COProcessingDialog(QDialog):
         self.btn_consolidate_earf.clicked.connect(self._consolidate_folder_prompt)
         folder_layout.addWidget(self.btn_consolidate_earf)
 
-        self.btn_run_consistency = QPushButton("Run Consistency Check")
+        self.btn_run_consistency = QPushButton("Run Validation Checks")
         self.btn_run_consistency.setObjectName("primaryBtn")
-        self.btn_run_consistency.setToolTip("Run R1 (Geocode Format) & R6 (POPCEN Match) consistency checks across consolidated records")
+        self.btn_run_consistency.setToolTip("Run 13 completeness & consistency validation rules across consolidated EARF records")
         self.btn_run_consistency.clicked.connect(self._run_consistency_check_prompt)
         folder_layout.addWidget(self.btn_run_consistency)
+
+        self.btn_export_validation_excel = QPushButton("Export Validation Report (Excel)")
+        self.btn_export_validation_excel.setObjectName("actionBtn")
+        self.btn_export_validation_excel.setToolTip("Export official multi-sheet Excel validation report (Summary + Sheets 2–14 per validation_id)")
+        self.btn_export_validation_excel.clicked.connect(self._export_earf_validation_excel)
+        folder_layout.addWidget(self.btn_export_validation_excel)
 
         self.btn_earf_stop = QPushButton("Stop")
         self.btn_earf_stop.setObjectName("stopBtn")
@@ -4163,7 +4284,7 @@ class COProcessingDialog(QDialog):
         self.kpi_earf_consistency = self._create_kpi_card("Consistency", "Pending Check", "#64748b")
         self.kpi_earf_popcen_warn = self._create_kpi_card("Missing POPCEN", "0", "#b45309")
         self.kpi_earf_retained = self._create_kpi_card("Retained EAs", "0", "#16a34a")
-        self.kpi_earf_split = self._create_kpi_card("Split EAs", "0", "#2563eb")
+        self.kpi_earf_split = self._create_kpi_card("Delineated EAs", "0", "#2563eb")
         self.kpi_earf_merged = self._create_kpi_card("Merged EAs", "0", "#ea580c")
 
         for k in (
@@ -4209,25 +4330,35 @@ class COProcessingDialog(QDialog):
 
         filter_bar.addWidget(QLabel("Consistency:"))
         self.cmb_earf_consistency_filter = QComboBox()
-        self.cmb_earf_consistency_filter.addItems([
+        earf_filter_items = [
             "All Records",
             "Passed (PASS)",
             "All Issues (Warnings & Errors)",
-            "R6: Missing in POPCEN (Warning)",
-            "R1: Invalid Geocode (Error)",
-        ])
+        ]
+        try:
+            from ..core.prelim_earf_validator import VALIDATION_SPECS
+            for spec in VALIDATION_SPECS:
+                earf_filter_items.append(f"[{spec['id']}] {spec['title']}")
+        except Exception:
+            try:
+                from core.prelim_earf_validator import VALIDATION_SPECS
+                for spec in VALIDATION_SPECS:
+                    earf_filter_items.append(f"[{spec['id']}] {spec['title']}")
+            except Exception:
+                pass
+        self.cmb_earf_consistency_filter.addItems(earf_filter_items)
         self.cmb_earf_consistency_filter.currentIndexChanged.connect(self._on_earf_filter_changed)
         filter_bar.addWidget(self.cmb_earf_consistency_filter)
 
         filter_bar.addWidget(QLabel("EA Type:"))
         self.cmb_earf_type_filter = QComboBox()
-        self.cmb_earf_type_filter.addItems(["All EA Types", "RETAINED", "SPLIT", "MERGED", "Other"])
+        self.cmb_earf_type_filter.addItems(["All EA Types", "RETAINED", "DELINEATED", "MERGED", "Other"])
         self.cmb_earf_type_filter.currentIndexChanged.connect(self._on_earf_filter_changed)
         filter_bar.addWidget(self.cmb_earf_type_filter)
 
         self.chk_earf_only_with_new_ea = QCheckBox("With New EA Code (2026)")
-        self.chk_earf_only_with_new_ea.setChecked(True)
-        self.chk_earf_only_with_new_ea.setToolTip("Only view rows with valid values in New EA Code (2026)")
+        self.chk_earf_only_with_new_ea.setChecked(False)
+        self.chk_earf_only_with_new_ea.setToolTip("Filter to view only rows with values in New EA Code (2026)")
         self.chk_earf_only_with_new_ea.setStyleSheet("font-weight: 600; color: #047857;")
         self.chk_earf_only_with_new_ea.stateChanged.connect(self._on_earf_filter_changed)
         filter_bar.addWidget(self.chk_earf_only_with_new_ea)
@@ -4336,9 +4467,15 @@ class COProcessingDialog(QDialog):
 
         self.btn_run_gpkg_consistency = QPushButton("Run Consistency Check")
         self.btn_run_gpkg_consistency.setObjectName("primaryBtn")
-        self.btn_run_gpkg_consistency.setToolTip("Run multi-file consistency, cross-file duplicate, and multipart checks across consolidated records")
+        self.btn_run_gpkg_consistency.setToolTip("Run multi-file consistency, overlap, and 13 completeness/consistency rules across consolidated records")
         self.btn_run_gpkg_consistency.clicked.connect(self._run_gpkg_consistency_check_prompt)
         folder_layout.addWidget(self.btn_run_gpkg_consistency)
+
+        self.btn_export_gpkg_validation_excel = QPushButton("Export Validation Report (Excel)")
+        self.btn_export_gpkg_validation_excel.setObjectName("actionBtn")
+        self.btn_export_gpkg_validation_excel.setToolTip("Export official multi-sheet Excel validation report for GeoPackage (Summary + Sheets 2–14)")
+        self.btn_export_gpkg_validation_excel.clicked.connect(self._export_gpkg_validation_excel)
+        folder_layout.addWidget(self.btn_export_gpkg_validation_excel)
 
         self.btn_gpkg_stop = QPushButton("Stop")
         self.btn_gpkg_stop.setObjectName("stopBtn")
@@ -4391,7 +4528,7 @@ class COProcessingDialog(QDialog):
         self.kpi_gpkg_overlaps = self._create_kpi_card("Cross-File Overlaps", "0", "#dc2626")
         self.kpi_gpkg_consistency = self._create_kpi_card("Consistency", "Pending Check", "#64748b")
         self.kpi_gpkg_retained = self._create_kpi_card("Retained EAs", "0", "#16a34a")
-        self.kpi_gpkg_split = self._create_kpi_card("Split EAs", "0", "#0284c7")
+        self.kpi_gpkg_split = self._create_kpi_card("Delineated EAs", "0", "#0284c7")
         self.kpi_gpkg_merged = self._create_kpi_card("Merged EAs", "0", "#ea580c")
 
         for k in (
@@ -4437,21 +4574,32 @@ class COProcessingDialog(QDialog):
 
         filter_bar.addWidget(QLabel("Consistency:"))
         self.cmb_gpkg_issue_filter = QComboBox()
-        self.cmb_gpkg_issue_filter.addItems([
+        gpkg_filter_items = [
             "All Records",
-            "Any Issue / Duplicate",
+            "Passed (PASS)",
+            "All Issues (Warnings & Errors)",
             "Cross-File Overlaps Only",
             "Intra-File Multipart Only",
-            "Conflicting Data Only",
             "Missing Geometry Only",
-            "Unique & Clean Only",
-        ])
+        ]
+        try:
+            from ..core.gpkg_validator import GPKG_VALIDATION_SPECS
+            for spec in GPKG_VALIDATION_SPECS:
+                gpkg_filter_items.append(f"[{spec['id']}] {spec['title']}")
+        except Exception:
+            try:
+                from core.gpkg_validator import GPKG_VALIDATION_SPECS
+                for spec in GPKG_VALIDATION_SPECS:
+                    gpkg_filter_items.append(f"[{spec['id']}] {spec['title']}")
+            except Exception:
+                pass
+        self.cmb_gpkg_issue_filter.addItems(gpkg_filter_items)
         self.cmb_gpkg_issue_filter.currentIndexChanged.connect(self._on_gpkg_filter_changed)
         filter_bar.addWidget(self.cmb_gpkg_issue_filter)
 
         filter_bar.addWidget(QLabel("EA Type:"))
         self.cmb_gpkg_type_filter = QComboBox()
-        self.cmb_gpkg_type_filter.addItems(["All EA Types", "RETAINED", "SPLIT", "MERGED", "Other"])
+        self.cmb_gpkg_type_filter.addItems(["All EA Types", "RETAINED", "DELINEATED", "MERGED", "Other"])
         self.cmb_gpkg_type_filter.currentIndexChanged.connect(self._on_gpkg_filter_changed)
         filter_bar.addWidget(self.cmb_gpkg_type_filter)
 
@@ -5981,16 +6129,23 @@ class COProcessingDialog(QDialog):
         err_cnt = results.get("errors", 0)
         rate = results.get("pass_rate", 0.0)
 
+        summary = results.get("summary", [])
+        top_issues = [f"  • {s['title']} ({s['validation_id']}): {s['frequency']:,}" for s in summary if s.get("frequency", 0) > 0]
+        issue_str = "\n".join(top_issues) if top_issues else "  • Zero validation issues detected!"
+
         msg = (
-            f"Consistency Check Complete (R1 & R6)!\n\n"
+            f"Completeness & Consistency Check Complete!\n\n"
             f"• Total Records Evaluated: {total:,}\n"
-            f"• Passed (R1 & R6): {passed:,}\n"
-            f"• R6 Warnings (Missing in POPCEN): {warn:,}\n"
-            f"• R1 Errors (Invalid Geocode): {err_cnt:,}\n\n"
-            f"Pass Rate: {rate}%\n\n"
-            "Use the 'Consistency' filter dropdown to isolate records missing in POPCEN or with invalid geocodes."
+            f"• Passed Cleanly: {passed:,}\n"
+            f"• Warning Records: {warn:,}\n"
+            f"• Error Records: {err_cnt:,}\n\n"
+            f"Overall Pass Rate: {rate}%\n\n"
+            f"Rule Inconsistencies Detected:\n{issue_str}\n\n"
+            f"Tips:\n"
+            f"• Use the 'Consistency' dropdown to filter by specific validation rules.\n"
+            f"• Click 'Export Validation Report (Excel)' for the multi-sheet breakdown (Sheets 1–14)."
         )
-        QMessageBox.information(self, "Consistency Results", msg)
+        QMessageBox.information(self, "Validation Results", msg)
 
     def _fetch_and_render_earf_db_page(self):
         search_txt = self.search_earf.text().strip()
@@ -6111,17 +6266,6 @@ class COProcessingDialog(QDialog):
 
         if earf_dfs:
             self.earf_df = pd.concat(earf_dfs, ignore_index=True)
-            type_col = next((c for c in self.earf_df.columns if any(k in str(c).strip().lower() for k in ["ea_type", "ea type", "type"])), None)
-            year_col = next((c for c in self.earf_df.columns if any(k in str(c).strip().lower() for k in ["source_year", "source year", "source yr", "sy", "year"])), None)
-            if not year_col:
-                year_col = "source_year"
-                self.earf_df[year_col] = "2026"
-            if type_col:
-                mask_retained = self.earf_df[type_col].astype(str).str.strip().str.upper().str.contains("RETAIN", na=False)
-                self.earf_df.loc[mask_retained, year_col] = "2024"
-                self.earf_df.loc[~mask_retained, year_col] = "2026"
-            else:
-                self.earf_df[year_col] = "2026"
         else:
             self.earf_df = pd.DataFrame()
 
@@ -6164,7 +6308,7 @@ class COProcessingDialog(QDialog):
         if type_col:
             types_upper = df[type_col].astype(str).str.upper()
             retained = types_upper.str.contains("RETAIN", na=False).sum()
-            split = types_upper.str.contains("SPLIT", na=False).sum()
+            split = types_upper.str.contains("SPLIT|DELIN", na=False).sum()
             merged = types_upper.str.contains("MERG", na=False).sum()
             self.kpi_earf_retained.val_label.setText(f"{retained:,}")
             self.kpi_earf_split.val_label.setText(f"{split:,}")
@@ -6194,7 +6338,7 @@ class COProcessingDialog(QDialog):
         type_col = next((c for c in df.columns if "type" in c.lower()), None)
         if type_col and ea_type_filter != "All EA Types":
             if ea_type_filter == "Other":
-                df = df[~df[type_col].astype(str).str.upper().str.contains("RETAIN|SPLIT|MERG", na=False)]
+                df = df[~df[type_col].astype(str).str.upper().str.contains("RETAIN|SPLIT|DELIN|MERG", na=False)]
             else:
                 df = df[df[type_col].astype(str).str.upper().str.contains(ea_type_filter, na=False)]
 
@@ -6293,17 +6437,6 @@ class COProcessingDialog(QDialog):
             return
 
         df = df.copy()
-        type_col = next((c for c in df.columns if any(k in str(c).strip().lower() for k in ["ea_type", "ea type", "type"])), None)
-        year_col = next((c for c in df.columns if any(k in str(c).strip().lower() for k in ["source_year", "source year", "source yr", "sy", "year"])), None)
-        if not year_col:
-            year_col = "source_year"
-            df[year_col] = "2026"
-        if type_col:
-            mask_retained = df[type_col].astype(str).str.strip().str.upper().str.contains("RETAIN", na=False)
-            df.loc[mask_retained, year_col] = "2024"
-            df.loc[~mask_retained, year_col] = "2026"
-        else:
-            df[year_col] = "2026"
 
         preferred_order = [
             "geocode",
@@ -6530,6 +6663,62 @@ class COProcessingDialog(QDialog):
             QMessageBox.information(self, "Export Success", f"Consistency issues report exported to:\n{f}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", f"Export failed:\n{e}")
+
+    def _export_earf_validation_excel(self):
+        """Exports the official multi-sheet Excel validation report (Summary + Sheets 2–14)."""
+        if self.cmb_earf_source_mode.currentIndex() != 0:
+            QMessageBox.information(
+                self,
+                "Database Mode Required",
+                "Please switch to 'Consolidated Database (SQLite: earf_database.db)' mode to export validation reports."
+            )
+            return
+
+        count = self.db.earf_record_count()
+        if count == 0:
+            QMessageBox.warning(self, "No Records", "No Preliminary EARF records found in the database.")
+            return
+
+        f, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Completeness & Consistency Validation Report",
+            "prelim_earf_validation_report.xlsx",
+            "Excel Files (*.xlsx)"
+        )
+        if not f:
+            return
+
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            if self.progress_bar:
+                self.progress_bar.setValue(10)
+            self.lbl_earf_table_info.setText("Generating multi-sheet Excel validation report...")
+
+            out_path = self.db.export_prelim_earf_validation_excel(
+                f,
+                progress_callback=lambda p, m: ((self.progress_bar.setValue(p) if self.progress_bar else None), self.lbl_earf_table_info.setText(m))
+            )
+
+            if self.progress_bar:
+                self.progress_bar.setValue(100)
+            self.lbl_earf_table_info.setText(f"Validation report exported: {os.path.basename(out_path)}")
+            QApplication.restoreOverrideCursor()
+
+            # Refresh table display with newly saved consistency tags
+            self._fetch_and_render_earf_db_page()
+
+            QMessageBox.information(
+                self,
+                "Export Success",
+                f"Official Completeness & Consistency Validation Report successfully generated!\n\n"
+                f"File: {out_path}\n\n"
+                f"Includes:\n"
+                f" • Sheet 1: Summary (List of Inconsistencies & Frequencies)\n"
+                f" • Sheets 2–14: Individual validation tables per validation_id"
+            )
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Export Error", f"Failed to generate validation report:\n{e}")
 
     # ----------------------------------------------------------------------
     # Preliminary EARF Record Selection & Removal Logic
@@ -6968,17 +7157,25 @@ class COProcessingDialog(QDialog):
         conflicts = results.get("attribute_conflicts", 0)
         missing_geom = results.get("missing_geometry", 0)
         invalid_gc = results.get("invalid_geocodes", 0)
+        passed = results.get("passed", 0)
+        rate = results.get("pass_rate", 0.0)
+
+        summary = results.get("summary", [])
+        top_issues = [f"  • {s['title']} ({s['validation_id']}): {s['frequency']:,}" for s in summary if s.get("frequency", 0) > 0]
+        issue_str = "\n".join(top_issues) if top_issues else "  • Zero validation issues detected!"
 
         msg = (
             f"EA GeoPackage Consistency Check Complete!\n\n"
             f"• Total Features Checked: {total:,}\n"
             f"• Unique Geocodes: {unique:,}\n"
+            f"• Passed Cleanly: {passed:,} ({rate}%)\n"
             f"• Cross-File Overlaps: {overlaps:,}\n"
             f"• Multipart EA Geocodes: {multiparts:,}\n"
-            f"• Attribute Conflicts: {conflicts:,}\n"
-            f"• Missing Geometry: {missing_geom:,}\n"
-            f"• Invalid Geocodes: {invalid_gc:,}\n\n"
-            "Use the 'Consistency' dropdown filter to isolate overlapping or conflicted records."
+            f"• Attribute Conflicts: {conflicts:,}\n\n"
+            f"Rule Inconsistencies Detected:\n{issue_str}\n\n"
+            f"Tips:\n"
+            f"• Use the 'Consistency' dropdown filter to isolate specific validation rules.\n"
+            f"• Click 'Export Validation Report (Excel)' for the multi-sheet breakdown (Sheets 1–14)."
         )
         QMessageBox.information(self, "GPKG Consistency Results", msg)
 
@@ -7237,7 +7434,7 @@ class COProcessingDialog(QDialog):
         if type_col:
             types_upper = df[type_col].astype(str).str.upper()
             retained = types_upper.str.contains("RETAIN", na=False).sum()
-            split = types_upper.str.contains("SPLIT", na=False).sum()
+            split = types_upper.str.contains("SPLIT|DELIN", na=False).sum()
             merged = types_upper.str.contains("MERG", na=False).sum()
             self.kpi_gpkg_retained.val_label.setText(f"{retained:,}")
             self.kpi_gpkg_split.val_label.setText(f"{split:,}")
@@ -7276,7 +7473,7 @@ class COProcessingDialog(QDialog):
         type_col = next((c for c in df.columns if "ea_type" in c.lower() or "type" in c.lower()), None)
         if type_col and ea_type_filter != "All EA Types":
             if ea_type_filter == "Other":
-                df = df[~df[type_col].astype(str).str.upper().str.contains("RETAIN|SPLIT|MERG", na=False)]
+                df = df[~df[type_col].astype(str).str.upper().str.contains("RETAIN|SPLIT|DELIN|MERG", na=False)]
             else:
                 df = df[df[type_col].astype(str).str.upper().str.contains(ea_type_filter, na=False)]
 
@@ -7648,6 +7845,62 @@ class COProcessingDialog(QDialog):
                 QMessageBox.information(self, "Export Success", f"EA GeoPackage attributes exported to:\n{f}")
             except Exception as e:
                 QMessageBox.critical(self, "Export Error", f"Export failed:\n{e}")
+
+    def _export_gpkg_validation_excel(self):
+        """Exports the official multi-sheet Excel validation report for GeoPackage (Summary + Sheets 2–14)."""
+        if self.cmb_gpkg_source_mode.currentIndex() != 0:
+            QMessageBox.information(
+                self,
+                "Database Mode Required",
+                "Please switch to 'Consolidated Database (SQLite: gpkg_database.db)' mode to export validation reports."
+            )
+            return
+
+        count = self.db.gpkg_record_count()
+        if count == 0:
+            QMessageBox.warning(self, "No Records", "No GeoPackage records found in the database.")
+            return
+
+        f, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export GeoPackage Validation Report",
+            "gpkg_validation_report.xlsx",
+            "Excel Files (*.xlsx)"
+        )
+        if not f:
+            return
+
+        try:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            if self.progress_bar:
+                self.progress_bar.setValue(10)
+            self.lbl_gpkg_table_info.setText("Generating multi-sheet GeoPackage Excel validation report...")
+
+            out_path = self.db.export_gpkg_validation_excel(
+                f,
+                progress_callback=lambda p, m: ((self.progress_bar.setValue(p) if self.progress_bar else None), self.lbl_gpkg_table_info.setText(m))
+            )
+
+            if self.progress_bar:
+                self.progress_bar.setValue(100)
+            self.lbl_gpkg_table_info.setText(f"Validation report exported: {os.path.basename(out_path)}")
+            QApplication.restoreOverrideCursor()
+
+            # Refresh table display with newly saved consistency tags
+            self._fetch_and_render_gpkg_db_page()
+
+            QMessageBox.information(
+                self,
+                "Export Success",
+                f"Official GeoPackage Completeness & Consistency Validation Report successfully generated!\n\n"
+                f"File: {out_path}\n\n"
+                f"Includes:\n"
+                f" • Sheet 1: Summary (List of Inconsistencies & Frequencies)\n"
+                f" • Sheets 2–14: Individual validation tables per validation_id"
+            )
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Export Error", f"Failed to generate GeoPackage validation report:\n{e}")
 
     # ----------------------------------------------------------------------
     # EA GeoPackage Feature Selection & Removal Logic
@@ -8099,12 +8352,12 @@ class COProcessingDialog(QDialog):
                     ea_t = str(d.get("earf_ea_type") or d.get("gpkg_ea_type") or "").strip()
                     rem = str(d.get("earf_remarks") or d.get("gpkg_remarks") or d.get("popcen_remarks") or "").strip()
 
-                    has_split = geocode_counts.get(gc, 0) > 1 or is_duplicate or "split" in ea_t.lower() or "split" in rem.lower()
+                    has_split = geocode_counts.get(gc, 0) > 1 or is_duplicate or "split" in ea_t.lower() or "delineat" in ea_t.lower() or "split" in rem.lower() or "delineat" in rem.lower()
                     if has_split:
-                        lifecycle = "SPLIT"
+                        lifecycle = "DELINEATED"
                     elif "merg" in ea_t.lower() or "merg" in rem.lower():
                         lifecycle = "MERGED"
-                    elif is_reset == 1 or "delineat" in ea_t.lower():
+                    elif is_reset == 1:
                         lifecycle = "RESET"
                     elif "retain" in ea_t.lower():
                         lifecycle = "RETAINED"

@@ -174,18 +174,30 @@ class GMDCOProcessingPlugin:
                 pass
             self.dock = None
 
-        # Guard against any orphaned dock widgets with the same object name in the main window
+        # Close any open EARF Post-Processing dialogs so that old UI instances
+        # don't linger across plugin reloads
         main_win = self.iface.mainWindow() if self.iface else None
         if main_win:
             try:
-                from .ui.dock_widget import GMDCOProcessingDock
-                for orphan in main_win.findChildren(GMDCOProcessingDock):
-                    try:
-                        self.iface.removeDockWidget(orphan)
-                        orphan.close()
-                        orphan.setParent(None)
-                        orphan.deleteLater()
-                    except Exception:
-                        pass
+                from qgis.PyQt.QtWidgets import QDialog
+                for dlg in main_win.findChildren(QDialog):
+                    if dlg.objectName() == "COProcessingDialog":
+                        try:
+                            dlg.close()
+                            dlg.setParent(None)
+                            dlg.deleteLater()
+                        except Exception:
+                            pass
             except Exception:
                 pass
+
+        # Clear cached modules from sys.modules to guarantee clean re-import
+        import sys
+        for mod_name in list(sys.modules.keys()):
+            if (
+                mod_name.startswith("GMD_COProcessing")
+                or mod_name.startswith("_coprocessing")
+                or mod_name.startswith("gmd_processing_tools")
+                or mod_name in ("dialog", "database", "plugin", "script_registry")
+            ):
+                del sys.modules[mod_name]
