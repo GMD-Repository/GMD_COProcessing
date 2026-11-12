@@ -43,6 +43,7 @@ flowchart LR
     C -->|match| S[Still detected]
     C -->|check only| N[Newly detected]
     C -->|remaining only| G[No longer detected]
+    C -->|type not looked for| U[Not checked]
     S --> L[ppp_mbi layer<br/>one row per involved barangay]
     N --> L
     G --> L
@@ -70,6 +71,13 @@ flowchart LR
    - A detection with a match is **Still detected**.
    - A detection without one is **Newly detected**.
    - A remaining MBI that no detection matched is added back as **No longer detected**, with nothing to cover.
+   - A remaining MBI of a type **this run did not look for** is added back as **Not checked** — it was never
+     counter-checked, so it must not read as resolved. It is **still an open case**: it is written one row per
+     involved barangay, exactly like a detection, so the covering barangay is chosen for it as usual. Run the
+     mode that covers its type to counter-check it as well.
+     If the remaining layer carries an `mbi_scope` field (the National-Level MBI Checker writes it), the log
+     reports which MBI types the run that produced it looked for — so a layer made with disputed areas
+     ignored is recognisable, and the contested polygons found now are expected as **Newly detected**.
 4. **Split per barangay.** Each case is written as one row per involved barangay: the same geometry, with
    that barangay's `geocode` and names. This becomes the `ppp_mbi` layer.
 5. **Decide.** For each case, the MBI is clipped to every involved barangay (MBI ∩ barangay) to get the part
@@ -94,6 +102,7 @@ touching along an edge is not a match).
 | **Still detected** | The check still finds the remaining MBI | normal row |
 | **Newly detected** | Found by the check, but not in the remaining layer | **light green** row |
 | **No longer detected** | A remaining MBI the check no longer finds | grey, cannot be ticked |
+| **Not checked** | A remaining MBI of a type this run did not look for — never counter-checked, but still to be covered | blue-grey Detection cell; ticked as usual |
 
 - Disputed remaining MBIs are **not skipped**. A remaining Disputed (or untyped) MBI matches any detection
   sharing area; a Gap or Overlap matches the same type only.
