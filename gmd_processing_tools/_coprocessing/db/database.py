@@ -3351,7 +3351,7 @@ class POPCENDatabase:
                         "household_count": _get_val(["household count (2026)", "household count", "household_count", "hh_count", "hhcount"]),
                         "building_count": _get_val(["building count (2026)", "building count", "building_count", "bldg_count", "bldgcount"]),
                         "ea_type": _get_val(["ea type", "ea_type", "type"]),
-                        "source_year": "2024" if "retain" in _get_val(["ea type", "ea_type", "type"]).lower() else "2026",
+                        "source_year": _get_val(["source year", "source_year", "sy", "source yr", "year"]),
                         "remarks": _get_val(["remarks", "remark", "notes"]),
                         "source_file": fname,
                         "match_status": "Pending Match",

@@ -329,20 +329,6 @@ def read_earf_table(file_path, sheet_name=0):
             if "source_year" not in df.columns:
                 df["source_year"] = df[col]
 
-    # If EA Type is Retained, set source_year to 2024, else 2026
-    type_col = next((c for c in df.columns if any(k in str(c).strip().lower() for k in ["ea_type", "ea type", "type"])), None)
-    year_col = next((c for c in df.columns if any(k in str(c).strip().lower() for k in ["source_year", "source year", "source yr", "sy", "year"])), None)
-    if not year_col:
-        year_col = "source_year"
-        df[year_col] = "2026"
-
-    if type_col:
-        mask_retained = df[type_col].astype(str).str.strip().str.upper().str.contains("RETAIN", na=False)
-        df.loc[mask_retained, year_col] = "2024"
-        df.loc[~mask_retained, year_col] = "2026"
-    else:
-        df[year_col] = "2026"
-
     return df
 
 

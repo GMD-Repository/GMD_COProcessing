@@ -4341,8 +4341,8 @@ class COProcessingDialog(QDialog):
         filter_bar.addWidget(self.cmb_earf_type_filter)
 
         self.chk_earf_only_with_new_ea = QCheckBox("With New EA Code (2026)")
-        self.chk_earf_only_with_new_ea.setChecked(True)
-        self.chk_earf_only_with_new_ea.setToolTip("Only view rows with valid values in New EA Code (2026)")
+        self.chk_earf_only_with_new_ea.setChecked(False)
+        self.chk_earf_only_with_new_ea.setToolTip("Filter to view only rows with values in New EA Code (2026)")
         self.chk_earf_only_with_new_ea.setStyleSheet("font-weight: 600; color: #047857;")
         self.chk_earf_only_with_new_ea.stateChanged.connect(self._on_earf_filter_changed)
         filter_bar.addWidget(self.chk_earf_only_with_new_ea)
@@ -6226,17 +6226,6 @@ class COProcessingDialog(QDialog):
 
         if earf_dfs:
             self.earf_df = pd.concat(earf_dfs, ignore_index=True)
-            type_col = next((c for c in self.earf_df.columns if any(k in str(c).strip().lower() for k in ["ea_type", "ea type", "type"])), None)
-            year_col = next((c for c in self.earf_df.columns if any(k in str(c).strip().lower() for k in ["source_year", "source year", "source yr", "sy", "year"])), None)
-            if not year_col:
-                year_col = "source_year"
-                self.earf_df[year_col] = "2026"
-            if type_col:
-                mask_retained = self.earf_df[type_col].astype(str).str.strip().str.upper().str.contains("RETAIN", na=False)
-                self.earf_df.loc[mask_retained, year_col] = "2024"
-                self.earf_df.loc[~mask_retained, year_col] = "2026"
-            else:
-                self.earf_df[year_col] = "2026"
         else:
             self.earf_df = pd.DataFrame()
 
@@ -6408,17 +6397,6 @@ class COProcessingDialog(QDialog):
             return
 
         df = df.copy()
-        type_col = next((c for c in df.columns if any(k in str(c).strip().lower() for k in ["ea_type", "ea type", "type"])), None)
-        year_col = next((c for c in df.columns if any(k in str(c).strip().lower() for k in ["source_year", "source year", "source yr", "sy", "year"])), None)
-        if not year_col:
-            year_col = "source_year"
-            df[year_col] = "2026"
-        if type_col:
-            mask_retained = df[type_col].astype(str).str.strip().str.upper().str.contains("RETAIN", na=False)
-            df.loc[mask_retained, year_col] = "2024"
-            df.loc[~mask_retained, year_col] = "2026"
-        else:
-            df[year_col] = "2026"
 
         preferred_order = [
             "geocode",
