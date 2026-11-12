@@ -176,6 +176,7 @@ class GMDCOProcessingPlugin:
 
         # Close any open EARF Post-Processing dialogs so that old UI instances
         # don't linger across plugin reloads
+        main_win = self.iface.mainWindow() if self.iface else None
         if main_win:
             try:
                 from qgis.PyQt.QtWidgets import QDialog
