@@ -2243,8 +2243,7 @@ class COProcessingDialog(QDialog):
         self.cmb_match_lifecycle_filter.addItems([
             "All EA Types",
             "Retained Only",
-            "Reset / Delineated Only",
-            "Split EAs Only",
+            "Delineated / Split Only",
             "Merged EAs Only",
         ])
         self.cmb_match_lifecycle_filter.currentIndexChanged.connect(self._on_matching_filter_changed)
@@ -2733,12 +2732,10 @@ class COProcessingDialog(QDialog):
             ea_t_item.setTextAlignment(Qt.AlignCenter)
             if "RETAIN" in ea_t_val:
                 ea_t_item.setForeground(QColor("#15803d"))
-            elif "SPLIT" in ea_t_val:
+            elif "SPLIT" in ea_t_val or "DELIN" in ea_t_val or "RESET" in ea_t_val:
                 ea_t_item.setForeground(QColor("#1d4ed8"))
             elif "MERG" in ea_t_val:
                 ea_t_item.setForeground(QColor("#b45309"))
-            elif "DELIN" in ea_t_val or "RESET" in ea_t_val:
-                ea_t_item.setForeground(QColor("#b91c1c"))
             self.table_matching.setItem(row_idx, 19, ea_t_item)
 
             # 20: Source Year
@@ -3186,11 +3183,11 @@ class COProcessingDialog(QDialog):
                     ea_t = str(e_row.get("ea_type") or g_row.get("ea_type") or "").strip()
                     rem = str(e_row.get("remarks") or g_row.get("remarks") or (p_row.get("remarks") if in_p_row else "") or "").strip()
 
-                    if is_split_ea or "split" in ea_t.lower() or "split" in rem.lower():
-                        lifecycle = "SPLIT"
+                    if is_split_ea or "split" in ea_t.lower() or "delineat" in ea_t.lower() or "split" in rem.lower() or "delineat" in rem.lower():
+                        lifecycle = "DELINEATED"
                     elif "merg" in ea_t.lower() or "merg" in rem.lower():
                         lifecycle = "MERGED"
-                    elif is_reset == 1 or "delineat" in ea_t.lower() or "delineat" in rem.lower():
+                    elif is_reset == 1:
                         lifecycle = "RESET"
                     elif "retain" in ea_t.lower():
                         lifecycle = "RETAINED"
@@ -3223,6 +3220,8 @@ class COProcessingDialog(QDialog):
                         bldg_cnt = ""
                     ea_type_val = ea_t or lifecycle
                     gpkg_ea_type = str(g_row.get("ea_type") or g_row.get("type") or g_row.get("code") or e_row.get("ea_type") or ea_type_val or "").strip().upper()
+                    if "SPLIT" in gpkg_ea_type:
+                        gpkg_ea_type = "DELINEATED"
                     src_year = to_whole_number_str(e_row.get("source_year") or g_row.get("sy") or "")
                     if not src_year:
                         src_year = "2024" if "RETAIN" in gpkg_ea_type.upper() else "2026"
@@ -4279,7 +4278,7 @@ class COProcessingDialog(QDialog):
         self.kpi_earf_consistency = self._create_kpi_card("Consistency", "Pending Check", "#64748b")
         self.kpi_earf_popcen_warn = self._create_kpi_card("Missing POPCEN", "0", "#b45309")
         self.kpi_earf_retained = self._create_kpi_card("Retained EAs", "0", "#16a34a")
-        self.kpi_earf_split = self._create_kpi_card("Split EAs", "0", "#2563eb")
+        self.kpi_earf_split = self._create_kpi_card("Delineated EAs", "0", "#2563eb")
         self.kpi_earf_merged = self._create_kpi_card("Merged EAs", "0", "#ea580c")
 
         for k in (
@@ -4337,7 +4336,7 @@ class COProcessingDialog(QDialog):
 
         filter_bar.addWidget(QLabel("EA Type:"))
         self.cmb_earf_type_filter = QComboBox()
-        self.cmb_earf_type_filter.addItems(["All EA Types", "RETAINED", "SPLIT", "MERGED", "Other"])
+        self.cmb_earf_type_filter.addItems(["All EA Types", "RETAINED", "DELINEATED", "MERGED", "Other"])
         self.cmb_earf_type_filter.currentIndexChanged.connect(self._on_earf_filter_changed)
         filter_bar.addWidget(self.cmb_earf_type_filter)
 
@@ -4507,7 +4506,7 @@ class COProcessingDialog(QDialog):
         self.kpi_gpkg_overlaps = self._create_kpi_card("Cross-File Overlaps", "0", "#dc2626")
         self.kpi_gpkg_consistency = self._create_kpi_card("Consistency", "Pending Check", "#64748b")
         self.kpi_gpkg_retained = self._create_kpi_card("Retained EAs", "0", "#16a34a")
-        self.kpi_gpkg_split = self._create_kpi_card("Split EAs", "0", "#0284c7")
+        self.kpi_gpkg_split = self._create_kpi_card("Delineated EAs", "0", "#0284c7")
         self.kpi_gpkg_merged = self._create_kpi_card("Merged EAs", "0", "#ea580c")
 
         for k in (
@@ -4567,7 +4566,7 @@ class COProcessingDialog(QDialog):
 
         filter_bar.addWidget(QLabel("EA Type:"))
         self.cmb_gpkg_type_filter = QComboBox()
-        self.cmb_gpkg_type_filter.addItems(["All EA Types", "RETAINED", "SPLIT", "MERGED", "Other"])
+        self.cmb_gpkg_type_filter.addItems(["All EA Types", "RETAINED", "DELINEATED", "MERGED", "Other"])
         self.cmb_gpkg_type_filter.currentIndexChanged.connect(self._on_gpkg_filter_changed)
         filter_bar.addWidget(self.cmb_gpkg_type_filter)
 
@@ -6280,7 +6279,7 @@ class COProcessingDialog(QDialog):
         if type_col:
             types_upper = df[type_col].astype(str).str.upper()
             retained = types_upper.str.contains("RETAIN", na=False).sum()
-            split = types_upper.str.contains("SPLIT", na=False).sum()
+            split = types_upper.str.contains("SPLIT|DELIN", na=False).sum()
             merged = types_upper.str.contains("MERG", na=False).sum()
             self.kpi_earf_retained.val_label.setText(f"{retained:,}")
             self.kpi_earf_split.val_label.setText(f"{split:,}")
@@ -6310,7 +6309,7 @@ class COProcessingDialog(QDialog):
         type_col = next((c for c in df.columns if "type" in c.lower()), None)
         if type_col and ea_type_filter != "All EA Types":
             if ea_type_filter == "Other":
-                df = df[~df[type_col].astype(str).str.upper().str.contains("RETAIN|SPLIT|MERG", na=False)]
+                df = df[~df[type_col].astype(str).str.upper().str.contains("RETAIN|SPLIT|DELIN|MERG", na=False)]
             else:
                 df = df[df[type_col].astype(str).str.upper().str.contains(ea_type_filter, na=False)]
 
@@ -7353,7 +7352,7 @@ class COProcessingDialog(QDialog):
         if type_col:
             types_upper = df[type_col].astype(str).str.upper()
             retained = types_upper.str.contains("RETAIN", na=False).sum()
-            split = types_upper.str.contains("SPLIT", na=False).sum()
+            split = types_upper.str.contains("SPLIT|DELIN", na=False).sum()
             merged = types_upper.str.contains("MERG", na=False).sum()
             self.kpi_gpkg_retained.val_label.setText(f"{retained:,}")
             self.kpi_gpkg_split.val_label.setText(f"{split:,}")
@@ -7392,7 +7391,7 @@ class COProcessingDialog(QDialog):
         type_col = next((c for c in df.columns if "ea_type" in c.lower() or "type" in c.lower()), None)
         if type_col and ea_type_filter != "All EA Types":
             if ea_type_filter == "Other":
-                df = df[~df[type_col].astype(str).str.upper().str.contains("RETAIN|SPLIT|MERG", na=False)]
+                df = df[~df[type_col].astype(str).str.upper().str.contains("RETAIN|SPLIT|DELIN|MERG", na=False)]
             else:
                 df = df[df[type_col].astype(str).str.upper().str.contains(ea_type_filter, na=False)]
 
@@ -8215,12 +8214,12 @@ class COProcessingDialog(QDialog):
                     ea_t = str(d.get("earf_ea_type") or d.get("gpkg_ea_type") or "").strip()
                     rem = str(d.get("earf_remarks") or d.get("gpkg_remarks") or d.get("popcen_remarks") or "").strip()
 
-                    has_split = geocode_counts.get(gc, 0) > 1 or is_duplicate or "split" in ea_t.lower() or "split" in rem.lower()
+                    has_split = geocode_counts.get(gc, 0) > 1 or is_duplicate or "split" in ea_t.lower() or "delineat" in ea_t.lower() or "split" in rem.lower() or "delineat" in rem.lower()
                     if has_split:
-                        lifecycle = "SPLIT"
+                        lifecycle = "DELINEATED"
                     elif "merg" in ea_t.lower() or "merg" in rem.lower():
                         lifecycle = "MERGED"
-                    elif is_reset == 1 or "delineat" in ea_t.lower():
+                    elif is_reset == 1:
                         lifecycle = "RESET"
                     elif "retain" in ea_t.lower():
                         lifecycle = "RETAINED"

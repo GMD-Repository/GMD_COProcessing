@@ -1137,9 +1137,7 @@ def export_matched_to_excel(
                 ea_t = str(r.get("ea_type") or r.get("ea_lifecycle") or "RETAINED").strip().upper()
                 if "MERG" in ea_t:
                     ea_t = "MERGED"
-                elif "SPLIT" in ea_t:
-                    ea_t = "SPLIT"
-                elif "DELIN" in ea_t:
+                elif "SPLIT" in ea_t or "DELIN" in ea_t or "RESET" in ea_t:
                     ea_t = "DELINEATED"
                 elif "RETAIN" in ea_t:
                     ea_t = "RETAINED"
@@ -1958,12 +1956,9 @@ def export_output_summary_to_excel(
             if "RETAIN" in ea_t or (not ea_t and "RETAIN" in ea_life):
                 b_retained += 1
                 b_final_eas += 1
-            elif "SPLIT" in ea_t or "SPLIT" in ea_life:
-                b_split += 1
-                b_final_eas += 1
             elif "MERG" in ea_t or "MERG" in ea_life:
                 b_merged += 1
-            elif "DELIN" in ea_t or "RESET" in ea_t or "DELIN" in ea_life or "RESET" in ea_life:
+            elif "DELIN" in ea_t or "SPLIT" in ea_t or "RESET" in ea_t or "DELIN" in ea_life or "SPLIT" in ea_life or "RESET" in ea_life:
                 b_delin += 1
                 b_final_eas += 1
             else:
@@ -3580,7 +3575,9 @@ class POPCENDatabase:
 
         if ea_type and ea_type != "All EA Types":
             if ea_type == "Other":
-                conditions.append("UPPER(COALESCE(ea_type, '')) NOT LIKE '%RETAIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%SPLIT%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%MERG%'")
+                conditions.append("UPPER(COALESCE(ea_type, '')) NOT LIKE '%RETAIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%SPLIT%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%DELIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%MERG%'")
+            elif ea_type == "DELINEATED":
+                conditions.append("(UPPER(ea_type) LIKE '%DELIN%' OR UPPER(ea_type) LIKE '%SPLIT%')")
             else:
                 conditions.append("UPPER(ea_type) LIKE ?")
                 params.append(f"%{ea_type.upper()}%")
@@ -3706,7 +3703,7 @@ class POPCENDatabase:
                 cur.execute(f"SELECT COUNT(*) FROM earf_records WHERE UPPER(ea_type) LIKE '%RETAIN%'{and_clause}")
                 kpis["retained"] = cur.fetchone()[0]
 
-                cur.execute(f"SELECT COUNT(*) FROM earf_records WHERE UPPER(ea_type) LIKE '%SPLIT%'{and_clause}")
+                cur.execute(f"SELECT COUNT(*) FROM earf_records WHERE (UPPER(ea_type) LIKE '%SPLIT%' OR UPPER(ea_type) LIKE '%DELIN%'){and_clause}")
                 kpis["split"] = cur.fetchone()[0]
 
                 cur.execute(f"SELECT COUNT(*) FROM earf_records WHERE UPPER(ea_type) LIKE '%MERG%'{and_clause}")
@@ -4208,7 +4205,9 @@ class POPCENDatabase:
 
         if ea_type and ea_type != "All EA Types":
             if ea_type == "Other":
-                conditions.append("UPPER(COALESCE(ea_type, '')) NOT LIKE '%RETAIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%SPLIT%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%MERG%'")
+                conditions.append("UPPER(COALESCE(ea_type, '')) NOT LIKE '%RETAIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%SPLIT%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%DELIN%' AND UPPER(COALESCE(ea_type, '')) NOT LIKE '%MERG%'")
+            elif ea_type == "DELINEATED":
+                conditions.append("(UPPER(ea_type) LIKE '%DELIN%' OR UPPER(ea_type) LIKE '%SPLIT%')")
             else:
                 conditions.append("UPPER(ea_type) LIKE ?")
                 params.append(f"%{ea_type.upper()}%")
@@ -4346,7 +4345,7 @@ class POPCENDatabase:
                 cur.execute("SELECT COUNT(*) FROM gpkg_records WHERE UPPER(ea_type) LIKE '%RETAIN%'")
                 kpis["retained"] = cur.fetchone()[0]
 
-                cur.execute("SELECT COUNT(*) FROM gpkg_records WHERE UPPER(ea_type) LIKE '%SPLIT%'")
+                cur.execute("SELECT COUNT(*) FROM gpkg_records WHERE (UPPER(ea_type) LIKE '%SPLIT%' OR UPPER(ea_type) LIKE '%DELIN%')")
                 kpis["split"] = cur.fetchone()[0]
 
                 cur.execute("SELECT COUNT(*) FROM gpkg_records WHERE UPPER(ea_type) LIKE '%MERG%'")
@@ -4950,10 +4949,8 @@ class POPCENDatabase:
         if ea_lifecycle and ea_lifecycle != "All EA Types":
             if ea_lifecycle == "Retained Only":
                 conditions.append("(UPPER(ea_lifecycle) = 'RETAINED' OR UPPER(ea_type) LIKE '%RETAIN%')")
-            elif ea_lifecycle == "Reset / Delineated Only":
-                conditions.append("(is_reset = 1 OR UPPER(ea_lifecycle) IN ('RESET', 'DELINEATED') OR UPPER(ea_type) LIKE '%DELIN%')")
-            elif ea_lifecycle == "Split EAs Only":
-                conditions.append("(UPPER(ea_lifecycle) LIKE '%SPLIT%' OR UPPER(ea_type) LIKE '%SPLIT%')")
+            elif ea_lifecycle in ("Delineated / Split Only", "Reset / Delineated Only", "Split EAs Only"):
+                conditions.append("(is_reset = 1 OR UPPER(ea_lifecycle) IN ('RESET', 'DELINEATED', 'SPLIT') OR UPPER(ea_type) LIKE '%DELIN%' OR UPPER(ea_type) LIKE '%SPLIT%')")
             elif ea_lifecycle == "Merged EAs Only":
                 conditions.append("(UPPER(ea_lifecycle) LIKE '%MERG%' OR UPPER(ea_type) LIKE '%MERG%')")
             else:
