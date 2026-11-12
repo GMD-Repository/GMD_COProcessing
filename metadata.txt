@@ -2,7 +2,7 @@
 name=GMD CO Processing
 qgisMinimumVersion=3.22
 description=EA post-processing tools for GMD.
-version=0.1.1
+version=0.1.2
 author=psacjperez
 email=cj.perez.psa@gmail.com
 
@@ -13,6 +13,7 @@ repository=https://github.com/GMD-Repository/GMD_COProcessing
 
 hasProcessingProvider=no
 changelog=
+    0.1.2 - National-Level MBI Checker: new 'Include Disputed Areas' checkbox (off by default - contested polygons are then removed before the check, as if absent); when ticked, detects Disputed Areas (barangay polygons whose 'boundary' is Contested), one row per disputed case with the barangays within 0.50 m listed as involved; new 'Disputed Only' mode; disputed footprints kept out of the Gaps; mbi_type 'Disputed' (mbi_status 2_Pending) in the per-province GPKG export; MBI Barangay Selector: remaining MBIs of a type a run did not look for are listed as 'Not checked' instead of being dropped, and the export now stamps mbi_scope
     0.1.1 - EA vs Barangay Check: tick several layers (Select All) and scan them together; blinking dotted outline and snap preview on zoom (toggle); Undo Last Snap
     0.1.0 - Initial plugin skeleton
 

@@ -87,6 +87,10 @@ DETECT_FIELD = "detection"
 DETECT_STILL = "Still detected"        # the check still finds this remaining MBI
 DETECT_NEW = "Newly detected"          # found by the check, not in the remaining layer
 DETECT_GONE = "No longer detected"     # remaining MBI the check no longer finds
+DETECT_UNCHECKED = "Not checked"       # remaining MBI of a type this run did not look for
+# An MBI layer may say which types the run that made it looked for (the National-Level MBI
+# Checker writes it); read from the first row that has it. Without it, nothing is assumed.
+SCOPE_FIELD = "mbi_scope"
 REF_UUID_FIELD = "ref_case_uuid"       # matched remaining MBI case_uuid(s)
 REF_KIND_FIELD = "ref_mbi_type"        # their mbi_type (a Disputed case can match a gap / overlap)
 REF_STATUS_FIELD = "ref_status"
@@ -148,6 +152,7 @@ COLOUR_PARTIAL = "#fff3c4"     # soft cream-yellow: partly covered
 COLOUR_NEW = "#dcedc8"         # light green: newly detected MBI (case row)
 COLOUR_NEW_CHILD = "#f1f8e9"   # paler green: its barangay rows
 COLOUR_GONE = "#e0e0e0"        # grey: remaining MBI no longer detected
+COLOUR_UNCHECKED = "#cfd8dc"   # blue-grey: remaining MBI this run did not look for
 COLOUR_JOINED = "#c51162"            # magenta hatch + dashed outline: MBI joined to a barangay
 COLOUR_JOINED_FILL = "236,64,122,90"
 # MBI level: cool lavender -> blue -> aqua -> slate (darker = more severe), never a status colour.
@@ -343,6 +348,13 @@ class MBICase:
     def gone(self):
         """A remaining MBI the check no longer finds: nothing to cover."""
         return self.detection == DETECT_GONE
+
+    @property
+    def unchecked(self):
+        """A remaining MBI left out of this run (its type was not looked for) - it was not
+        'not found', it was never checked. It still needs a covering barangay, so it is
+        listed with its involved barangays and can be ticked like any other case."""
+        return self.detection == DETECT_UNCHECKED
 
     def add_feature(self, feat, coverage_field=None):
         self.feature_ids.append(feat.id())
@@ -1029,8 +1041,8 @@ def build_counter_check(detected, remaining, checked_kinds, name, bgy_info=None)
 
     detected: [(layer, 'Gap' | 'Overlap' | 'Disputed')] (the checker's output layers);
     remaining: the remaining MBI layer, or None (plain check, no 'detection' fields);
-    checked_kinds: MBI types the run looked for — a remaining MBI of another type is not
-    reported as no longer detected.
+    checked_kinds: MBI types the run looked for — a remaining MBI of another type is listed
+    as 'Not checked' (never looked for), never as 'No longer detected'.
 
     A detection matches a remaining MBI when they share area (not just an edge) and:
       • the remaining MBI is a Gap / Overlap of the same type, or
@@ -1040,7 +1052,8 @@ def build_counter_check(detected, remaining, checked_kinds, name, bgy_info=None)
     Each detected MBI is written as ONE ROW PER INVOLVED BARANGAY (same case_uuid, the MBI
     geometry on every row; 'geocode' / region / province / city_mun / barangay are that row's
     barangay, from bgy_info {geocode: {...}} or the 'involved_bgys' labels), so each row gets
-    its own coverage status. No-longer-detected MBIs keep the remaining layer's row.
+    its own coverage status. A 'Not checked' remaining MBI is written the same way - it still
+    needs a covering barangay. No-longer-detected MBIs keep the remaining layer's single row.
     Returns (MultiPolygon memory layer or None when empty, stats dict)."""
     from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeature,
                            QgsField, QgsGeometry, QgsProject, QgsSpatialIndex, QgsVectorLayer)
@@ -1186,9 +1199,9 @@ def build_counter_check(detected, remaining, checked_kinds, name, bgy_info=None)
         if rid in hit_count:
             continue
         needs = {"Gap", "Overlap", "Disputed"} if r["kind"] in ("", "Disputed") else {r["kind"]}
-        if not needs <= set(checked_kinds):
-            stats["unchecked"] += 1   # this run did not look for its type
-            continue
+        # A type this run did not look for was not "not found" - it was never checked.
+        # Such a case is still listed, as Not checked, so it cannot be silently lost.
+        unchecked = not needs <= set(checked_kinds)
         attrs = {}
         for n, _t in CHECKER_SCHEMA:
             value = _feat_text(r["feat"], REF_SOURCES.get(n, [n])) or None
@@ -1199,11 +1212,17 @@ def build_counter_check(detected, remaining, checked_kinds, name, bgy_info=None)
                     value = None
             attrs[n] = value
         attrs.update({"case_uuid": r["uuid"], MBI_TYPE: attrs.get(MBI_TYPE) or r["kind"] or None,
-                      DETECT_FIELD: DETECT_GONE, REF_UUID_FIELD: r["uuid"],
+                      DETECT_FIELD: DETECT_UNCHECKED if unchecked else DETECT_GONE,
+                      REF_UUID_FIELD: r["uuid"],
                       REF_KIND_FIELD: r["kind"] or None,
                       REF_STATUS_FIELD: r["status"] or None, REF_REMARKS_FIELD: r["remarks"] or None})
-        stats["gone"] += 1
-        add(r["geom"], attrs)
+        stats["unchecked" if unchecked else "gone"] += 1
+        if unchecked:
+            # Never checked, but still an open case: write it like a detection, one row per
+            # involved barangay, so a covering barangay can be chosen for it.
+            add_per_barangay(r["geom"], attrs)
+        else:
+            add(r["geom"], attrs)
 
     if not feats:
         return None, stats
@@ -1341,7 +1360,8 @@ HELP_HTML = """
         runs on the barangay layers and every MBI it finds is compared with the remaining MBIs, Disputed ones
         included.</li>
     <li>Read the <b>Detection</b> column: <b>Still detected</b>, <b>Newly detected</b> (the whole row is
-        <b style="color:#558b2f;">light green</b>) or <b>No longer detected</b> (grey).</li>
+        <b style="color:#558b2f;">light green</b>), <b>No longer detected</b> (grey, nothing to cover) or
+        <b>Not checked</b> (blue-grey cell: its MBI type was not looked for in this run — still to be covered).</li>
     <li>In the list, <b>tick the Role / Status box of the barangay that covers</b> each detected MBI — or click
         <b>Auto-Assign Pending</b> to let the tool decide the easy ones, then review. An overlap that
         runs across several barangays can be <b>shared out</b>: tick more than one barangay and each keeps only
@@ -1392,10 +1412,20 @@ HELP_HTML = """
     <tr><td style="font-weight:bold; vertical-align:top;">No longer detected<br><span style="background:#e0e0e0;">&nbsp;grey&nbsp;</span></td>
         <td>A remaining MBI the check did not find any more. It is listed for your information only — there is nothing
         to cover, so it cannot be ticked, Auto-Assign skips it and Apply Coverage leaves its fields untouched.</td></tr>
+    <tr><td style="font-weight:bold; vertical-align:top;">Not checked<br><span style="background:#cfd8dc;">&nbsp;blue-grey&nbsp;</span></td>
+        <td>A remaining MBI of a type <b>this run did not look for</b> — e.g. a Disputed case under
+        <i>Overlaps Only</i>, or one carried over from a National-Level MBI Checker run made with
+        <b>Include Disputed Areas</b> unticked. It was never counter-checked, so it is <b>not</b>
+        "no longer detected" and nothing here says it is resolved. It is <b>still an open case</b>:
+        it is listed with its involved barangays (from <i>involved_areas</i>), one row each, and you
+        <b>tick the covering barangay exactly as usual</b> — only the Detection cell is marked blue-grey.
+        Run the mode that covers its type to counter-check it as well. When the remaining layer carries
+        an <i>mbi_scope</i> field, the log names the MBI types the run that produced it looked for.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Matching rule</td>
         <td>Same as GEMMA's MBI Validator: a detection and a remaining MBI only match when they overlap in <b>area</b>;
         merely touching along an edge does not count, so a genuinely new MBI next to an old one is reported as new.
-        Remaining MBIs of a type the run did not look for are not called "no longer detected" (e.g. gaps with
+        Remaining MBIs of a type the run did not look for are listed as <b>Not checked</b>, never as
+        "no longer detected" (e.g. gaps with
         <i>Overlaps Only</i>); remaining <i>Disputed</i> MBIs are only checked by <i>Gaps, Overlaps and Disputed</i>,
         since a dispute can show up as any of the three.
         One detection overlapping several remaining MBIs lists them all in <i>ref_case_uuid</i>; a remaining MBI now
@@ -1478,7 +1508,7 @@ HELP_HTML = """
         cities / municipalities involved and the <b>Bldg Pts</b> inside it. Status is <b>Pending — tick the covering barangay below</b> (peach) until a
         barangay is chosen, then <b>✔ Done — covered by &lt;barangay&gt;</b> (green) — or <b>Partly covered (x%) — tick another barangay</b> (cream)
         when the barangays ticked in a shared overlap do not fill the whole MBI yet. No-longer-detected MBIs show
-        <b>No longer detected</b> (grey).</td></tr>
+        <b>No longer detected</b> (grey); a <b>Not checked</b> case keeps its normal status and is ticked as usual.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Barangay rows (below)</td>
         <td>Each involved barangay (geocode, name, city / municipality) with its own <b>Bldg Pts</b> (buildings
         inside this MBI tagged to that barangay). <b>Tick the Role / Status box of the covering barangay.</b> In a
@@ -2041,7 +2071,9 @@ def make_dialog_class():
                             "Counter-check against the Remaining MBI layer:\n"
                             f"{DETECT_STILL} — the check still finds this remaining MBI.\n"
                             f"{DETECT_NEW} — found by the check, not in the remaining layer (light green).\n"
-                            f"{DETECT_GONE} — a remaining MBI the check no longer finds (nothing to cover).")
+                            f"{DETECT_GONE} — a remaining MBI the check no longer finds (nothing to cover).\n"
+                            f"{DETECT_UNCHECKED} — a remaining MBI of a type this run did not look for; "
+                            "still to be covered.")
             head.setToolTip(COL_BLDG,
                             "Case row: buildings inside the gap / overlap (num_bldg_pts, or a live\n"
                             "count when Building Points is set).\n"
@@ -2073,6 +2105,7 @@ def make_dialog_class():
             self.legend = QtWidgets.QLabel(" &nbsp;&nbsp;".join([
                 swatch.format(COLOUR_NEW, "Newly detected (row)"),
                 swatch.format(COLOUR_GONE, "No longer detected"),
+                swatch.format(COLOUR_UNCHECKED, "Not checked"),
                 swatch.format(COLOUR_PENDING, "Pending (to decide)"),
                 swatch.format(COLOUR_PARTIAL, "Partly covered"),
                 swatch.format(COLOUR_COVERED, "✔ Covers"),
@@ -2227,6 +2260,7 @@ def make_dialog_class():
                                 ("Partly covered", "partial"), ("Covered", "covered"),
                                 (DETECT_NEW, f"det:{DETECT_NEW}"), (DETECT_STILL, f"det:{DETECT_STILL}"),
                                 (DETECT_GONE, f"det:{DETECT_GONE}"),
+                                (DETECT_UNCHECKED, f"det:{DETECT_UNCHECKED}"),
                                 ("Overlaps", "type:Overlap"), ("Gaps", "type:Gap")]:
                 self.show_combo.addItem(label, data)
             for lvl in sorted(levels):
@@ -2597,7 +2631,7 @@ def make_dialog_class():
                 text = f"{total:,} MBI case(s)"
                 if det:
                     text += " (" + ", ".join(f"{det[d]:,} {d.lower()}" for d in
-                                             (DETECT_NEW, DETECT_STILL, DETECT_GONE) if det.get(d)) + ")"
+                                             (DETECT_NEW, DETECT_STILL, DETECT_GONE, DETECT_UNCHECKED) if det.get(d)) + ")"
                 text += (f" - {n['pending']:,} pending, "
                          + (f"{partial:,} partly covered, " if partial else "")
                          + f"{covered:,} covered.")
@@ -2701,6 +2735,17 @@ def make_dialog_class():
             self.mbi_combo.setLayer(result)
             self.load_cases(use_selection=False)
 
+        def _remaining_scope(self, layer):
+            """The MBI types the run that produced this layer looked for (its SCOPE_FIELD),
+            or '' when the layer does not say."""
+            if layer is None or layer.fields().indexOf(SCOPE_FIELD) < 0:
+                return ""
+            for f in layer.getFeatures():
+                value = _text(f, SCOPE_FIELD)
+                if value:
+                    return value
+            return ""
+
         def _log_counter_check(self, remaining, s, checked_kinds):
             self.log(f"Counter-check against '{remaining.name()}' ({s['remaining']:,} remaining MBI(s)"
                      + (f", {s['disputed']:,} of them Disputed" if s["disputed"] else "") + "):")
@@ -2713,9 +2758,17 @@ def make_dialog_class():
                 self.log(f"  Disputed: {s['disputed_still']:,} of {s['disputed']:,} remaining Disputed MBI(s) "
                          "still detected (as a contested polygon, gap or overlap sharing their area)")
             if s["unchecked"]:
-                self.log(f"  Not checked: {s['unchecked']:,} remaining MBI(s) of a type this run did not "
-                         f"look for (only {', '.join(sorted(checked_kinds)).lower()}; Disputed needs all "
-                         "three) — left out")
+                self.log(f"  {DETECT_UNCHECKED}: {s['unchecked']:,} remaining MBI(s) of a type this run "
+                         f"did not look for (only {', '.join(sorted(checked_kinds)).lower()}; Disputed "
+                         "needs all three) — not counter-checked, but listed with their involved "
+                         "barangays so they can still be covered")
+            scope = self._remaining_scope(remaining)
+            if scope:
+                kinds = {k.strip().lower() for k in scope.split(",")}
+                self.log(f"  '{remaining.name()}' says it was made by a run looking for: {scope}")
+                if "disputed" not in kinds:
+                    self.log("    That run left disputed areas out, so it holds no Disputed case "
+                             f"and any contested polygon found now is listed as {DETECT_NEW}.")
             if s["multi"]:
                 self.log(f"  {s['multi']:,} detection(s) overlap more than one remaining MBI "
                          f"('{REF_UUID_FIELD}' lists them all)")
@@ -2728,7 +2781,8 @@ def make_dialog_class():
             field = DETECT_FIELD if layer.fields().indexOf(DETECT_FIELD) >= 0 else MBI_TYPE
             styles = {DETECT_NEW: ("139,195,74,140", "51,105,30,255", "solid"),
                       DETECT_STILL: ("251,140,0,110", "230,81,0,255", "solid"),
-                      DETECT_GONE: ("189,189,189,60", "97,97,97,255", "dash")}
+                      DETECT_GONE: ("189,189,189,60", "97,97,97,255", "dash"),
+                      DETECT_UNCHECKED: ("176,190,197,60", "69,90,100,255", "dot")}
             values = sorted({f[field] for f in layer.getFeatures() if f[field]})
             cats = []
             for value in values:
@@ -2784,7 +2838,7 @@ def make_dialog_class():
                         det[case.detection] = det.get(case.detection, 0) + 1
                 if det:
                     self.log("  " + " · ".join(f"{d}: {det[d]:,}" for d in
-                                               (DETECT_NEW, DETECT_STILL, DETECT_GONE) if d in det))
+                                               (DETECT_NEW, DETECT_STILL, DETECT_GONE, DETECT_UNCHECKED) if d in det))
                 if skipped:
                     self.log(f"  Skipped {skipped:,} within-barangay case(s) (one barangay only — "
                              "untick 'Skip within-barangay cases' to list them)")
@@ -3054,6 +3108,10 @@ def make_dialog_class():
                     for col in range(len(TREE_COLS)):
                         if col != COL_ROLE:
                             top.setForeground(col, QBrush(QColor("#9e9e9e")))
+                elif case.unchecked:
+                    # Never counter-checked, but still to be covered: only the Detection
+                    # cell is marked, the row stays tickable like any open case.
+                    paint(top, COL_DETECT, COLOUR_UNCHECKED)
 
                 for c_order, cand in enumerate(case.candidates.values()):
                     child = TreeItem(top)
@@ -3109,7 +3167,11 @@ def make_dialog_class():
                 return ""
             tip = {DETECT_NEW: "Found by the MBI Checker but not in the remaining MBI layer.",
                    DETECT_STILL: "The check still finds this remaining MBI.",
-                   DETECT_GONE: "This remaining MBI was not found by the check — nothing to cover."
+                   DETECT_GONE: "This remaining MBI was not found by the check — nothing to cover.",
+                   DETECT_UNCHECKED: "This run did not look for this MBI's type, so it was never "
+                                     "checked — it is NOT 'no longer detected'. It is still an open "
+                                     "case: tick the barangay that covers it. Run the mode that "
+                                     "covers its type to counter-check it as well."
                    }.get(case.detection, case.detection)
             if case.ref_uuids and case.detection != DETECT_NEW:
                 tip += f"\nRemaining MBI case_uuid: {case.ref_uuids.replace(',', ', ')}"
