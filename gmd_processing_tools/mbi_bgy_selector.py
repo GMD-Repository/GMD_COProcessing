@@ -1517,7 +1517,10 @@ HELP_HTML = """
         tick several. Unticking every barangay makes the case Pending again.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">Moving around</td>
         <td>Click a row to select it on the map, double-click to zoom, right-click for more (set / add / remove
-        a covering barangay, mark pending, copy case ID or the remaining MBI's case ID). Use the search box
+        a covering barangay, mark pending, copy case ID or the remaining MBI's case ID). Zooming on a barangay row
+        always shows the <b>whole MBI case</b> (both sides of a gap / overlap), not just that barangay's own row,
+        and flashes the barangay you clicked so it stands out. Select a barangay row to see its part against the
+        MBI on the map even in a two-barangay case (see <i>On the map</i> under <i>Shared Overlaps</i>). Use the search box
         (barangay, city, geocode, EA name, case ID or detection) and the <i>Show</i> filter (<i>All / Pending /
         Partly covered / Covered / Newly detected / Still detected / No longer detected / Overlaps / Gaps / level</i>)
         to find cases. Click a column header to sort.</td></tr>
@@ -1542,7 +1545,9 @@ HELP_HTML = """
     <tr><td style="font-weight:bold; vertical-align:top;">On the map</td>
         <td>Select a barangay row to see its part: <b style="color:#2e7d32;">green</b> = what it keeps,
         <b style="color:#1565c0;">dashed blue</b> = what it would keep if ticked. Select the case row to see
-        every kept part and, in <b style="color:#e65100;">orange</b>, what no ticked barangay keeps yet.</td></tr>
+        every kept part and, in <b style="color:#e65100;">orange</b>, what no ticked barangay keeps yet. This also
+        works for an ordinary two-barangay case (not just a 3+-way shared overlap): select either barangay row to
+        see its own part (dashed blue, or green once it is the one ticked) against the whole MBI.</td></tr>
     <tr><td style="font-weight:bold; vertical-align:top;">When it applies</td>
         <td>Overlaps with two or more barangays whose shapes are all in the selected barangay layers. Gaps (no
         barangay contains a gap) and overlaps with a barangay missing from the selected layers keep the
@@ -3413,7 +3418,10 @@ def make_dialog_class():
             return band
 
         def show_bands(self):
-            """Highlight on the map the part of the MBI each selected barangay keeps (or would keep)."""
+            """Highlight on the map the part of the MBI each selected barangay keeps (or would
+            keep) — including a pair case (only one of the two can cover it): selecting its row
+            shows the barangay's own part (MBI ∩ barangay) against the whole MBI, so you can see
+            where it sits before deciding."""
             if self.iface is None:
                 return
             for band in self._bands.values():
@@ -3424,7 +3432,7 @@ def make_dialog_class():
             geoms = {"kept": [], "part": [], "left": []}
             for item in self.tree.selectedItems():
                 case = self.cases.get(item.data(COL_ID, ROLE_UUID))
-                if case is None or not case.split:
+                if case is None:
                     continue
                 code = item.data(COL_ID, ROLE_BGY)
                 cands = [case.candidates.get(code)] if code else list(case.candidates.values())
@@ -3452,15 +3460,23 @@ def make_dialog_class():
             self.zoom_to_items(self.tree.selectedItems())
 
         def zoom_to_items(self, items):
+            """Zoom to the whole MBI case (every row of it, not just the one barangay's own
+            row), so the gap / overlap's full extent is visible — then flash just the
+            barangay(s) that were clicked, so it stands out against the full picture."""
             if self.iface is None:
                 return
             mbi_fids, bgy_fids = self._selection(items)
+            case_fids = set(mbi_fids)
+            for item in items:
+                case = self.cases.get(item.data(COL_ID, ROLE_UUID))
+                if case is not None:
+                    case_fids.update(case.feature_ids)
             prj = QgsProject.instance()
-            targets = [(self.mbi_layer, mbi_fids)]
+            targets = [(self.mbi_layer, case_fids)]
             targets += [(prj.mapLayer(lid), fids) for lid, fids in bgy_fids.items()]
             canvas = self.iface.mapCanvas()
             dest = canvas.mapSettings().destinationCrs()
-            extent, flashes = None, []
+            extent = None
             for layer, fids in targets:
                 if layer is None or not fids:
                     continue
@@ -3474,14 +3490,19 @@ def make_dialog_class():
                         extent = box
                     else:
                         extent.combineExtentWith(box)
-                flashes.append((layer, list(fids)))
             if extent is None:
                 return
             extent.scale(1.3)
             canvas.setExtent(extent)
             canvas.refresh()
-            for layer, fids in flashes:
-                canvas.flashFeatureIds(layer, fids)
+            # Flash only what was actually clicked (the case row, or a specific barangay and
+            # its own layer feature) — narrower than the extent, so it stands out in it.
+            if mbi_fids:
+                canvas.flashFeatureIds(self.mbi_layer, list(mbi_fids))
+            for lid, fids in bgy_fids.items():
+                layer = prj.mapLayer(lid)
+                if layer is not None and fids:
+                    canvas.flashFeatureIds(layer, list(fids))
 
         def show_context_menu(self, pos):
             item = self.tree.itemAt(pos)
