@@ -139,6 +139,11 @@ pale aqua → slate = Within-Barangay), so it never looks like a status. Both co
 under the list.
 
 Click a row to select it on the map, double-click to zoom, right-click for more options.
+Double-clicking (or selecting) a barangay row always zooms to the **whole MBI case**, not just
+that barangay's own row, and flashes the barangay you clicked so it stands out against it.
+Selecting a barangay row also draws its part on the map (green = what it keeps, dashed blue =
+what it would keep if ticked) against the MBI — this works for an ordinary two-barangay case
+too, not only a 3+-way shared overlap (see below).
 
 ---
 

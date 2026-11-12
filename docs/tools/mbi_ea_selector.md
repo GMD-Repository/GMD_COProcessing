@@ -19,7 +19,9 @@ No MBI check runs here — the MBI layer comes from the MBI Barangay Selector, s
 2. **EA Layers** — tick the EA layers of the covering barangays.
 3. **Building Points** (optional) — pick the layer and its geocode field to count buildings per EA.
 4. Click **Load MBI Cases** (green).
-5. **Tick the covering EA(s)** of each case (or **Auto-Assign Pending**, then review).
+5. **Tick the case row** — the tickbox sits on the case, not on the EAs: you assigned a barangay, so
+   its EA(s) listed under the case cover the MBI. (Or **Auto-Assign Pending**, then review.)
+   To pick one EA yourself, **right-click its row**.
 6. Click **Apply Coverage** — writes `assigned_ea` and `coverage_status` into the MBI layer, and adds
    the `ppp_mbi_ea_clipped` layer (each MBI clipped to the boundary of every ticked EA).
 7. Click **Export GPKG + CSV** to save the result and a decision log.
@@ -39,7 +41,7 @@ flowchart LR
     EA[EA layers] --> F[Find the barangay's EAs<br/>first 8 geocode digits]
     X --> F
     F --> C[Candidates:<br/>EAs holding / bordering the MBI]
-    C --> T[You tick the<br/>covering EA]
+    C --> T[You tick the case row:<br/>its EAs cover the MBI]
     T --> R[Resolve kept parts<br/>and status]
     R --> A[Apply: assigned_ea<br/>+ coverage_status]
     R --> K[Apply: ppp_mbi_ea_clipped<br/>MBI clipped per ticked EA]
@@ -61,12 +63,13 @@ flowchart LR
      distance is measured in EPSG:3857 and corrected for latitude.
    - **Nothing that close:** the 3 nearest EAs.
 5. **Resolve.**
-   - **One EA covers the MBI:** it keeps the whole case geometry.
-   - **Several EAs share an overlap:** each ticked EA keeps the MBI ∩ EA, minus what an earlier-ticked EA
-     keeps.
+   - **One EA covers the MBI:** the EA holding most of the MBI (for a gap, the one with most tagged
+     buildings, else the nearest) keeps the whole case geometry.
+   - **Several EAs share an overlap:** ticking the case gives it to every EA under it — each keeps the
+     MBI ∩ EA, minus what an EA before it keeps (largest part first).
    - **Status:** the case is *Covered* when the leftover is at most 0.5 m² (or 0.1% of the MBI), otherwise
      *Partly covered*.
-   - **Buildings:** each building point goes to the first ticked EA whose kept part contains it.
+   - **Buildings:** each building point goes to the first covering EA whose kept part contains it.
 6. **Write.** Apply edits only the covering barangay's rows: `assigned_ea` (comma-separated) and
    `coverage_status`. Rows of barangays not chosen get `2_Not Covered`. All of this is one undoable edit
    command. Apply also adds `ppp_mbi_ea_clipped`: the kept part of every ticked EA as its own feature.
@@ -86,7 +89,7 @@ flowchart LR
 
 | MBI type | EAs offered |
 |----------|-------------|
-| **Overlap / disputed area** | The barangay's EAs holding part of it. Several can be ticked — each keeps only its own part. |
+| **Overlap / disputed area** | The barangay's EAs holding part of it. All of them cover the case — each keeps only its own part. |
 | **Gap** | The barangay's EAs bordering the gap or within **EAs within … m of a gap** (default 5 m). One EA absorbs the whole gap. |
 | **None that close** | The 3 nearest EAs of the barangay, with their distance (*12.0 m away*) — check them on the map. |
 
@@ -96,17 +99,22 @@ flowchart LR
 
 ---
 
-## Ticking EAs
+## Ticking a case
 
-| Case | Ticked EA | Others |
-|------|-----------|--------|
+The tickbox is on the **case row**, not on the EA rows: a barangay was assigned to the MBI in the MBI
+Barangay Selector, so that barangay's EA(s) — listed under the case — are what covers it. The EA rows are
+information only; **right-click** one to set it as the only covering EA, or to add / remove one EA of a
+shared overlap.
+
+| Case | Covering EA | Others |
+|------|-------------|--------|
 | Overlap | **✔ Covers — keeps the overlap** | ✖ Gives up the overlap — cut out of it |
-| Shared overlap | **✔ Covers its part (x% of the MBI)** — first-ticked wins a shared piece | ✖ Gives up, or *Gives up x% · tick to keep the rest* |
+| Shared overlap | **✔ Covers its part (x% of the MBI)** — the largest part wins a shared piece | ✖ Gives up, or *Gives up x% of its part* |
 | Gap | **✔ Covers — its boundary is extended over the gap** | Not extended — stays as it is |
 
-Before you tick, each EA row reads **☐ Tick if this EA covers it**. Case status: **Pending — tick the covering EA below**
-(peach) → **✔ Done — covered by …** (green), or **Partly covered (x%) — tick another EA** (cream) when the
-ticked EAs do not fill the MBI yet. The **MBI Level** column has its own cool colours (lavender → blue → aqua
+Before you tick the case, each EA row reads **☐ Tick the case row above to cover it**. Case status:
+**☐ Tick to cover it with the EAs below** (peach) → **✔ Done — covered by …** (green), or
+**Partly covered (x%)** (cream) when the covering EAs do not fill the MBI yet. The **MBI Level** column has its own cool colours (lavender → blue → aqua
 → slate), shown in the legend under the list.
 
 **Auto-Assign Pending:** single-EA cases go to that EA; others to the EA owning most of the buildings
@@ -120,7 +128,7 @@ Written on the **covering barangay's row(s)** of the MBI layer:
 
 | Field | Contents |
 |-------|----------|
-| `assigned_ea` | Covering EA geocode(s), comma-separated in tick order |
+| `assigned_ea` | Covering EA geocode(s), comma-separated, largest part first |
 | `coverage_status` | `1_Covered` · `2_Not Covered` (still pending) · `3_Partially Covered` (part of a shared overlap has no EA yet) |
 
 - Rows of barangays **not chosen** get no EA and `2_Not Covered`.
@@ -165,7 +173,7 @@ Unticking **Choose EAs inside the covering barangay** (or loading an EA MBI Chec
 | *No EA found in the selected EA layers* | Tick the EA layer of that barangay, then Load again. Check its geocodes share the barangay's first 8 digits. |
 | Fewer cases than MBIs | MBIs still pending in the Barangay Selector are skipped. A shared overlap gives one case per barangay, so there can also be more. |
 | Barangay column shows only a geocode | No name found for it in the MBI layer or the EA layers — tick an EA layer with a `barangay` / `bgy_name` field. |
-| Can tick only one EA of an overlap | The log after **Load MBI Cases** lists each such case under *overlap case(s) where only ONE EA can be ticked*, with the reason — usually no EA of the barangay holds more than 0.5 m² of the MBI (the EAs only touch it or lie within the search distance). Check that the EA layer lines up with the MBI on the map. Gaps always take one EA. |
-| Stays *Partly covered* | Select the case row to see the orange leftover, then tick the EA that contains it. |
+| Only one EA covers an overlap | The log after **Load MBI Cases** lists each such case under *overlap case(s) where only ONE EA can cover the MBI*, with the reason — usually no EA of the barangay holds more than 0.5 m² of the MBI (the EAs only touch it or lie within the search distance). Check that the EA layer lines up with the MBI on the map. Gaps always take one EA. |
+| Stays *Partly covered* | Select the case row to see the orange leftover, then right-click the EA that contains it and add it as a covering EA. |
 | Load MBI Cases greyed out | Pick a layer with `case_uuid` and tick at least one EA layer. |
-| Made a mistake | Before Apply: **Reset Choices** or untick. After Apply: **Edit › Undo** or **Discard Edits**. |
+| Made a mistake | Before Apply: **Reset Choices** or untick the case. After Apply: **Edit › Undo** or **Discard Edits**. |
