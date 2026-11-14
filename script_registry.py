@@ -53,6 +53,11 @@ def earf_icon():
     return plugin_icon()
 
 
+def mbi_coverage_icon():
+    svg = os.path.join(ICONS_DIR, "mbi_coverage_selector.svg")
+    return QIcon(svg) if os.path.exists(svg) else plugin_icon()
+
+
 def theme_icon(name):
     return QgsApplication.getThemeIcon(f"/{name}")
 

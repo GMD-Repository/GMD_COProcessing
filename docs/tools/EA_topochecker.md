@@ -91,4 +91,4 @@ The most severe administrative boundary the pair crosses:
 | `count_involved_areas` | How many areas |
 | `num_bldg_pts` | Building points inside the piece |
 
-The [MBI EA Selector](mbi_ea_selector.md) can read this layer in its original EA mode.
+The EA Selector tab of the [MBI Coverage Selector](mbi_coverage_selector.md#ea-selector-rules) can read this layer in its original EA mode.

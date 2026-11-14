@@ -1,0 +1,52 @@
+name: Bug report
+description: Something does not work in GMD CO Processing (Beta or Stable).
+labels: ["bug", "needs-triage"]
+body:
+  - type: dropdown
+    id: channel
+    attributes:
+      label: Release channel
+      options: ["Beta", "Stable"]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Plugin version
+      description: Plugins > Manage and Install Plugins > Installed > GMD CO Processing (e.g. 0.3.21-beta.2).
+    validations:
+      required: true
+  - type: input
+    id: tool
+    attributes:
+      label: Tool
+      description: Which tool / menu item (e.g. MBI Coverage Selector > EA Selector tab).
+    validations:
+      required: true
+  - type: input
+    id: qgis
+    attributes:
+      label: QGIS version
+      placeholder: "3.40.10"
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open ...
+        2. Pick layer ...
+        3. Click ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Error message / log
+      description: Copy the tool's Log box or the QGIS Python error (View > Panels > Log Messages). Screenshots welcome.
+      render: text

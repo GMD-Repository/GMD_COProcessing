@@ -1,4 +1,6 @@
-"""EA MBI Checker (Gaps & Overlaps) - checks EA boundaries and building points.
+"""DEPRECATED - kept in gmd_processing_tools/deprecated/, which the plugin does not scan.
+
+EA MBI Checker (Gaps & Overlaps) - checks EA boundaries and building points.
 
 Identifies boundary discrepancies between EA polygons:
   - Overlaps: overlapping boundary areas between adjacent EAs
@@ -65,7 +67,7 @@ BLDG_LAYER_NAMES = []     # e.g. ['BldgPts_R1', 'BldgPts_R2']
 RUN_MODE = 0
 
 # Style (.qml) applied to the output layers. Set to '' to skip styling.
-_LOCAL_STYLE = os.path.join(os.path.dirname(__file__), "styles", "mbi_checker.qml")
+_LOCAL_STYLE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "styles", "mbi_checker.qml")
 STYLE_PATH = (
     _LOCAL_STYLE
     if os.path.exists(_LOCAL_STYLE)

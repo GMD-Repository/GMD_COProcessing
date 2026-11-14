@@ -1,20 +1,30 @@
 name: Release QGIS plugin
 
-# Builds the plugin zip and plugins.xml:
-#   - automatically on every push to main that changes the plugin: the patch version of the latest
-#     vX.Y.Z tag is bumped (v0.3.1 -> v0.3.2) and a GitHub release is created for it;
-#   - for a release published by hand: its tag sets the version ("v0.4.0" -> version=0.4.0).
+# Two release channels, each with its own branch, version line and QGIS plugin repository URL:
 #
-# Both files are attached to the release AND published to the "plugin-repo" branch, which is
-# served by raw.githubusercontent.com (reachable even where github.com downloads time out).
+#   Channel  Pushed / merged into  Version (tag)              Published to branch   Release type
+#   Beta     beta                  vX.Y.Z-beta.N              plugin-repo-beta      pre-release (experimental)
+#   Stable   main                  vX.Y.Z                     plugin-repo           full release
 #
-# QGIS plugin repository URL (Plugins > Manage and Install Plugins > Settings > Add...):
-#   https://raw.githubusercontent.com/<owner>/<repo>/plugin-repo/plugins.xml
+# Versions:
+#   - Stable: patch + 1 of the latest stable tag (v0.3.20 -> v0.3.21).
+#   - Beta:   the NEXT stable version + "-beta.N" (after v0.3.20: v0.3.21-beta.1, -beta.2, ...).
+#     So a beta is always newer than the current stable and older than the stable it leads to.
+#   - A release published by hand sets its own version from its tag ("v0.4.0" or "v0.4.0-beta.1");
+#     tick "pre-release" for the Beta channel. The next automatic release continues from it.
+#
+# QGIS plugin repository URLs (Plugins > Manage and Install Plugins > Settings > Add...):
+#   Stable: https://raw.githubusercontent.com/<owner>/<repo>/plugin-repo/plugins.xml
+#   Beta:   https://raw.githubusercontent.com/<owner>/<repo>/plugin-repo-beta/plugins.xml
+#
+# Who can release is controlled by the branch rules on GitHub (see README.md > Contributing):
+# only the maintainer can merge into beta and main.
 
 on:
   push:
-    branches: [main]
-    paths-ignore: ["README.md", ".gitignore", ".gitattributes", "docs/**", ".claude/**"]
+    branches: [main, beta]
+    paths-ignore: ["README.md", ".gitignore", ".gitattributes", "docs/**", ".claude/**", ".github/CODEOWNERS",
+                   ".github/ISSUE_TEMPLATE/**", ".github/pull_request_template.md"]
   release:
     types: [published]
 
@@ -29,46 +39,62 @@ permissions:
 env:
   # Folder name inside the zip = Python package name QGIS loads. Do not change.
   PLUGIN_DIR: GMD_COProcessing
-  REPO_BRANCH: plugin-repo
 
 jobs:
   package:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
+      channel: ${{ steps.version.outputs.channel }}
+      repo_branch: ${{ steps.version.outputs.repo_branch }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0   # all tags, to find the latest version
 
-      - name: Work out the version
+      - name: Work out the channel and version
         id: version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
           RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          BRANCH: ${{ github.ref_name }}
         run: |
+          # Latest stable tag vX.Y.Z (no suffix)
+          LAST=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+          if [ -z "$LAST" ]; then
+            NEXT="0.1.0"
+          else
+            IFS=. read -r MAJ MIN PAT <<< "${LAST#v}"
+            NEXT="${MAJ}.${MIN}.$((PAT + 1))"
+          fi
+
           if [ "${{ github.event_name }}" = "release" ]; then
             TAG="$RELEASE_TAG"
             PRERELEASE="$RELEASE_PRERELEASE"
+          elif [ "$BRANCH" = "beta" ]; then
+            # Next stable version + -beta.N, N = number of betas of that version so far + 1
+            N=$(git tag -l "v${NEXT}-beta.*" | grep -cE "^v${NEXT//./\\.}-beta\.[0-9]+$" || true)
+            TAG="v${NEXT}-beta.$((N + 1))"
+            PRERELEASE=true
           else
-            # Latest vX.Y.Z tag, patch + 1 (none yet -> v0.1.0)
-            LAST=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
-            if [ -z "$LAST" ]; then
-              TAG="v0.1.0"
-            else
-              IFS=. read -r MAJ MIN PAT <<< "${LAST#v}"
-              TAG="v${MAJ}.${MIN}.$((PAT + 1))"
-            fi
+            TAG="v${NEXT}"
             PRERELEASE=false
           fi
+
           VERSION="${TAG#v}"
-          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]; then
-            echo "::error::Release tag '$TAG' is not a version number. Use a tag like v0.2.0 (QGIS compares versions to offer upgrades)."
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}(-beta\.[0-9]+)?$ ]]; then
+            echo "::error::Release tag '$TAG' is not a version number. Use v0.4.0 (Stable) or v0.4.0-beta.1 (Beta, pre-release)."
             exit 1
           fi
-          echo "Version: $TAG"
-          { echo "TAG=${TAG}"; echo "VERSION=${VERSION}"; echo "PRERELEASE=${PRERELEASE}"; } >> "$GITHUB_ENV"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          if [ "$PRERELEASE" = "true" ]; then
+            CHANNEL=beta;   REPO_BRANCH=plugin-repo-beta
+          else
+            CHANNEL=stable; REPO_BRANCH=plugin-repo
+          fi
+          echo "Channel: $CHANNEL  Version: $TAG  Published to: $REPO_BRANCH"
+          { echo "TAG=${TAG}"; echo "VERSION=${VERSION}"; echo "PRERELEASE=${PRERELEASE}";
+            echo "CHANNEL=${CHANNEL}"; echo "REPO_BRANCH=${REPO_BRANCH}"; } >> "$GITHUB_ENV"
+          { echo "tag=${TAG}"; echo "channel=${CHANNEL}"; echo "repo_branch=${REPO_BRANCH}"; } >> "$GITHUB_OUTPUT"
 
       - name: Check Python syntax
         run: python -m compileall -q -x "/.github/" .
@@ -85,10 +111,16 @@ jobs:
         run: |
           META="build/${PLUGIN_DIR}/metadata.txt"
           sed -i "s/^version=.*/version=${VERSION}/" "$META"
-          if [ "$PRERELEASE" = "true" ]; then EXP=True; else EXP=False; fi
+          if [ "$PRERELEASE" = "true" ]; then
+            EXP=True
+            # Make the Beta build recognisable in the QGIS Plugin Manager
+            sed -i "s/^description=\(.*\)$/description=[BETA] \1/" "$META"
+          else
+            EXP=False
+          fi
           sed -i "s/^experimental=.*/experimental=${EXP}/" "$META"
           sed -i "s#^homepage=.*#homepage=${REPO_URL}#; s#^repository=.*#repository=${REPO_URL}#; s#^tracker=.*#tracker=${REPO_URL}/issues#" "$META"
-          grep -E '^(version|experimental|homepage|repository|tracker)=' "$META"
+          grep -E '^(version|description|experimental|homepage|repository|tracker)=' "$META"
 
       - name: Build zip
         run: |
@@ -115,12 +147,15 @@ jobs:
         run: |
           if [ "${{ github.event_name }}" = "release" ]; then
             gh release upload "$TAG" "${PLUGIN_DIR}.${VERSION}.zip" plugins.xml --clobber
+          elif [ "$PRERELEASE" = "true" ]; then
+            gh release create "$TAG" "${PLUGIN_DIR}.${VERSION}.zip" plugins.xml \
+              --target "${{ github.sha }}" --title "$TAG (Beta)" --generate-notes --prerelease
           else
             gh release create "$TAG" "${PLUGIN_DIR}.${VERSION}.zip" plugins.xml \
-              --target "${{ github.sha }}" --title "$TAG" --generate-notes
+              --target "${{ github.sha }}" --title "$TAG" --generate-notes --latest
           fi
 
-      - name: Publish to the plugin-repo branch (raw.githubusercontent.com)
+      - name: Publish to the plugin repository branch (raw.githubusercontent.com)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -132,8 +167,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .
-          git commit -q -m "QGIS plugin repository: ${TAG}"
-          # The branch only ever holds the latest release, so it is replaced each time.
+          git commit -q -m "QGIS plugin repository (${CHANNEL}): ${TAG}"
+          # The branch only ever holds the latest release of its channel, so it is replaced each time.
           git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "${REPO_BRANCH}"
           echo "Repository URL: https://raw.githubusercontent.com/${{ github.repository }}/${REPO_BRANCH}/plugins.xml"
 
@@ -173,12 +208,12 @@ jobs:
           password: ${{ secrets.MAIL_PASSWORD }}
           to: ${{ secrets.NOTIFY_EMAIL }}
           from: GMD CO Processing releases <${{ secrets.MAIL_USERNAME }}>
-          subject: "${{ needs.package.result == 'success' && 'Released' || 'FAILED release' }}: GMD CO Processing ${{ needs.package.outputs.tag }}"
+          subject: "${{ needs.package.result == 'success' && 'Released' || 'FAILED release' }} (${{ needs.package.outputs.channel || 'unknown channel' }}): GMD CO Processing ${{ needs.package.outputs.tag }}"
           body: |
-            Release ${{ needs.package.outputs.tag }} of ${{ github.repository }}: ${{ needs.package.result }}.
+            Release ${{ needs.package.outputs.tag }} (${{ needs.package.outputs.channel }}) of ${{ github.repository }}: ${{ needs.package.result }}.
 
             ${{ needs.package.result == 'success' && 'The QGIS plugin repository was updated. In QGIS: Plugins > Manage and Install Plugins > Settings > Reload Repositories, then upgrade GMD CO Processing.' || 'The plugin repository was NOT updated. Check the workflow run for the error.' }}
 
             Release:  ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.package.outputs.tag }}
             Run log:  ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-            Repository URL: https://raw.githubusercontent.com/${{ github.repository }}/plugin-repo/plugins.xml
+            Repository URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ needs.package.outputs.repo_branch }}/plugins.xml

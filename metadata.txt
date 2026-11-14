@@ -2,7 +2,7 @@
 name=GMD CO Processing
 qgisMinimumVersion=3.22
 description=EA post-processing tools for GMD.
-version=0.1.2
+version=0.1.0
 author=psacjperez
 email=cj.perez.psa@gmail.com
 

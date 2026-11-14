@@ -20,9 +20,8 @@ Put your PyQGIS scripts here. Every `*.py` file in this folder appears in the
 
 Variables available inside a script (same as the QGIS Python console):
 
-| Name       | Value                                         |
-|------------|-----------------------------------------------|
-| `iface`    | the QGIS interface                            |
-| `ea_layer` | the layer chosen in the panel's *EA layer* box (or `None`) |
+| Name    | Value              |
+|---------|--------------------|
+| `iface` | the QGIS interface |
 
 `print()` output and errors are shown in the panel's log.

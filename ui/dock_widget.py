@@ -7,7 +7,7 @@ import sys
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
 
-from qgis.core import QgsApplication, QgsMapLayerProxyModel
+from qgis.core import QgsApplication
 from qgis.PyQt import uic
 from qgis.PyQt.QtCore import QFileSystemWatcher, QSize, Qt, QUrl
 from qgis.PyQt.QtGui import QDesktopServices, QFont
@@ -58,9 +58,6 @@ class GMDCOProcessingDock(QDockWidget, FORM_CLASS):
         self._running = False
 
         os.makedirs(SCRIPTS_DIR, exist_ok=True)
-
-        self.layerCombo.setFilters(QgsMapLayerProxyModel.VectorLayer)
-        self.layerCombo.setAllowEmptyLayer(True)
 
         self.scriptList.setIconSize(QSize(20, 20))
         self.runButton.setIcon(theme_icon("mActionStart.svg"))
@@ -142,7 +139,6 @@ class GMDCOProcessingDock(QDockWidget, FORM_CLASS):
         name = os.path.basename(path)
         script_globals = {
             "iface": self.iface,
-            "ea_layer": self.layerCombo.currentLayer(),
         }
 
         self._running = True

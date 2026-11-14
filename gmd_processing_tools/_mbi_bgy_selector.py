@@ -1,14 +1,15 @@
 r"""MBI Barangay Coverage — counter-check the remaining MBIs, then choose the covering barangay.
 
 The remaining MBIs (the gaps / overlaps the PSOs declared pending, e.g. the 'remaining_cases'
-layer of GEMMA's MBI Validator GeoPackage, Disputed cases included) are counter-checked with a
-fresh run of the built-in MBI Checker (a copy of GEMMA's MBI Checker v13 — GEMMA does not need
-to be installed) on the barangay layers:
+layer of GEMMA's MBI Validator GeoPackage, Disputed cases included) are counter-checked
+against the MBI Layer when Load MBI Cases is clicked (the Run Check box is hidden):
 
-  • Still detected     — the check still finds the remaining MBI (shares area with it).
-  • Newly detected     — the check finds an MBI that is not in the remaining layer
+  • Still detected     — an MBI of the MBI Layer shares area with the remaining MBI.
+  • Newly detected     — an MBI of the MBI Layer that is not in the remaining layer
                          (light green row in the preview).
-  • No longer detected — a remaining MBI the check does not find any more (nothing to cover).
+  • No longer detected — a remaining MBI no MBI of the MBI Layer matches (nothing to cover).
+  • Not checked        — a remaining MBI of a type the MBI Layer does not contain; still to
+                         be covered.
 
 Every detected MBI involves two or more barangays, possibly from different barangay layers.
 The preview lists each MBI with all of its involved barangays, so you can tick the barangay
@@ -25,25 +26,20 @@ Workflow:
   Step 1  Pick the Remaining MBI layer (or Browse GPKG… to load 'remaining_cases' from a
           ref_mbi_reviewed GeoPackage).
   Step 2  Select every barangay layer the involved barangays come from (one or more).
-  Step 3  Pick the building point layer (and its geocode field): the MBI Checker counts the
-          buildings inside each MBI, and per involved barangay the ones tagged to it are
-          counted (the field may hold the barangay geocode or an EA geocode that starts with it).
-  Step 4  Click Run Check & Counter-Check — runs the built-in MBI Checker on the selected barangay
-          layers, compares each detection with the remaining MBIs, adds one "ppp_mbi"
-          layer ('detection', 'ref_case_uuid', 'ref_status', 'ref_remarks') and lists its cases.
-          Or pick an existing MBI layer (needs 'case_uuid') and click Load MBI Cases.
-          'Skip within-barangay cases' leaves out cases that involve a single barangay.
+  Step 3  Pick the building point layer (and its geocode field): the buildings inside each
+          MBI are counted, and per involved barangay the ones tagged to it
+          (the field may hold the barangay geocode or an EA geocode that starts with it).
+  Step 4  Pick the MBI Layer (needs 'case_uuid') and click Load MBI Cases — compares each
+          MBI with the remaining MBIs, adds one "ppp_mbi" layer ('detection',
+          'ref_case_uuid', 'ref_mbi_type', 'ref_status', 'ref_remarks') and lists its cases.
   Step 5  Tick the Role / Status box of the covering barangay in each case.
           Shared overlaps: when an overlap runs across several barangays (and their layers
           are selected), more than one barangay can be ticked — each keeps only its own part
           of the overlap (the MBI clipped to that barangay, minus what a barangay ticked
           before it keeps). The case is Partly Covered until those parts fill the MBI.
-          Auto-Assign Pending: single-barangay cases go to that barangay, multi-barangay
-          cases go to the barangay owning most of the buildings inside the MBI (needs
-          Step 3); shared overlaps go to every barangay with tagged buildings, most first.
           No-longer-detected MBIs have nothing to cover and cannot be ticked.
   Step 6  Apply Coverage writes 'assigned_bgy' (covering barangay geocodes, comma-separated)
-          into the MBI layer. No coverage status is written here — the MBI EA Selector writes
+          into the MBI layer. No coverage status is written here — the EA Selector writes
           it. Unsaved, undoable edits; no-longer-detected MBIs are untouched.
           An MBI between TWO barangays goes to one of them (ticking one unticks the other);
           only an overlap across THREE OR MORE barangays can be shared out (several ticks).
@@ -51,16 +47,15 @@ Workflow:
           every kept MBI part added as its own feature carrying the covering barangay's attributes,
           flagged 'bgy_part' = 'MBI' / 'is_mbi' = 1 and drawn hatched magenta (kept parts are cut
           out of the barangay features, so released overlaps leave the other barangays).
-  Step 8  Export GPKG + CSV writes the processed MBI layer, the coverage parts, the joined
-          barangays and a decision log CSV into the Export folder (applying pending choices first).
-  Step 9  Choose EAs in MBI EA Selector… applies pending choices and opens the MBI EA Selector
-          with this layer in barangay mode: each MBI is listed under its covering barangay
+  Step 8  Export GPKG + CSV writes the processed MBI layer, the joined barangays
+          ('mbi_bgy_joined', when barangay layers are ticked and kept parts exist) and a
+          decision log CSV into the Export folder (applying pending choices first).
+  Step 9  Choose EAs in the EA Selector Tab → applies pending choices and switches to the
+          EA Selector tab with this layer picked (barangay mode): each MBI is listed under its covering barangay
           ('assigned_bgy') and only that barangay's EAs can be chosen to cover it.
 """
-# Menu / panel entry (read by the GMD CO Processing plugin)
-TOOL_NAME = "MBI Barangay Selector"
-TOOL_GROUP = "EA Tools"
-TOOL_ICON = "icons/mbi_bgy_selector.svg"
+# Not a menu entry of its own (file name starts with "_"): this is the "Barangay Selector" tab of
+# the MBI Coverage Selector (mbi_coverage_selector.py), which loads it and builds the window.
 
 import csv
 import os
@@ -1163,6 +1158,10 @@ def build_counter_check(detected, remaining, checked_kinds, name, bgy_info=None)
                 continue
             stats["detected"] += 1
             attrs = {n: f[n] for n, _ in CHECKER_SCHEMA if n in lnames}
+            # A loaded MBI layer can mix types: each feature's own mbi_type wins.
+            fkind = _norm_type(_text(f, MBI_TYPE)) if MBI_TYPE in lnames else ""
+            if fkind not in ("Gap", "Overlap", "Disputed"):
+                fkind = kind
             if not _text(f, MBI_TYPE):
                 attrs[MBI_TYPE] = kind
             if remaining is not None:
@@ -1171,7 +1170,7 @@ def build_counter_check(detected, remaining, checked_kinds, name, bgy_info=None)
                 hits = []
                 for rid in index.intersects(g.boundingBox()):
                     r = refs.get(rid)
-                    if r is None or r["kind"] not in ("", "Disputed", kind) \
+                    if r is None or r["kind"] not in ("", "Disputed", fkind) \
                             or not engine.intersects(r["geom"].constGet()):
                         continue
                     if _area(_polygonal(g.intersection(r["geom"])), da) > MATCH_MIN_M2:
@@ -1243,10 +1242,10 @@ def infer_mbi_type(layer_name):
 # ─────────────────── UI (styled after GEMMA's Geometry Check & Repair) ───────────────────
 
 DIALOG_NAME = "MBIBgyCoverageDialog"
-DIALOG_TITLE = "MBI Barangay Coverage"
-DIALOG_SUBTITLE = ("Counter-check the remaining MBIs with the built-in MBI Checker, review every "
-                   "detected gap / overlap with its involved barangays, then choose the "
-                   "barangay that covers it.")
+DIALOG_TITLE = "MBI Coverage Selector — Barangay Selector"
+DIALOG_SUBTITLE = ("Barangay Selector: counter-check the MBI layer against the remaining MBIs, review "
+                   "every gap / overlap with its involved barangays, then choose the barangay "
+                   "that covers it.")
 
 BTN_RUN = ""
 BTN_CANCEL = ""
@@ -1257,8 +1256,7 @@ GRP_STYLE = ("QGroupBox { font-weight:600; margin-top:6px; } "
 LEFT_WIDTH = 315
 
 NO_CASES = ("No MBI cases loaded. Pick the Remaining MBI layer and tick the barangay layers on the "
-            "left, then click Run Check & Counter-Check — or pick an existing MBI layer and click "
-            "Load MBI Cases.")
+            "left, pick the MBI layer, then click Load MBI Cases.")
 
 TREE_COLS = ["MBI Case / Bgy Geocode", "Detection", "MBI Level", "Barangay", "City / Municipality",
              "Bldg Pts", "Role / Status"]
@@ -1336,351 +1334,13 @@ RUN_COLOURS = {
            "load": "#2E7D32", "load_text": "#FFFFFF", "load_border": "#66BB6A", "load_hover": "#388E3C"},
 }
 # Help HTML colour swaps for dark mode
-HELP_DARK_SWAPS = [("#111827", "#ECEFF1"), ("#1f2937", "#ECEFF1"), ("#374151", "#B0BEC5"),
-                   ("#4b5563", "#B0BEC5"), ("#f9fafb", "#1E2327"), ("#e5e7eb", "#455A64")]
-
-HELP_HTML = """
-<div style="font-family:'Segoe UI',Arial,sans-serif; color:#1f2937; font-size:12px; line-height:1.5;">
-  <div style="border-bottom:2px solid #374151; padding-bottom:8px; margin-bottom:14px;">
-    <h2 style="margin:0 0 4px 0; color:#111827; font-size:17px;">MBI Barangay Coverage</h2>
-    <div style="color:#4b5563;">Counter-check the remaining MBIs (the gaps, overlaps and disputed areas declared pending)
-    with a fresh run of the <b>built-in MBI Checker</b> — a copy of GEMMA's MBI Checker, so GEMMA does not need to be
-    installed — see which are still detected and which are new, then decide which involved barangay covers each one
-    and export the result.</div>
-  </div>
-
-  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Quick Start</h3>
-  <ol style="margin-top:4px;">
-    <li><b>Pick the remaining MBI layer</b> (left, <i>Remaining MBI Layer</i>). Not loaded yet? Click the folder
-        button (<b>Browse GPKG…</b>) and open the MBI Validator's <i>ref_mbi_reviewed-….gpkg</i> — its
-        <i>remaining_cases</i> layer is added and picked for you.</li>
-    <li><b>Tick your barangay layers</b> (<i>Barangay Layers</i>) — every layer the involved barangays come from.</li>
-    <li>Pick the <i>Building Points</i> layer so the check counts the buildings inside each MBI.</li>
-    <li>Click <b>Run Check &amp; Counter-Check</b> (the <b style="color:#E65100;">orange</b> box). The MBI Checker
-        runs on the barangay layers and every MBI it finds is compared with the remaining MBIs, Disputed ones
-        included.</li>
-    <li>Read the <b>Detection</b> column: <b>Still detected</b>, <b>Newly detected</b> (the whole row is
-        <b style="color:#558b2f;">light green</b>), <b>No longer detected</b> (grey, nothing to cover) or
-        <b>Not checked</b> (blue-grey cell: its MBI type was not looked for in this run — still to be covered).</li>
-    <li>In the list, <b>tick the Role / Status box of the barangay that covers</b> each detected MBI — or click
-        <b>Auto-Assign Pending</b> to let the tool decide the easy ones, then review. An overlap that
-        runs across several barangays can be <b>shared out</b>: tick more than one barangay and each keeps only
-        its own part (see <i>Shared Overlaps</i> below).</li>
-    <li>Click <b>Apply Coverage</b> to write your choices into the <i>ppp_mbi</i> layer: the chosen barangay's row
-        gets the covering barangay geocode in <i>assigned_bgy</i>. No coverage status is written here — the MBI EA
-        Selector writes it.</li>
-    <li>Click <b>Join MBI to Barangays</b> for a copy of the barangay layers with each MBI joined to the barangay
-        it is assigned to — the joined MBI parts are drawn <b style="color:#c51162;">hatched magenta</b> and flagged
-        <i>bgy_part</i> = <b>MBI</b> / <i>is_mbi</i> = <b>1</b>.</li>
-    <li>Click <b>Export GPKG + CSV</b> to save the processed layer and a decision log.</li>
-    <li><b>Next step — choose the EA:</b> click <b>Choose EAs in MBI EA Selector…</b>. It applies any pending
-        choices, then opens the MBI EA Selector with this layer: every MBI is listed under the barangay you chose
-        here and <b>only that barangay's EAs</b> are offered. Tick the EA layers there and click <b>Load MBI
-        Cases</b>.</li>
-  </ol>
-
-  <div style="background:#f9fafb; border:1px solid #e5e7eb; border-left:4px solid #2e7d32;
-              padding:10px 14px; margin:12px 0 16px 0;">
-    <b style="color:#111827;">After the barangay, the EA:</b>
-    The MBI EA Selector reads <i>assigned_bgy</i> from this layer (keep the Coverage field named
-    <i>assigned_bgy</i>). A shared overlap is listed there once per covering barangay, each with only its part.
-    MBIs still pending here are skipped there, so assign them first. It writes <i>assigned_ea</i> and
-    <i>coverage_status</i> on the covering barangay's rows and never changes <i>assigned_bgy</i>.
-  </div>
-
-  <div style="background:#f9fafb; border:1px solid #e5e7eb; border-left:4px solid #4b5563;
-              padding:10px 14px; margin:12px 0 16px 0;">
-    <b style="color:#111827;">Nothing Reaches Disk Without Your Say-So:</b>
-    Ticking barangays only changes the viewer. <i>Apply Coverage</i> writes into the MBI layer inside an
-    ordinary QGIS edit session — keep it with Toggle Editing's <b>Save Edits</b>, or undo with
-    <b>Edit &gt; Undo</b> / <b>Discard Edits</b>. The remaining MBI layer and the barangay layers are never
-    edited. Files are only created by <i>Export GPKG + CSV</i>.
-  </div>
-
-  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">The Counter-Check</h3>
-  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
-    <tr><td width="110" style="font-weight:bold; vertical-align:top;">Still detected</td>
-        <td>The check found an MBI that <b>shares area</b> with a remaining MBI of the same type (gap with gap, overlap
-        with overlap, disputed with disputed) — the discrepancy the PSO declared pending is still there. A remaining
-        <b>Disputed</b> MBI is still detected by <b>any</b> finding sharing its area: an open dispute shows up as a
-        contested polygon, a gap or an overlap (the tooltip then names the remaining MBI's type). Hover the Detection cell for the
-        remaining MBI's <i>case_uuid</i>, its declared status and remarks.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Newly detected<br><span style="background:#dcedc8;">&nbsp;light green&nbsp;</span></td>
-        <td>The check found an MBI that matches <b>no</b> remaining MBI — it is not in the remaining layer. The case row
-        and its barangay rows are coloured light green (the Role / Status cell keeps its status colour). Newly detected
-        MBIs are listed first.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">No longer detected<br><span style="background:#e0e0e0;">&nbsp;grey&nbsp;</span></td>
-        <td>A remaining MBI the check did not find any more. It is listed for your information only — there is nothing
-        to cover, so it cannot be ticked, Auto-Assign skips it and Apply Coverage leaves its fields untouched.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Not checked<br><span style="background:#cfd8dc;">&nbsp;blue-grey&nbsp;</span></td>
-        <td>A remaining MBI of a type <b>this run did not look for</b> — e.g. a Disputed case under
-        <i>Overlaps Only</i>, or one carried over from a National-Level MBI Checker run made with
-        <b>Include Disputed Areas</b> unticked. It was never counter-checked, so it is <b>not</b>
-        "no longer detected" and nothing here says it is resolved. It is <b>still an open case</b>:
-        it is listed with its involved barangays (from <i>involved_areas</i>), one row each, and you
-        <b>tick the covering barangay exactly as usual</b> — only the Detection cell is marked blue-grey.
-        Run the mode that covers its type to counter-check it as well. When the remaining layer carries
-        an <i>mbi_scope</i> field, the log names the MBI types the run that produced it looked for.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Matching rule</td>
-        <td>Same as GEMMA's MBI Validator: a detection and a remaining MBI only match when they overlap in <b>area</b>;
-        merely touching along an edge does not count, so a genuinely new MBI next to an old one is reported as new.
-        Remaining MBIs of a type the run did not look for are listed as <b>Not checked</b>, never as
-        "no longer detected" (e.g. gaps with
-        <i>Overlaps Only</i>); remaining <i>Disputed</i> MBIs are only checked by <i>Gaps, Overlaps and Disputed</i>,
-        since a dispute can show up as any of the three.
-        One detection overlapping several remaining MBIs lists them all in <i>ref_case_uuid</i>; a remaining MBI now
-        found as several pieces gives one case per piece.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Built-in MBI Checker</td>
-        <td>A copy of GEMMA's MBI Checker (v13) inside this tool: barangay layers are merged, reprojected to
-        EPSG:3857 and fixed; <b>overlaps</b> are intersecting polygon pairs (<i>2_Overlap</i>);
-        <b>gaps</b> are holes between the dissolved barangays, involving every barangay within 0.50 m
-        (<i>1_Gap</i>); the MBI level comes from region / province / city / barangay. A finding of
-        <b>0.10 m² or less with no building point inside</b> is dropped as a sliver; a tiny one holding a building
-        is kept. This area is measured on the project's ellipsoid (as QGIS <i>$area</i>, like the National-Level
-        and EA MBI Checkers), or planar in EPSG:3857 when the project has no ellipsoid. Adjusted for the counter-check:
-        <b>disputed areas</b> are reported again (<i>3_Disputed</i>: polygons whose <i>boundary</i> is
-        <i>Contested</i>, involving the contested polygon and every barangay within 0.50 m, so a covering barangay can
-        be chosen; their footprint is left out of the gaps, as in GEMMA); the remaining MBIs are <b>not</b> subtracted
-        from the gaps (GEMMA drops loaded Disputed cases from its gaps, which would hide the cases being checked); and
-        building points are optional.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">ppp_mbi layer</td>
-        <td>Run Check adds one temporary layer named <b>ppp_mbi</b>, where <i>ppp</i> is the province code — the first
-        3 digits of the ticked barangay layers' geocodes (several provinces: <i>012_015_mbi</i>). Each detected MBI is
-        written as <b>one row per involved barangay</b>, all sharing the MBI's <i>case_uuid</i> and geometry, as in the
-        MBI EA Selector: <i>geocode, region, province, city_mun, barangay</i> are that row's barangay, so every row
-        gets its own coverage status. Fields: the MBI Checker's (<i>case_uuid, geocode … involved_areas,
-        involved_bgys, mbi_type, num_bldg_pts</i>) plus <b>detection</b>, <b>ref_case_uuid</b>, <b>ref_mbi_type</b>,
-        <b>ref_status</b> and <b>ref_remarks</b>. No-longer-detected remaining MBIs keep the remaining layer's row.
-        On the map it is coloured by detection (green = new, orange = still, grey dashed = no longer). Right-click
-        &gt; <b>Make Permanent</b> to keep it. Without a remaining layer there are no detection fields.</td></tr>
-  </table>
-
-  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">How Barangays Are Matched</h3>
-  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
-    <tr><td width="110" style="font-weight:bold; vertical-align:top;">Barangay geocode</td>
-        <td>The MBI Checker writes <b>one row per MBI</b>: the involved barangays are the geocodes in
-        <i>involved_areas</i> (names from <i>involved_bgys</i>), plus the row's own <i>geocode</i>. In the barangay
-        layers the tool looks for <i>geocode</i>, then <i>bgy_geocode</i>; the barangay name comes from
-        <i>barangay</i> (or <i>bgy_name</i> / <i>name</i>).</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">EA MBI layers</td>
-        <td>An older EA MBI layer (one row per involved EA) still loads with <i>Load MBI Cases</i>: all the EAs of one
-        barangay in a case count as <b>one barangay</b> (hover the barangay name to see its EAs). Cases where every
-        area belongs to the same barangay have nothing to decide — <i>Skip within-barangay cases</i> leaves them out.</td></tr>
-  </table>
-
-  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Inputs (left panel)</h3>
-  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
-    <tr><td width="110" style="font-weight:bold; vertical-align:top;">Remaining MBI Layer</td>
-        <td>The MBIs declared pending: the <i>remaining_cases</i> (or <i>pending_cases</i>) layer of the MBI
-        Validator's GeoPackage, or a <i>ref_mbi_cases</i> layer. A loaded layer with one of those names is picked
-        automatically. The folder button (<b>Browse GPKG…</b>) adds the layer from a GeoPackage — <i>remaining_cases</i>
-        first, else <i>pending_cases</i> / <i>ref_mbi_cases</i>, else you choose. Its <i>case_uuid</i>, <i>mbi_type</i>,
-        status (<i>mbi_status</i> / <i>ref_status</i>) and remarks (<i>pso_remarks</i> / <i>ref_remarks</i>) are read.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Barangay Layers</td>
-        <td>Click every barangay layer the involved barangays come from — an inter-municipal or inter-provincial
-        MBI can involve barangays stored in different layers. These are the layers the MBI Checker checks. The log
-        reports involved barangays that none of the selected layers contain (shown in red in the list). The barangay
-        shapes are also what <b>shared overlaps</b> are clipped to. <i>Skip within-barangay cases</i> (on by default)
-        leaves out cases that involve a single barangay.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Building Points</td>
-        <td>Passed to the MBI Checker (its <i>num_bldg_pts</i>). <b>Case row:</b> building points inside the MBI.
-        <b>Barangay rows:</b> of those, the points whose <i>Geocode field</i> (auto: bgy_geocode, geocode, then
-        ea_geocode) is the barangay's geocode <b>or starts with it</b>. Used by Auto-Assign. Without it the check
-        still runs, with building counts of 0.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Run Check &amp; Counter-Check<br>(orange box)</td>
-        <td>Choose <i>Gaps, Overlaps and Disputed</i> (checks every remaining MBI), <i>Overlaps Only</i>,
-        <i>Gaps Only</i> or <i>Disputed Only</i>, then click the button. It runs the <b>built-in MBI Checker</b> on the
-        ticked barangay layers, compares every MBI it finds with the remaining MBI layer, adds the <i>ppp_mbi</i>
-        layer and loads its cases. GEMMA is not needed. Barangay layers need a <i>geocode</i> field
-        (plus <i>region</i>, <i>province</i>, <i>city_mun</i> and <i>barangay</i> for the MBI level, and
-        <i>boundary</i> = <i>Contested</i> on disputed polygons).</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Or Load an Existing MBI Layer<br>(green button)</td>
-        <td>Reopens a result without running the check again: pick an earlier <i>ppp_mbi</i> layer (e.g. one
-        you made permanent) and click <b>Load MBI Cases</b> — its Detection column and colours come back. Tick <i>Only
-        selected MBI features</i> to load just part of it and <i>Resume saved coverage choices</i> to pre-tick
-        barangays already applied to it.</td></tr>
-  </table>
-
-  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Reading the Case List</h3>
-  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
-    <tr><td width="110" style="font-weight:bold; vertical-align:top;">Case row (bold)</td>
-        <td>One gap / overlap. Shows its <b>Detection</b> (see <i>The Counter-Check</i>), MBI level, the barangays and
-        cities / municipalities involved and the <b>Bldg Pts</b> inside it. Status is <b>Pending — tick the covering barangay below</b> (peach) until a
-        barangay is chosen, then <b>✔ Done — covered by &lt;barangay&gt;</b> (green) — or <b>Partly covered (x%) — tick another barangay</b> (cream)
-        when the barangays ticked in a shared overlap do not fill the whole MBI yet. No-longer-detected MBIs show
-        <b>No longer detected</b> (grey); a <b>Not checked</b> case keeps its normal status and is ticked as usual.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Barangay rows (below)</td>
-        <td>Each involved barangay (geocode, name, city / municipality) with its own <b>Bldg Pts</b> (buildings
-        inside this MBI tagged to that barangay). <b>Tick the Role / Status box of the covering barangay.</b> In a
-        gap, an MBI between <b>two</b> barangays, or an overlap that cannot be shared out, only one barangay covers
-        the case — ticking one unticks the other. Only an overlap across <b>three or more</b> barangays lets you
-        tick several. Unticking every barangay makes the case Pending again.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Moving around</td>
-        <td>Click a row to select it on the map, double-click to zoom, right-click for more (set / add / remove
-        a covering barangay, mark pending, copy case ID or the remaining MBI's case ID). Zooming on a barangay row
-        always shows the <b>whole MBI case</b> (both sides of a gap / overlap), not just that barangay's own row,
-        and flashes the barangay you clicked so it stands out. Select a barangay row to see its part against the
-        MBI on the map even in a two-barangay case (see <i>On the map</i> under <i>Shared Overlaps</i>). Use the search box
-        (barangay, city, geocode, EA name, case ID or detection) and the <i>Show</i> filter (<i>All / Pending /
-        Partly covered / Covered / Newly detected / Still detected / No longer detected / Overlaps / Gaps / level</i>)
-        to find cases. Click a column header to sort.</td></tr>
-  </table>
-
-  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Shared Overlaps (one MBI across several barangays)</h3>
-  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
-    <tr><td width="110" style="font-weight:bold; vertical-align:top;">What it is</td>
-        <td><b>Needs three or more candidate barangays</b> — an MBI between two barangays always goes to one of
-        them. An overlap that runs across several barangays (e.g. one barangay overlapping a strip of three
-        barangays of the next municipality) does not have to go to a single barangay. Tick several: <b>each
-        ticked barangay keeps only its own part of the overlap</b> — the MBI clipped to that barangay. The other
-        barangays release (clip) the parts the ticked ones keep.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Order matters</td>
-        <td>Where two ticked barangays both contain the same piece of the overlap, the barangay <b>ticked
-        first</b> keeps it; the later one keeps the rest of its part. To change who keeps a shared piece, untick
-        and re-tick in the order you want.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Reading the rows</td>
-        <td>Ticked barangay: <b>✔ Covers its part (x% of the MBI)</b> — its share of the MBI, plus the buildings in it.
-        Unticked barangay: <b>✖ Gives up the overlap — cut out of it</b> when all of its part is kept by ticked barangays, <b>Gives up x%
-        · tick to keep the rest</b> when only some is — tick it to keep the rest. Hover a row for the areas.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">On the map</td>
-        <td>Select a barangay row to see its part: <b style="color:#2e7d32;">green</b> = what it keeps,
-        <b style="color:#1565c0;">dashed blue</b> = what it would keep if ticked. Select the case row to see
-        every kept part and, in <b style="color:#e65100;">orange</b>, what no ticked barangay keeps yet. This also
-        works for an ordinary two-barangay case (not just a 3+-way shared overlap): select either barangay row to
-        see its own part (dashed blue, or green once it is the one ticked) against the whole MBI.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">When it applies</td>
-        <td>Overlaps with two or more barangays whose shapes are all in the selected barangay layers. Gaps (no
-        barangay contains a gap) and overlaps with a barangay missing from the selected layers keep the
-        one-barangay-covers-all rule.</td></tr>
-  </table>
-
-  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Choices in the Viewer</h3>
-  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
-    <tr><td width="110" style="font-weight:bold;">Overlap</td>
-        <td>Ticked barangay: <b>✔ Covers — keeps the overlap</b>. Others: <b>✖ Gives up the overlap — cut out of it</b>. With two barangays, ticking one
-        unticks the other.</td></tr>
-    <tr><td style="font-weight:bold;">Shared overlap</td>
-        <td>Three or more barangays: each ticked barangay <b>✔ Covers its part</b>. Others: <b>✖ Gives up</b> what the ticked ones keep.</td></tr>
-    <tr><td style="font-weight:bold;">Gap</td>
-        <td>Ticked barangay: <b>✔ Covers — its boundary is extended over the gap</b>. Others: <b>Not extended — stays as it is</b>. Before you tick, each row reads <b>☐ Tick if this barangay covers it</b>.</td></tr>
-    <tr><td style="font-weight:bold;">Auto-Assign</td>
-        <td>Single-barangay cases go to that barangay. Multi-barangay cases go to the barangay that owns most of the
-        buildings inside the MBI (needs Building Points); shared overlaps go to <b>every</b> barangay with tagged
-        buildings, most buildings first, each keeping its part. No tagged buildings or a tie stays Pending —
-        decide those by hand. Auto-assigned shared overlaps can end up Partly covered: check them with
-        <i>Show: Partly covered</i>.</td></tr>
-  </table>
-
-  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Join MBI to Barangays</h3>
-  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
-    <tr><td width="110" style="font-weight:bold; vertical-align:top;">What it makes</td>
-        <td>A new temporary layer <i>Barangays + MBI (&lt;date&gt;_&lt;time&gt;)</i>: every feature of the ticked
-        barangay layers, plus <b>one feature per MBI part a barangay keeps</b> (your ticks in the viewer — Apply
-        Coverage is not needed first). Each MBI part carries the <b>covering barangay's attributes</b> (geocode,
-        name, city …), so it belongs to that barangay. The barangay layers themselves are never edited.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">How to tell it is an MBI</td>
-        <td><b>bgy_part</b> = <i>MBI</i> (original areas: <i>Barangay</i>) and <b>is_mbi</b> = <i>1</i> (else 0) —
-        filter with <i>"is_mbi" = 1</i>. On the map the MBI parts are <b style="color:#c51162;">hatched magenta with a
-        dashed outline</b>. They also hold <i>mbi_case_uuid, mbi_type, mbi_level, mbi_detection, mbi_area_m2,
-        mbi_bldg_pts</i> and <i>mbi_released_by</i> (the barangays that gave the overlap up).</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Barangay features</td>
-        <td>Kept MBI parts are <b>cut out</b> of every barangay feature they lie in, so nothing is counted twice: an
-        overlap is removed from the barangays that released it (and stored once, as the MBI part, for the one that
-        keeps it); a disputed polygon wholly absorbed by its covering barangay is left out. Gaps simply add a new
-        part. To merge each MBI into its barangay, run <i>Vector &gt; Geoprocessing &gt; Dissolve</i> by
-        <i>geocode</i>.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Not joined</td>
-        <td>Pending cases, the uncovered part of partly covered overlaps, and no-longer-detected MBIs. An MBI assigned
-        to a barangay that is not in the ticked layers still gets its part, with only geocode / name / city filled
-        (the log counts them).</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Export</td>
-        <td><i>Export GPKG + CSV</i> also writes this layer into the GeoPackage as <i>mbi_bgy_joined</i>.</td></tr>
-  </table>
-
-  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Apply Coverage — Fields Written</h3>
-  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
-    <tr><td width="110" style="font-weight:bold; vertical-align:top;">Coverage field<br>(default <i>assigned_bgy</i>)</td>
-        <td>Geocode of the covering barangay, on every row of the case — several geocodes, comma-separated, for a
-        shared overlap (in the order ticked). Empty while the case is Pending.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">No coverage status</td>
-        <td>This tool writes <b>no</b> <i>coverage_status</i>: the coverage status is decided per EA and written by
-        the <b>MBI EA Selector</b>. Skipped within-barangay cases are not loaded and no-longer-detected MBIs have
-        nothing to cover, so both are left untouched.</td></tr>
-  </table>
-  <div style="color:#4b5563; margin-top:4px;">The field name can be changed in the panel (letters, digits and
-  underscores only), but the MBI EA Selector reads <i>assigned_bgy</i> — keep that name. A missing field is
-  added to the MBI layer automatically.</div>
-
-  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">Export GPKG + CSV</h3>
-  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
-    <tr><td width="110" style="font-weight:bold; vertical-align:top;">Export folder</td>
-        <td>Where the files go. Leave it empty and you are asked for a folder when you click Export.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">GeoPackage</td>
-        <td><i>ppp_mbi_&lt;date&gt;_&lt;time&gt;.gpkg</i> with: <i>ppp_mbi</i> — the whole MBI layer including the
-        coverage fields, even if you have not saved the layer's edits yet — and <i>mbi_bgy_joined</i> — the barangays with their MBIs joined (as <i>Join MBI to Barangays</i>; only when
-        barangay layers are ticked and some MBI is covered).</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">CSV</td>
-        <td><i>ppp_mbi_&lt;date&gt;_&lt;time&gt;.csv</i> — one row per case / barangay: case ID, detection,
-        remaining MBI case ID and declared status, type, level, MBI
-        area, building counts, barangay geocode / name / city / province, its EAs, the barangay's part and kept
-        area (m²) and kept buildings, <i>chosen</i> (Yes for the covering barangay) and the covering barangay(s). Opens in Excel.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Not applied yet?</td>
-        <td>If your choices are not in the MBI layer yet, Export offers to <b>Apply Coverage first</b>, so the
-        files always match what you see. Pending cases are exported with an empty <i>assigned_bgy</i>.</td></tr>
-  </table>
-
-  <h3 style="color:#111827; font-size:14px; border-bottom:1px solid #e5e7eb; padding-bottom:4px;">If Something Looks Wrong</h3>
-  <table width="100%" cellpadding="6" cellspacing="0" style="border:1px solid #e5e7eb; font-size:11px;">
-    <tr><td width="110" style="font-weight:bold; vertical-align:top;">Run Check is greyed out</td>
-        <td>Tick at least one barangay layer, and make sure each has a <i>geocode</i> field.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">No Detection column</td>
-        <td>No remaining MBI layer was picked, so nothing was counter-checked. Pick it (or Browse GPKG…) and run the
-        check again.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Everything is Newly detected</td>
-        <td>No detection shares area with a remaining MBI: check you picked the right remaining layer (the same
-        province / municipality) and that its <i>mbi_type</i> values say Gap / Overlap / Disputed.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">A remaining MBI is missing from the list</td>
-        <td>It is of a type this run did not look for (e.g. a gap with <i>Overlaps Only</i>, or a Disputed case with
-        anything but <i>Gaps, Overlaps and Disputed</i>) — the log counts them. Run <i>Gaps, Overlaps and Disputed</i>
-        to check everything.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">No disputed areas found</td>
-        <td>The checker reports a disputed area only for a barangay polygon whose <i>boundary</i> field is
-        <i>Contested</i>. Without that field, a remaining Disputed MBI can still be found as a gap or overlap
-        sharing its area.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Load MBI Cases is greyed out</td>
-        <td>The picked MBI layer has no <i>case_uuid</i> field — use Run Check to create a proper one.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">No cases after loading</td>
-        <td>Every case involves one barangay only (e.g. an EA MBI layer with only within-barangay
-        discrepancies). Untick <i>Skip within-barangay cases</i> to list them anyway.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Barangay in red / "not found"</td>
-        <td>The barangay's layer is not ticked, or its geocode differs from the MBI layer's <i>geocode</i>. Tick
-        the layer, then Load again.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Can only tick one barangay in an overlap</td>
-        <td>An MBI between two barangays (and every gap) takes one barangay. An overlap across three or more can
-        be shared out only when the layers of <b>all</b> its barangays are ticked under <i>Barangay Layers</i> (none
-        may be red) — tick them, then Load again.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Stays Partly covered</td>
-        <td>The ticked barangays' parts leave some of the MBI uncovered. Select the case row to see the orange
-        leftover on the map, then tick the barangay that contains it.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Barangay rows show 0 buildings</td>
-        <td>No building inside this MBI is tagged to that barangay. Check the <i>Geocode field</i> under Building
-        Points holds the barangay geocode (or an EA geocode starting with it).</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Field name turns red</td>
-        <td>Use letters, digits and underscores only, starting with a letter or underscore; the Coverage field,
-        Apply and Export stay disabled until fixed.</td></tr>
-    <tr><td style="font-weight:bold; vertical-align:top;">Made a mistake</td>
-        <td>Before Apply: <b>Reset Choices</b> or untick. After Apply: <b>Edit &gt; Undo</b> or
-        <b>Discard Edits</b> on the MBI layer (before saving).</td></tr>
-  </table>
-</div>
-"""
 
 
 class _Cancelled(Exception):
     pass
 
 
-def make_dialog_class():
+def make_panel_class():
     import re
     from qgis.core import (QgsApplication, QgsCategorizedSymbolRenderer, QgsCoordinateTransform,
                            QgsFeature, QgsFeatureRequest, QgsField, QgsFillSymbol,
@@ -1810,23 +1470,16 @@ def make_dialog_class():
             except TypeError:
                 return str(a) < str(b)
 
-    class CoverageDialog(QtWidgets.QDialog):
+    class CoveragePanel(QtWidgets.QWidget):
+        """One tab page of the MBI Coverage Selector window (the window, its title, Help tab
+        and Minimize / Close buttons belong to mbi_coverage_selector.py)."""
+
         def __init__(self, iface, parent=None):
             super().__init__(parent)
             self.setObjectName(DIALOG_NAME)
-            self.setWindowTitle(f"{DIALOG_TITLE} — MBI Barangay Selector")
-            icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), TOOL_ICON) \
-                if "__file__" in globals() else ""
-            if icon and os.path.exists(icon):
-                from qgis.PyQt.QtGui import QIcon
-                self.setWindowIcon(QIcon(icon))
-            self.setWindowFlags(self.windowFlags()
-                                | Qt.WindowMinimizeButtonHint | Qt.WindowMaximizeButtonHint)
-            self.setAttribute(Qt.WA_DeleteOnClose, True)
-            self.setMinimumSize(860, 560)
-            self.resize(1100, 740)
 
             self.iface = iface
+            self.ea_panel_hook = None  # set by the MBI Coverage Selector: shows + returns the EA tab
             self.cases = {}           # case_uuid -> MBICase
             self.case_items = {}      # case_uuid -> top-level tree item
             self.bgy_lookup = {}      # barangay geocode -> {name, city_mun, fids, layer_id}
@@ -1843,30 +1496,8 @@ def make_dialog_class():
             self.is_dark = self.palette().color(self.palette().Window).lightness() < 128
 
             root = QtWidgets.QVBoxLayout(self)
-            root.setContentsMargins(12, 12, 12, 12)
-            root.setSpacing(8)
-            self.title_label = QtWidgets.QLabel(DIALOG_TITLE)
-            self.title_label.setWordWrap(True)
-            root.addWidget(self.title_label)
-            self.sub_label = QtWidgets.QLabel(DIALOG_SUBTITLE)
-            self.sub_label.setWordWrap(True)
-            root.addWidget(self.sub_label)
-            self.sep_line = QtWidgets.QFrame()
-            self.sep_line.setFrameShape(QtWidgets.QFrame.HLine)
-            root.addWidget(self.sep_line)
-
-            self.tabs = QtWidgets.QTabWidget()
-            self.tabs.addTab(self._build_main_tab(), "MBI Barangay Coverage")
-            self.tabs.addTab(self._build_help_tab(), "Help and Information")
-            root.addWidget(self.tabs, 1)
-
-            close_row = QtWidgets.QHBoxLayout()
-            close_row.addStretch()
-            close_btn = QtWidgets.QPushButton("Close")
-            close_btn.setMinimumWidth(100)
-            close_btn.clicked.connect(self.close)
-            close_row.addWidget(close_btn)
-            root.addLayout(close_row)
+            root.setContentsMargins(0, 0, 0, 0)
+            root.addWidget(self._build_main_tab(), 1)
 
             prj = QgsProject.instance()
             prj.layersAdded.connect(self.refresh_bgy_list)
@@ -1893,13 +1524,13 @@ def make_dialog_class():
             ll.setContentsMargins(0, 0, 4, 0)
             ll.setSpacing(6)
 
-            box, lay = group("Remaining MBI Layer (declared pending)")
+            box, lay = group("Remaining MBI Layer")
             rrow = QtWidgets.QHBoxLayout()
             self.remaining_combo = layer_combo(polygon_filter)
             self.remaining_combo.setToolTip(
                 "The MBIs the PSOs declared pending — e.g. 'remaining_cases' of the MBI Validator's\n"
-                "ref_mbi_reviewed GeoPackage, or a ref_mbi_cases layer. Run Check compares every\n"
-                "MBI the check finds with these.")
+                "ref_mbi_reviewed GeoPackage, or a ref_mbi_cases layer. Load MBI Cases compares\n"
+                "every MBI of the MBI Layer with these (counter-check).")
             rrow.addWidget(self.remaining_combo, 1)
             self.browse_btn = QtWidgets.QToolButton()
             self.browse_btn.setIcon(QgsApplication.getThemeIcon("/mActionFileOpen.svg"))
@@ -1910,6 +1541,41 @@ def make_dialog_class():
             lay.addLayout(rrow)
             self.remaining_hint = self._hint()
             lay.addWidget(self.remaining_hint)
+            ll.addWidget(box)
+
+            box, lay = group("MBI Layer")
+            self.mbi_combo = layer_combo(polygon_filter)
+            self.mbi_combo.setToolTip("An existing MBI layer (e.g. a ppp_mbi layer made permanent),\n"
+                                      "or any Gaps / Overlaps layer with 'case_uuid'.")
+            lay.addWidget(self.mbi_combo)
+            self.mbi_hint = self._hint()
+            lay.addWidget(self.mbi_hint)
+            self.selected_only = QtWidgets.QCheckBox("Only selected MBI features")
+            self.selected_only.setToolTip("Load only the cases of the features selected on the map.")
+            lay.addWidget(self.selected_only)
+            self.preload_check = QtWidgets.QCheckBox("Resume saved coverage choices")
+            self.preload_check.setChecked(True)
+            self.preload_check.setToolTip("Pre-tick barangays from the coverage field already in the MBI layer.")
+            lay.addWidget(self.preload_check)
+            ll.addWidget(box)
+
+            box, lay = group("Building Points")
+            self.bldg_combo = layer_combo(point_filter)
+            lay.addWidget(self.bldg_combo)
+            frow = QtWidgets.QHBoxLayout()
+            frow.addWidget(QtWidgets.QLabel("Geocode field:"))
+            self.bldg_field_combo = QgsFieldComboBox()
+            self.bldg_field_combo.setAllowEmptyFieldName(True)
+            self.bldg_field_combo.setToolTip(
+                "Building point field holding the barangay geocode (or an EA geocode, which starts\n"
+                "with it). Each building inside an MBI is credited to the involved barangay whose\n"
+                "geocode equals — or begins — the value.")
+            frow.addWidget(self.bldg_field_combo, 1)
+            lay.addLayout(frow)
+            self.bldg_combo.layerChanged.connect(self._on_bldg_layer)
+            self.bldg_field_combo.fieldChanged.connect(self.validate_inputs)
+            self.bldg_hint = self._hint()
+            lay.addWidget(self.bldg_hint)
             ll.addWidget(box)
 
             box, lay = group("Barangay Layers")
@@ -1933,32 +1599,7 @@ def make_dialog_class():
             lay.addWidget(self.layer_count_label)
             self.bgy_hint = self._hint()
             lay.addWidget(self.bgy_hint)
-            self.skip_within = QtWidgets.QCheckBox("Skip within-barangay cases")
-            self.skip_within.setChecked(True)
-            self.skip_within.setToolTip(
-                "Leave out cases that involve a single barangay (e.g. gaps / overlaps between\n"
-                "EAs of the same barangay in an EA MBI layer) — there is no barangay to choose.")
-            lay.addWidget(self.skip_within)
             ll.addWidget(box, 1)
-
-            box, lay = group("Building Points")
-            self.bldg_combo = layer_combo(point_filter)
-            lay.addWidget(self.bldg_combo)
-            frow = QtWidgets.QHBoxLayout()
-            frow.addWidget(QtWidgets.QLabel("Geocode field:"))
-            self.bldg_field_combo = QgsFieldComboBox()
-            self.bldg_field_combo.setAllowEmptyFieldName(True)
-            self.bldg_field_combo.setToolTip(
-                "Building point field holding the barangay geocode (or an EA geocode, which starts\n"
-                "with it). Each building inside an MBI is credited to the involved barangay whose\n"
-                "geocode equals — or begins — the value.")
-            frow.addWidget(self.bldg_field_combo, 1)
-            lay.addLayout(frow)
-            self.bldg_combo.layerChanged.connect(self._on_bldg_layer)
-            self.bldg_field_combo.fieldChanged.connect(self.validate_inputs)
-            self.bldg_hint = self._hint()
-            lay.addWidget(self.bldg_hint)
-            ll.addWidget(box)
 
             box, lay = group("Run MBI Check && Counter-Check")
             self.run_box = box
@@ -1987,29 +1628,18 @@ def make_dialog_class():
             lay.addWidget(self.run_btn)
             self.run_hint = self._hint()
             lay.addWidget(self.run_hint)
+            # Hidden: the users load an existing MBI layer, so no check is run here.
+            box.setVisible(False)
             ll.addWidget(box)
 
-            box, lay = group("Or Load an Existing MBI Layer")
-            self.mbi_combo = layer_combo(polygon_filter)
-            self.mbi_combo.setToolTip("A ppp_mbi layer from an earlier run (e.g. made permanent),\n"
-                                      "or any Gaps / Overlaps layer with 'case_uuid'. Run Check fills this in.")
-            lay.addWidget(self.mbi_combo)
-            self.mbi_hint = self._hint()
-            lay.addWidget(self.mbi_hint)
-            self.selected_only = QtWidgets.QCheckBox("Only selected MBI features")
-            self.selected_only.setToolTip("Load only the cases of the features selected on the map.")
-            lay.addWidget(self.selected_only)
-            self.preload_check = QtWidgets.QCheckBox("Resume saved coverage choices")
-            self.preload_check.setChecked(True)
-            self.preload_check.setToolTip("Pre-tick barangays from the coverage field already in the MBI layer.")
-            lay.addWidget(self.preload_check)
             self.load_btn = button("Load MBI Cases")
-            self.load_btn.setToolTip("Read the MBI layer picked above (no new check) and list each\n"
-                                     "case with all of its involved barangays.")
+            self.load_btn.setToolTip("Counter-check the MBI Layer against the Remaining MBI layer (Still /\n"
+                                     "Newly / No longer detected — adds a 'ppp_mbi' layer), then list each\n"
+                                     "case with all of its involved barangays. An MBI layer that is already\n"
+                                     "counter-checked, or no Remaining MBI layer, is loaded as it is.")
             self.load_btn.setObjectName("loadBtn")
             self.load_btn.clicked.connect(lambda: self.load_cases())
-            lay.addWidget(self.load_btn)
-            ll.addWidget(box)
+            ll.addWidget(self.load_btn)
 
             r1 = QtWidgets.QHBoxLayout()
             self.cancel_btn = button("Cancel", 32, BTN_CANCEL)
@@ -2131,7 +1761,7 @@ def make_dialog_class():
             self.field_edit.setToolTip("Field that receives the geocode(s) of the covering barangay(s),\n"
                                        "comma-separated when an overlap is shared out.")
             orow.addWidget(self.field_edit)
-            # No coverage status here: the status is written by the MBI EA Selector only.
+            # No coverage status here: the status is written by the EA Selector only.
             # (The widget is kept hidden so field validation stays unchanged.)
             self.status_edit = QtWidgets.QLineEdit(STATUS_FIELD)
             self.status_edit.setVisible(False)
@@ -2154,20 +1784,13 @@ def make_dialog_class():
             self.folder_hint = self._hint()
             gf.addWidget(self.folder_hint)
             arow = QtWidgets.QHBoxLayout()
-            self.auto_btn = button("Auto-Assign Pending", 32)
-            self.auto_btn.setToolTip(
-                "Single-barangay cases go to that barangay. Multi-barangay cases go to the\n"
-                "barangay that owns most of the buildings inside the MBI (needs Building Points +\n"
-                "geocode field); shared overlaps go to every barangay with tagged buildings, most\n"
-                "first, each keeping its own part. No tagged buildings or a tie stays pending.")
-            self.auto_btn.clicked.connect(self.auto_assign)
             self.reset_btn = button("Reset Choices", 32, BTN_CANCEL)
             self.reset_btn.setToolTip("Clear every barangay tick in the viewer (nothing is written).")
             self.reset_btn.clicked.connect(self.reset_choices)
             self.apply_btn = button("Apply Coverage", 32, BTN_EXPORT)
             self.apply_btn.setToolTip(
                 f"Writes the covering barangay geocode(s) ('{COVERAGE_FIELD}') into the MBI layer.\n"
-                "No coverage status is written here — the MBI EA Selector writes it.\n"
+                "No coverage status is written here — the EA Selector writes it.\n"
                 "Changes are left UNSAVED (the layer enters edit mode) — use QGIS's\n"
                 "Save Edits to keep them, or Cancel Edits to discard and revert.")
             self.apply_btn.clicked.connect(self.apply_coverage)
@@ -2186,21 +1809,20 @@ def make_dialog_class():
                 "to a GeoPackage, plus a CSV of every case / barangay decision, into the Export folder.\n"
                 "Choices not yet applied are applied first.")
             self.export_btn.clicked.connect(self.export_results)
-            arow.addWidget(self.auto_btn, 1)
             arow.addWidget(self.reset_btn, 1)
             arow.addWidget(self.apply_btn, 2)
             arow.addWidget(self.join_btn, 2)
             arow.addWidget(self.export_btn, 2)
             gf.addLayout(arow)
-            # Next step: pick the covering EA inside each covering barangay (MBI EA Selector)
+            # Next step: pick the covering EA inside each covering barangay (EA Selector)
             nrow = QtWidgets.QHBoxLayout()
             self.next_label = QtWidgets.QLabel(
                 "<b>Next:</b> choose which EA of the covering barangay covers each MBI.")
             self.next_label.setWordWrap(True)
             nrow.addWidget(self.next_label, 1)
-            self.ea_sel_btn = button("Choose EAs in MBI EA Selector…", 32)
+            self.ea_sel_btn = button("Choose EAs in the EA Selector Tab →", 32)
             self.ea_sel_btn.setToolTip(
-                "Open the MBI EA Selector with this MBI layer: every MBI is listed under the covering\n"
+                "Switch to the EA Selector tab with this MBI layer: every MBI is listed under the covering\n"
                 "barangay chosen here, and only that barangay's EAs are offered. Choices not yet\n"
                 f"applied are applied first (the EA Selector reads '{COVERAGE_FIELD}').")
             self.ea_sel_btn.clicked.connect(self.open_ea_selector)
@@ -2217,15 +1839,6 @@ def make_dialog_class():
 
             root.addWidget(left_scroll)
             root.addWidget(right, 1)
-            return tab
-
-        def _build_help_tab(self):
-            tab = QtWidgets.QWidget()
-            lay = QtWidgets.QVBoxLayout(tab)
-            lay.setContentsMargins(8, 8, 8, 8)
-            self.help_text = QtWidgets.QTextBrowser()
-            self.help_text.setOpenExternalLinks(True)
-            lay.addWidget(self.help_text)
             return tab
 
         def _on_bldg_layer(self, layer):
@@ -2283,11 +1896,6 @@ def make_dialog_class():
         # ──────────────── theme ────────────────
         def apply_theme(self):
             t = THEMES[self.is_dark]
-            self.title_label.setStyleSheet(
-                f"font-size: 15px; font-weight: bold; color: {t['title']}; padding: 2px 0;")
-            self.sub_label.setStyleSheet(f"color: {t['sub']}; font-size: 11px; margin-bottom: 4px;")
-            self.sep_line.setStyleSheet(f"color: {t['line']};")
-            self.tabs.setStyleSheet(t["tabs"])
             self.summary.setStyleSheet(f"font-size:13px; font-weight:600; color:{t['summary']};")
             self.log_box.setStyleSheet(t["log"])
             self.bgy_list.setStyleSheet(t["list"])
@@ -2309,12 +1917,6 @@ def make_dialog_class():
                 f" border:1px solid {rc['load_border']}; border-radius:3px; }}"
                 f" QPushButton#loadBtn:hover {{ background-color:{rc['load_hover']}; }}"
                 f" QPushButton#loadBtn:disabled {{ background-color:{rc['load_off']}; color:{rc['off_text']}; }}")
-            html = HELP_HTML
-            if self.is_dark:
-                for a, b in HELP_DARK_SWAPS:
-                    html = html.replace(a, b)
-            self.help_text.setStyleSheet(t["help"])
-            self.help_text.setHtml(html)
             for lab in (self.mbi_hint, self.bgy_hint, self.bldg_hint, self.folder_hint,
                         self.layer_count_label, self.run_hint, self.remaining_hint):
                 self.set_hint(lab, lab.text(), lab.property("hintKind") or "info")
@@ -2326,23 +1928,16 @@ def make_dialog_class():
                 self.is_dark = dark
                 self.apply_theme()
 
-        # ──────────────── teardown ────────────────
-        def _teardown(self):
+        # ──────────────── window hooks (called by the MBI Coverage Selector) ────────────────
+        def on_window_hidden(self):
+            # Close / Esc only hides the window (work is resumed on reopen): just drop the
+            # map highlights. Signals are released with the window when QGIS exits.
             self.clear_bands()
-            prj = QgsProject.instance()
-            for sig in (prj.layersAdded, prj.layersRemoved):
-                try:
-                    sig.disconnect(self.refresh_bgy_list)
-                except (TypeError, RuntimeError):
-                    pass
 
-        def done(self, result):
-            self._teardown()
-            super().done(result)
-
-        def closeEvent(self, event):
-            self._teardown()
-            super().closeEvent(event)
+        def resume(self):
+            """Window shown again: pick up layers added / removed while it was hidden."""
+            self.refresh_bgy_list()
+            self.validate_inputs()
 
         # ──────────────── barangay layer list (multi-select) ────────────────
         def _bgy_items(self):
@@ -2445,12 +2040,11 @@ def make_dialog_class():
             ok = True
             mbi = self.mbi_combo.currentLayer()
             if mbi is None:
-                self.set_hint(self.mbi_hint, "Optional: Run Check fills this in. Pick a layer here only "
-                                             "to reopen an earlier result.")
+                self.set_hint(self.mbi_hint, "Pick the MBI layer to load.")
                 ok = False
             elif "case_uuid" not in field_names(mbi):
-                self.set_hint(self.mbi_hint, "Missing 'case_uuid' field — use Run Check & "
-                                             "Counter-Check to produce an MBI layer.", "error")
+                self.set_hint(self.mbi_hint, "Missing 'case_uuid' field — is this an MBI layer?",
+                              "error")
                 ok = False
             else:
                 kind = infer_mbi_type(mbi.name())
@@ -2461,7 +2055,7 @@ def make_dialog_class():
             remaining = self.remaining_combo.currentLayer()
             if remaining is None:
                 self.set_hint(self.remaining_hint, "Pick the remaining MBI layer (or Browse GPKG…). "
-                                                   "Without it Run Check only lists what it finds — "
+                                                   "Without it the MBI Layer is loaded as it is — "
                                                    "nothing is counter-checked.")
             elif not _pick_field(remaining, REF_SOURCES["case_uuid"]):
                 self.set_hint(self.remaining_hint, "No 'case_uuid' field — is this a remaining MBI "
@@ -2596,7 +2190,7 @@ def make_dialog_class():
             self.cancel_requested = False
             for w in (self.mbi_combo, self.bgy_list, self.btn_all, self.btn_none, self.bldg_combo,
                       self.remaining_combo, self.browse_btn,
-                      self.selected_only, self.preload_check, self.skip_within, self.tree,
+                      self.selected_only, self.preload_check, self.tree,
                       self.search_edit,
                       self.show_combo, self.clear_btn, self.mode_combo, self.bldg_field_combo):
                 w.setEnabled(not busy)
@@ -2800,10 +2394,73 @@ def make_dialog_class():
             if cats:
                 layer.setRenderer(QgsCategorizedSymbolRenderer(field, cats))
 
+        def counter_check_loaded(self, mbi, remaining, only_fids=None):
+            """Counter-check a loaded MBI layer (no 'detection' field yet) against the remaining
+            MBI layer: adds the ppp_mbi layer (one row per involved barangay, with Still / Newly /
+            No longer detected) and returns it, or None when there is nothing to list."""
+            source = mbi
+            if only_fids:
+                source = mbi.materialize(QgsFeatureRequest().setFilterFids(list(only_fids)))
+            kinds = set()
+            if source.fields().indexOf(MBI_TYPE) >= 0:
+                for f in source.getFeatures(QgsFeatureRequest().setSubsetOfAttributes(
+                        [MBI_TYPE], source.fields()).setFlags(QgsFeatureRequest.NoGeometry)):
+                    k = _norm_type(_text(f, MBI_TYPE))
+                    if k in ("Gap", "Overlap", "Disputed"):
+                        kinds.add(k)
+            default_kind = infer_mbi_type(mbi.name()) or ""
+            if default_kind:
+                kinds.add(default_kind)
+            if not kinds:
+                kinds = {"Gap", "Overlap", "Disputed"}
+            self.log(f"Counter-checking '{mbi.name()}' against '{remaining.name()}' "
+                     f"({', '.join(sorted(kinds))})…")
+            self.summary.setText(f"Counter-checking against '{remaining.name()}'…")
+            QtWidgets.QApplication.processEvents()
+            bgy_info, provinces = read_bgy_info(self.bgy_layers())
+            result, stats = build_counter_check([(source, default_kind)], remaining, kinds,
+                                                mbi_output_name(provinces), bgy_info)
+            self._log_counter_check(remaining, stats, kinds)
+            if result is None:
+                self.log("  Nothing to list after the counter-check.")
+                return None
+            self._style_results(result)
+            QgsProject.instance().addMapLayer(result)
+            self.log(f"  Added layer '{result.name()}' ({result.featureCount():,} row(s)). It is a "
+                     "temporary layer — right-click > Make Permanent to keep it.")
+            return result
+
         def load_cases(self, use_selection=True):
             if self.running or not self.validate_inputs():
                 return
             mbi = self.mbi_combo.currentLayer()
+            remaining = self.remaining_combo.currentLayer()
+            if remaining is not None and DETECT_FIELD not in field_names(mbi):
+                fids = None
+                if use_selection and self.selected_only.isChecked():
+                    fids = mbi.selectedFeatureIds()
+                    if not fids:
+                        QtWidgets.QMessageBox.warning(
+                            self, DIALOG_TITLE, f"No features are selected in '{mbi.name()}'.")
+                        return
+                if not self._unapplied_ok("Load MBI Cases"):
+                    return
+                self.log("=" * 50)
+                try:
+                    result = self.counter_check_loaded(mbi, remaining, fids)
+                except Exception as e:
+                    self.log(traceback.format_exc().rstrip())
+                    self.log(f"Counter-check FAILED: {e}")
+                    self.update_summary()
+                    return
+                if result is None:
+                    self.update_summary()
+                    return
+                self.mbi_combo.setLayer(result)
+                mbi = result
+                use_selection = False
+                if not self.validate_inputs():
+                    return
             bgys = [l for l in self.bgy_layers() if _pick_field(l, BGY_GEOCODE_FIELDS)]
             bldg = self.bldg_combo.currentLayer()
             bldg_field = self.bldg_field()
@@ -2829,12 +2486,11 @@ def make_dialog_class():
             try:
                 if mbi.fields().indexOf(MBI_GEOCODE) < 0 and mbi.fields().indexOf(MBI_INVOLVED_AREAS) < 0:
                     raise RuntimeError(f"'{mbi.name()}' has no '{MBI_GEOCODE}' / '{MBI_INVOLVED_AREAS}' "
-                                       "field (the barangay geocodes) — use Run Check & Counter-Check "
-                                       "to create one.")
+                                       "field (the barangay geocodes) — is this an MBI layer?")
                 cases, skipped = load_mbi_cases(
                     mbi, infer_mbi_type(mbi.name()), only_fids, preload,
                     tick=lambda d, t: self.tick(d, t * 2 if bldg else t, "Reading MBI cases…"),
-                    skip_within=self.skip_within.isChecked())
+                    skip_within=False)
                 involved = {c for case in cases.values() if not case.gone for c in case.candidates}
                 self.log(f"  {len(cases):,} case(s) involving {len(involved):,} barangay(s)")
                 det = {}
@@ -2844,9 +2500,6 @@ def make_dialog_class():
                 if det:
                     self.log("  " + " · ".join(f"{d}: {det[d]:,}" for d in
                                                (DETECT_NEW, DETECT_STILL, DETECT_GONE, DETECT_UNCHECKED) if d in det))
-                if skipped:
-                    self.log(f"  Skipped {skipped:,} within-barangay case(s) (one barangay only — "
-                             "untick 'Skip within-barangay cases' to list them)")
                 if preload:
                     resumed = sum(1 for c in cases.values() if c.assigned)
                     self.log(f"  Resumed {resumed:,} saved choice(s) from '{preload}'")
@@ -3545,46 +3198,6 @@ def make_dialog_class():
             menu.addAction("Collapse all", self.tree.collapseAll)
             menu.exec_(self.tree.viewport().mapToGlobal(pos))
 
-        # ──────────────── auto-assign ────────────────
-        def auto_assign(self):
-            single = by_bldg = shared = left = 0
-            for case in self.cases.values():
-                if case.assigned or not case.candidates or case.gone:
-                    continue
-                cands = list(case.candidates.values())
-                if len(cands) == 1:
-                    self.set_assignment(case, [cands[0].code], quiet=True)
-                    single += 1
-                elif not all(c.bldg is not None for c in cands):
-                    left += 1
-                elif case.split:
-                    # Every barangay with tagged buildings keeps its part, most buildings first.
-                    owners = sorted((c for c in cands if c.bldg), key=lambda c: -c.bldg)
-                    if owners:
-                        self.set_assignment(case, [c.code for c in owners], quiet=True)
-                        shared += 1
-                    else:
-                        left += 1
-                else:
-                    most = max(c.bldg for c in cands)
-                    leaders = [c for c in cands if c.bldg == most]
-                    if most > 0 and len(leaders) == 1:
-                        self.set_assignment(case, [leaders[0].code], quiet=True)
-                        by_bldg += 1
-                    else:
-                        left += 1
-            partial = sum(1 for c in self.cases.values() if c.status == "partial")
-            self.log(f"Auto-assign: {single:,} single-barangay case(s), {by_bldg:,} to the barangay owning most "
-                     "of the buildings inside the MBI"
-                     + (f", {shared:,} shared overlap(s) to every barangay with tagged buildings "
-                        "(each keeps its part)" if shared else "")
-                     + (f", {left:,} left pending (no tagged buildings, a tie, or no building "
-                        "counts)" if left else "")
-                     + (f". {partial:,} case(s) are only partly covered — review them "
-                        "(Show: Partly covered)." if partial else ""))
-            self.apply_filter()
-            self.on_selection_changed()
-
         # ──────────────── apply ────────────────
         def _case_status(self, case):
             return {"covered": STATUS_COVERED, "partial": STATUS_PARTIAL}.get(
@@ -3682,7 +3295,7 @@ def make_dialog_class():
                     pieces.append((case, cand, released_by, bldg, g))
             if not pieces:
                 raise RuntimeError("No MBI has a covering barangay yet — tick the covering barangays "
-                                   "(or Auto-Assign) first.")
+                                   "first.")
             index = QgsSpatialIndex()
             for i, (_c, _d, _r, _b, g) in enumerate(pieces):
                 f = QgsFeature(i)
@@ -3829,7 +3442,7 @@ def make_dialog_class():
             return None
 
         def open_ea_selector(self):
-            """Hand the MBI layer over to the MBI EA Selector (barangay mode): it lists every MBI
+            """Hand the MBI layer over to the EA Selector (barangay mode): it lists every MBI
             under the covering barangay written here and offers only that barangay's EAs."""
             if self.running:
                 return
@@ -3840,7 +3453,7 @@ def make_dialog_class():
             if self.coverage_field() != COVERAGE_FIELD:
                 QtWidgets.QMessageBox.warning(
                     self, DIALOG_TITLE,
-                    f"The MBI EA Selector reads the covering barangays from '{COVERAGE_FIELD}', but the "
+                    f"The EA Selector reads the covering barangays from '{COVERAGE_FIELD}', but the "
                     f"Coverage field here is '{self.coverage_field()}'. Set it back to '{COVERAGE_FIELD}' "
                     "and Apply Coverage first.")
                 return
@@ -3848,7 +3461,7 @@ def make_dialog_class():
                 if QtWidgets.QMessageBox.question(
                         self, DIALOG_TITLE,
                         "The choices in the viewer are not in the MBI layer yet.\n"
-                        "Apply Coverage first, then open the MBI EA Selector?",
+                        "Apply Coverage first, then open the EA Selector?",
                         QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel) != QtWidgets.QMessageBox.Yes:
                     return
                 if not self._write_coverage(mbi):
@@ -3857,19 +3470,14 @@ def make_dialog_class():
             if not n["covered"] + n["partial"]:
                 QtWidgets.QMessageBox.warning(
                     self, DIALOG_TITLE, "No MBI has a covering barangay yet — tick the covering "
-                                        "barangays (or Auto-Assign) and Apply Coverage first.")
+                                        "barangays and Apply Coverage first.")
                 return
-            import runpy
-            folder = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else \
-                os.path.join(QgsApplication.qgisSettingsDirPath(), "python", "plugins",
-                             "GMD_COProcessing", "gmd_processing_tools")
-            path = os.path.join(folder, "mbi_ea_selector.py")
-            if not os.path.exists(path):
-                QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, f"MBI EA Selector not found:\n{path}")
+            if self.ea_panel_hook is None:
+                QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, "The EA Selector tab is not available.")
                 return
             try:
-                scope = runpy.run_path(path, init_globals={"iface": self.iface}, run_name="__main__")
-                dialog = scope.get("_DIALOG") or scope["show_dialog"]()
+                # The MBI Coverage Selector switches to its EA Selector tab and returns that panel.
+                dialog = self.ea_panel_hook()
                 dialog.mbi_combo.setLayer(mbi)
                 # Barangay layers that are really EA layers (they carry ea_geocode) are pre-ticked.
                 ea_ids = {l.id() for l in self.bgy_layers() if _pick_field(l, ["ea_geocode"])}
@@ -3879,11 +3487,11 @@ def make_dialog_class():
                 if self.bldg_combo.currentLayer() is not None:
                     dialog.bldg_combo.setLayer(self.bldg_combo.currentLayer())
                 dialog.validate_inputs()
-                self.log(f"Opened the MBI EA Selector with '{mbi.name()}' — tick the EA layers of the "
+                self.log(f"Sent '{mbi.name()}' to the EA Selector tab — tick the EA layers of the "
                          "covering barangays there, then Load MBI Cases.")
             except Exception as e:
                 self.log(traceback.format_exc().rstrip())
-                QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, f"Could not open the MBI EA Selector: {e}")
+                QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, f"Could not open the EA Selector tab: {e}")
 
         def apply_coverage(self):
             layer = self.mbi_layer
@@ -3898,7 +3506,7 @@ def make_dialog_class():
                    f"for {len(self.cases) - n['gone']:,} case(s) into '{layer.name()}'?\n\n"
                    f"{n['covered'] + n['partial']:,} case(s) have a covering barangay, "
                    f"{n['pending']:,} are still pending (left empty).\n"
-                   "No coverage status is written here — the MBI EA Selector writes it."
+                   "No coverage status is written here — the EA Selector writes it."
                    + (f"\n{n['gone']:,} no-longer-detected MBI(s) are left untouched." if n["gone"] else ""))
             if QtWidgets.QMessageBox.question(
                     self, DIALOG_TITLE, msg,
@@ -3908,7 +3516,7 @@ def make_dialog_class():
 
         def _write_coverage(self, layer):
             """Write the coverage field (covering barangay geocodes, on every row of the case) for
-            every loaded case (unsaved, undoable edits). No coverage status: the MBI EA Selector
+            every loaded case (unsaved, undoable edits). No coverage status: the EA Selector
             writes it. Returns True on success."""
             field = self.coverage_field()
             self.set_busy(True)
@@ -4080,35 +3688,4 @@ def make_dialog_class():
                                     "Yes" if chosen else "", ",".join(case.assigned)])
             self.log(f"  CSV written: {path}")
 
-    return CoverageDialog
-
-
-# ─────────────────── entry point ───────────────────
-
-def show_dialog():
-    """Open the MBI Barangay Coverage window (non-modal, so the map stays usable)."""
-    from qgis.PyQt.QtWidgets import QDialog
-
-    qgis_iface = globals().get("iface")
-    if qgis_iface is None:
-        try:
-            from qgis.utils import iface as qgis_iface
-        except ImportError:
-            qgis_iface = None
-    main = qgis_iface.mainWindow() if qgis_iface is not None else None
-
-    if main is not None:
-        for old in main.findChildren(QDialog, DIALOG_NAME):
-            old.close()
-
-    dialog = make_dialog_class()(qgis_iface, main)
-    dialog.show()
-    dialog.raise_()
-    dialog.activateWindow()
-    return dialog
-
-
-if "qgis" in sys.modules and not os.environ.get("MBI_BGY_SELECTOR_NO_DIALOG"):
-    _DIALOG = show_dialog()
-elif "qgis" not in sys.modules:
-    print("Run this script inside QGIS: GMD CO Processing > EA Tools > MBI Barangay Selector.")
+    return CoveragePanel

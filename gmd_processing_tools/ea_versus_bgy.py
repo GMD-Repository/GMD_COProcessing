@@ -1646,12 +1646,6 @@ def make_dialog_class():
 
             self.apply_mode(reset=False)
             self.refresh_lists()
-            # Set when run from the GMD CO Processing panel. That combo often just holds the first
-            # layer, so it is used only if it looks like an EA layer.
-            panel_layer = globals().get("ea_layer")
-            if panel_layer is not None and panel_layer.id() in self.target.likely_ids():
-                self.target.set_ticks([panel_layer.id()])
-                self.manual["target"] = True
             self.autodetect_layers()
             self.ref.changed.connect(lambda: self.on_layer_picked("ref"))
             self.target.changed.connect(lambda: self.on_layer_picked("target"))

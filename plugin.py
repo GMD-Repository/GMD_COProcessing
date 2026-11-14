@@ -16,10 +16,12 @@ from qgis.PyQt.QtCore import Qt, QUrl
 from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import QAction, QMenu
 
-from .script_registry import SCRIPTS_DIR, earf_icon, group_icon, grouped_scripts, plugin_icon, theme_icon
+from .script_registry import SCRIPTS_DIR, earf_icon, group_icon, grouped_scripts, mbi_coverage_icon, plugin_icon, theme_icon
 
 MENU_TITLE = "&GMD CO Processing"
-HELP_URL = "https://github.com/GMD-Repository/GMD_COProcessing#readme"
+# Scripts listed directly under the GMD CO Processing menu instead of inside their group submenu
+TOP_LEVEL_SCRIPTS = ("mbi_coverage_selector.py", "national_mbi_checker.py")
+HELP_URL ="https://github.com/GMD-Repository/GMD_COProcessing#readme"
 
 
 class GMDCOProcessingPlugin:
@@ -29,6 +31,7 @@ class GMDCOProcessingPlugin:
         self.menu = None
         self.panel_action = None
         self.earf_action = None
+        self.mbi_coverage_action = None
         self.help_action = None
         self._tools_end = None       # separator after the tool groups
         self._tool_actions = []      # group submenus, rebuilt every time the menu opens
@@ -52,10 +55,11 @@ class GMDCOProcessingPlugin:
         self.iface.addDockWidget(Qt.RightDockWidgetArea, self.dock)
         self.dock.hide()
 
-        # toggleViewAction() keeps the menu check mark / toolbar button in sync with the dock.
-        self.panel_action = self.dock.toggleViewAction()
-        self.panel_action.setIcon(plugin_icon())
-        self.panel_action.setText("GMD CO Processing Panel")
+        # Own action (not dock.toggleViewAction(): QGIS appends " Panel" to that one's text).
+        self.panel_action = QAction(plugin_icon(), "GMD CO Processing Panel", main_window)
+        self.panel_action.setCheckable(True)
+        self.panel_action.triggered.connect(self.dock.setVisible)  # user clicks only, no feedback loop
+        self.dock.visibilityChanged.connect(self.panel_action.setChecked)
 
         # ---- own top-level menu, placed before "Help"
         self.menu = QMenu(MENU_TITLE, main_window)
@@ -70,7 +74,13 @@ class GMDCOProcessingPlugin:
         self.earf_action.setObjectName("GMDEARFPostProcessingAction")
         self.earf_action.setToolTip("Open EARF Post-Processing & Geocode Matching workspace")
         self.earf_action.triggered.connect(self._open_earf_post_processing)
-        self.menu.addAction(self.earf_action)
+
+        # Dedicated action for MBI Coverage Selector (with icon)
+        self.mbi_coverage_action = QAction(mbi_coverage_icon(), "MBI Coverage Selector", main_window)
+        self.mbi_coverage_action.setObjectName("GMDMBICoverageSelectorAction")
+        self.mbi_coverage_action.setToolTip("Open MBI Coverage Selector (Barangay / EA)")
+        self.mbi_coverage_action.triggered.connect(
+            lambda: self._open_script_file("mbi_coverage_selector.py"))
 
         self.menu.addAction(self.panel_action)
         self.menu.addAction(theme_icon("mActionFileNew.svg"), "New Script…", self._new_script)
@@ -90,7 +100,7 @@ class GMDCOProcessingPlugin:
 
         # ---- toolbar buttons
         self.iface.addToolBarIcon(self.earf_action)
-        self.iface.addToolBarIcon(self.panel_action)
+        self.iface.addToolBarIcon(self.mbi_coverage_action)
 
         # ---- help entry under Help > Plugins (PyQGIS cookbook convention)
         self.help_action = QAction(plugin_icon(), "GMD CO Processing Help", main_window)
@@ -115,21 +125,49 @@ class GMDCOProcessingPlugin:
             self._tool_actions.append(placeholder)
             return
 
+        top_level = []
         for group, scripts in groups:
+            in_group = []
+            for script in scripts:
+                if os.path.basename(script.path) in TOP_LEVEL_SCRIPTS:
+                    top_level.append(script)
+                else:
+                    in_group.append(script)
+            if not in_group:
+                continue
             submenu = QMenu(group, self.menu)
             submenu.setIcon(group_icon(group))
             submenu.setToolTipsVisible(True)
-            for script in scripts:
-                action = submenu.addAction(script.icon, script.name)
-                first_line = script.description.strip().splitlines()[0] if script.description.strip() else ""
-                action.setToolTip(first_line)
-                action.triggered.connect(lambda _=False, p=script.path: self._run_script(p))
+            for script in in_group:
+                self._add_script_action(submenu, script)
             self._tool_actions.append(self.menu.insertMenu(self._tools_end, submenu))
+
+        # Scripts shown directly under the GMD CO Processing menu, in TOP_LEVEL_SCRIPTS order
+        top_level.sort(key=lambda s: TOP_LEVEL_SCRIPTS.index(os.path.basename(s.path)))
+        for script in top_level:
+            action = self._add_script_action(None, script)
+            self.menu.insertAction(self._tools_end, action)
+            self._tool_actions.append(action)
+
+    def _add_script_action(self, menu, script):
+        if menu is not None:
+            action = menu.addAction(script.icon, script.name)
+        else:
+            action = QAction(script.icon, script.name, self.menu)
+        first_line = script.description.strip().splitlines()[0] if script.description.strip() else ""
+        action.setToolTip(first_line)
+        action.triggered.connect(lambda _=False, p=script.path: self._run_script(p))
+        return action
 
     def _open_earf_post_processing(self):
         earf_script = os.path.join(SCRIPTS_DIR, "earf_post_processing.py")
         if os.path.exists(earf_script):
             self._run_script(earf_script)
+
+    def _open_script_file(self, filename):
+        script = os.path.join(SCRIPTS_DIR, filename)
+        if os.path.exists(script):
+            self._run_script(script)
 
     def _show_panel(self):
         self.dock.show()
@@ -154,8 +192,13 @@ class GMDCOProcessingPlugin:
             self.earf_action.deleteLater()
             self.earf_action = None
 
+        if self.mbi_coverage_action is not None:
+            self.iface.removeToolBarIcon(self.mbi_coverage_action)
+            self.mbi_coverage_action.deleteLater()
+            self.mbi_coverage_action = None
+
         if self.panel_action is not None:
-            self.iface.removeToolBarIcon(self.panel_action)
+            self.panel_action.deleteLater()
             self.panel_action = None
 
         if self.menu is not None:

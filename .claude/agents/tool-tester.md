@@ -24,8 +24,8 @@ Steps:
    app = QgsApplication([], False); app.initQgis()
    sys.path.insert(0, r"<repo>/gmd_processing_tools")
    ```
-   Tool scripts run their body when executed and expect globals `iface` and `ea_layer`. Run them via
-   `runpy.run_path(path, init_globals={"iface": stub, "ea_layer": None})` with a minimal stub iface,
+   Tool scripts run their body when executed and expect the global `iface`. Run them via
+   `runpy.run_path(path, init_globals={"iface": stub})` with a minimal stub iface,
    or, if the script opens UI immediately, load it and call its pure functions directly.
 4. **Smoke-test logic**: for processing functions (overlap/status assignment, field building,
    export naming…), build small `memory:` layers, e.g.

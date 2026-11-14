@@ -5,7 +5,7 @@
 
 Finds the **MBIs** (gaps, overlaps and disputed areas) between **barangay** polygons, at any scale up to
 the whole country, and counts the building points inside each one. It is the barangay-level counterpart of the
-[EA MBI Checker](EA_topochecker.md). The [MBI Barangay Selector](mbi_bgy_selector.md) later chooses the
+[EA MBI Checker](EA_topochecker.md). The Barangay Selector tab of the [MBI Coverage Selector](mbi_coverage_selector.md) later chooses the
 covering barangay of the MBIs that remain after review.
 
 It opens as a standard QGIS Processing dialog; the right-hand panel of the dialog holds its help.
@@ -143,7 +143,7 @@ used instead, in this order: `hh_count`, `est_hh`, `household_count`, `household
 |-------|----------|
 | `mbi_type` | `Overlap`, `Gap` or `Disputed` |
 | `mbi_remarks` | Empty, for the reviewer |
-| `mbi_scope` | The MBI types this run looked for: `Gap,Overlap` or `Gap,Overlap,Disputed`. Lets the [MBI Barangay Selector](mbi_bgy_selector.md) tell *not looked for* from *not found* — without it, disputed areas skipped by an unticked **Include Disputed Areas** would read as resolved. |
+| `mbi_scope` | The MBI types this run looked for: `Gap,Overlap` or `Gap,Overlap,Disputed`. Lets the [Barangay Selector](mbi_coverage_selector.md#barangay-selector-rules) tell *not looked for* from *not found* — without it, disputed areas skipped by an unticked **Include Disputed Areas** would read as resolved. |
 | `mbi_status` | `2_Pending` on every `Disputed` row, and on `1_Inter-Region` / `2_Inter-Province` rows; otherwise empty |
 
 ---
