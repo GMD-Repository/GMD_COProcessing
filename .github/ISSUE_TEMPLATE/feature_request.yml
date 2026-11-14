@@ -1,0 +1,17 @@
+name: Feature request
+description: Suggest a change or a new tool.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: input
+    id: tool
+    attributes:
+      label: Tool
+      description: Which tool this is about, or "New tool".
+    validations:
+      required: true
+  - type: textarea
+    id: need
+    attributes:
+      label: What do you need, and why?
+    validations:
+      required: true
