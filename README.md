@@ -2,14 +2,28 @@
 QGIS plugin for EA post-processing of GMD. Requires QGIS 3.22 or later.
 
 ## Install (with automatic updates)
+The plugin has two release channels, each with its own plugin repository URL. Add **one** of them.
+
+| Channel | Who it is for | Version looks like | Plugin repository URL |
+|---|---|---|---|
+| **Stable** | Everyone doing production work | `0.1.0` | **https://raw.githubusercontent.com/GMD-Repository/GMD_COProcessing/plugin-repo/plugins.xml** |
+| **Beta** (pre-release) | Testers and developers trying the next version | `0.1.1-beta.1` | **https://raw.githubusercontent.com/GMD-Repository/GMD_COProcessing/plugin-repo-beta/plugins.xml** |
+
 1. In QGIS open **Plugins > Manage and Install Plugins > Settings**.
-2. Tick **Show also experimental plugins**.
+2. For **Beta** only: tick **Show also experimental plugins**.
 3. Click **Add…** and enter:
-   - Name: `GMD CO Processing`
-   - URL: **https://raw.githubusercontent.com/GMD-Repository/GMD_COProcessing/plugin-repo/plugins.xml**
+   - Name: `GMD CO Processing` (Stable) or `GMD CO Processing Beta` (Beta)
+   - URL: the URL of your channel from the table above
 4. Go to **All**, search for **GMD CO Processing** and click **Install**.
 
-QGIS checks this link and offers an **Upgrade** when a new version is released.
+QGIS checks the URL and offers an **Upgrade** when a new version of that channel is released.
+In the Plugin Manager a Beta build has the description prefix **[BETA]**.
+
+The Beta URL works once the first Beta (`0.1.0-beta.1`) is published.
+
+To switch channels, remove the other repository in **Settings** (or untick **Enabled**), then
+**Reload all repositories** and install from the channel you kept. Do not keep both enabled: QGIS
+would always offer the highest version of the two.
 
 ## Use
 A **GMD CO Processing** menu appears in the menu bar. The toolbar button opens the panel, where you
