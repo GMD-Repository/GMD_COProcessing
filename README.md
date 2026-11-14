@@ -6,8 +6,8 @@ The plugin has two release channels, each with its own plugin repository URL. Ad
 
 | Channel | Who it is for | Version looks like | Plugin repository URL |
 |---|---|---|---|
-| **Stable** | Everyone doing production work | `0.3.21` | **https://raw.githubusercontent.com/GMD-Repository/GMD_COProcessing/plugin-repo/plugins.xml** |
-| **Beta** (pre-release) | Testers and developers trying the next version | `0.3.22-beta.1` | **https://raw.githubusercontent.com/GMD-Repository/GMD_COProcessing/plugin-repo-beta/plugins.xml** |
+| **Stable** | Everyone doing production work | `0.1.0` | **https://raw.githubusercontent.com/GMD-Repository/GMD_COProcessing/plugin-repo/plugins.xml** |
+| **Beta** (pre-release) | Testers and developers trying the next version | `0.1.1-beta.1` | **https://raw.githubusercontent.com/GMD-Repository/GMD_COProcessing/plugin-repo-beta/plugins.xml** |
 
 1. In QGIS open **Plugins > Manage and Install Plugins > Settings**.
 2. For **Beta** only: tick **Show also experimental plugins**.
