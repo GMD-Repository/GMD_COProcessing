@@ -114,7 +114,7 @@ titled **[Archived]**, so the workflow ignores them. Because QGIS never offers a
 anyone who still has `0.3.x` installed must **uninstall GMD CO Processing once and install it again** from their
 channel's URL.
 
-**Stable release:** open a pull request **`beta` → `main`**, check the testers' issues are closed, and merge it.
+**Stable release:** open a pull request **`beta` → `main`** (set **base: `main`** — the default base is `beta`), check the testers' issues are closed, and merge it.
 
 **Bigger version jump** (e.g. `v0.4.0`): publish a release by hand on GitHub with that tag
 (`v0.4.0`, or `v0.4.0-beta.1` with **Set as a pre-release** ticked for the Beta channel). The next
@@ -134,7 +134,10 @@ automatic release continues from it.
      **Dismiss stale approvals**, **Require conversation resolution**.
 5. **Release branches** — a second ruleset `release branches` for `plugin-repo` and `plugin-repo-beta`:
    **Restrict deletions** only (the workflow force-pushes them, so do not block force pushes).
-6. **Issues labels** — create `needs-triage`, `bug`, `enhancement` (used by the issue forms).
+6. **Default branch = `beta`** — repo **Settings > General > Default branch** (⇄ switch icon) → **`beta`** → **Update**.
+   New pull requests then open against `beta` automatically. For a stable release, change the **base** of
+   the `beta` → `main` pull request by hand (or switch the default back to `main` first).
+7. **Issues labels** — create `needs-triage`, `bug`, `enhancement` (used by the issue forms).
 
 ## Folder structure
 The repo root is the plugin folder, so it can be cloned straight into the QGIS plugins folder for
