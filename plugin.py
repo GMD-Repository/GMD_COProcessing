@@ -20,7 +20,7 @@ from .script_registry import SCRIPTS_DIR, earf_icon, group_icon, grouped_scripts
 
 MENU_TITLE = "&GMD CO Processing"
 # Scripts listed directly under the GMD CO Processing menu instead of inside their group submenu
-TOP_LEVEL_SCRIPTS = ("mbi_coverage_selector.py", "national_mbi_checker.py")
+TOP_LEVEL_SCRIPTS = ("mbi_coverage_selector.py", "national_mbi_checker.py", "test_earf_inconsistency.py")
 HELP_URL ="https://github.com/GMD-Repository/GMD_COProcessing#readme"
 
 
