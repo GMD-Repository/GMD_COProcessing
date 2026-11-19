@@ -160,6 +160,33 @@ def split_source(source):
     return path, sheet
 
 
+def resolve_vrt(path, sheet=None):
+    """A .vrt (written by the Spreadsheet Layers plugin) -> the spreadsheet and sheet it points at.
+
+    Any other path is returned unchanged.
+    """
+    if not str(path).lower().endswith(".vrt") or not os.path.isfile(path):
+        return path, sheet
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.parse(path).getroot()
+        layer = root.find("OGRVRTLayer") if root.tag != "OGRVRTLayer" else root
+        if sheet:   # a .vrt can hold several layers: take the one named like the QGIS layer
+            layer = next((l for l in root.iter("OGRVRTLayer") if l.get("name") == sheet), layer)
+        src = layer.find("SrcDataSource")
+        src_path = (src.text or "").strip()
+        if src.get("relativeToVRT") == "1" or not os.path.isabs(src_path):
+            src_path = os.path.join(os.path.dirname(path), src_path)
+        src_layer = layer.findtext("SrcLayer") or None
+        if src_layer is None:   # SrcSQL: SELECT ... FROM 'Sheet1' / "Sheet1" / Sheet1
+            m = re.search(r"\bFROM\s+(?:'([^']+)'|\"([^\"]+)\"|\[([^\]]+)\]|(\S+))",
+                          layer.findtext("SrcSQL") or "", re.I)
+            src_layer = next((g for g in m.groups() if g), None) if m else None
+        return os.path.normpath(src_path), src_layer
+    except Exception:
+        return path, sheet
+
+
 def read_sheet_raw(path, sheet=None, nrows=None):
     if path.lower().endswith(".csv"):
         return pd.read_csv(path, header=None, dtype=str, nrows=nrows, keep_default_na=False)
@@ -592,9 +619,12 @@ Preliminary EARF, and writes two workbooks in the <i>EA List of Inconsistencies<
 <ol>
 <li>Add the inputs to the QGIS project (drag the <code>_ea2026.gpkg</code> and the spreadsheets into QGIS;
 for a spreadsheet pick the sheet, e.g. <code>EA2026</code>).</li>
-<li>Choose one layer in each dropdown: <b>EA GeoPackage</b>, <b>Preliminary EARF</b> and
-<b>Est. No. of Households</b>. All three are required. Press
-<b>Refresh Layers</b> if a layer you just added is missing.</li>
+<li>Choose the <b>EA GeoPackage</b> layer from the dropdown (press <b>Refresh Layers</b> if a layer you
+just added is missing).</li>
+<li>For <b>Preliminary EARF</b> and <b>Est. No. of Households</b>, the tool searches the GeoPackage's folder
+and fills in the spreadsheet whose name matches (<i>earf</i>; <i>household</i>, <i>hh</i>, <i>popcen</i>
+or <i>estimated</i>). Otherwise press <b>Browse…</b> (it opens in that folder) or type the path. Then pick
+the <b>Sheet</b>. The spreadsheets do not need to be loaded in QGIS. All three inputs are required.</li>
 <li>Press <b>Run Check</b>. The table on the right shows each check and how many records it found.</li>
 <li>Click a check to list its records below. Double-click a GeoPackage record to zoom to the EA.</li>
 <li>Choose the <b>Output folder</b> and press <b>Export Excel</b>.</li>
@@ -660,10 +690,10 @@ def make_dialog_class():
             from qgis.core import QgsProviderRegistry
             parts = QgsProviderRegistry.instance().decodeUri(layer.providerType(), layer.source())
             if parts.get("path"):
-                return parts["path"], parts.get("layerName") or None
+                return resolve_vrt(parts["path"], parts.get("layerName") or None)
         except Exception:
             pass
-        return split_source(layer.source())
+        return resolve_vrt(*split_source(layer.source()))
 
     class LayerPicker(QtWidgets.QGroupBox):
         """One dropdown of the matching layers in the Layers panel."""
@@ -703,16 +733,96 @@ def make_dialog_class():
             lyr = self.layer()
             return [lyr] if lyr is not None else []
 
+    class FilePicker(QtWidgets.QGroupBox):
+        """A spreadsheet path (typed, browsed, or found in the GeoPackage's folder) and its sheet."""
+
+        FILTER = "Spreadsheets (*.xlsx *.xlsm *.xls *.ods *.csv);;All files (*)"
+
+        def __init__(self, title, hint, folder_fn, parent=None):
+            super().__init__(title, parent)
+            self.hint, self.folder_fn = re.compile(hint, re.I), folder_fn
+            lay = QtWidgets.QVBoxLayout(self)
+            row = QtWidgets.QHBoxLayout()
+            self.path = QtWidgets.QLineEdit()
+            self.path.setPlaceholderText("Spreadsheet file (.xlsx, .xls, .ods, .csv)")
+            self.path.editingFinished.connect(self._load_sheets)
+            browse = QtWidgets.QPushButton("Browse…")
+            browse.clicked.connect(self.browse)
+            row.addWidget(self.path, 1)
+            row.addWidget(browse)
+            lay.addLayout(row)
+            srow = QtWidgets.QHBoxLayout()
+            srow.addWidget(QtWidgets.QLabel("Sheet:"))
+            self.sheet = QtWidgets.QComboBox()
+            srow.addWidget(self.sheet, 1)
+            lay.addLayout(srow)
+            self._loaded = None
+
+        def folder(self):
+            p = self.path.text().strip()
+            if p and os.path.isdir(os.path.dirname(p)):
+                return os.path.dirname(p)
+            return self.folder_fn() or ""
+
+        def browse(self):
+            fn, _ = QtWidgets.QFileDialog.getOpenFileName(self, self.title(), self.folder(), self.FILTER)
+            if fn:
+                self.path.setText(os.path.normpath(fn))
+                self._load_sheets()
+
+        def search_folder(self):
+            """Fill in the likeliest spreadsheet in the GeoPackage's folder, if none is set yet."""
+            if self.path.text().strip():
+                return
+            folder = self.folder_fn()
+            if not folder or not os.path.isdir(folder):
+                return
+            try:
+                files = sorted(f for f in os.listdir(folder)
+                               if f.lower().endswith(SPREADSHEET_EXT) and not f.startswith("~$"))
+            except OSError:
+                return
+            match = next((f for f in files if self.hint.search(f)), None)
+            if match:
+                self.path.setText(os.path.normpath(os.path.join(folder, match)))
+                self._load_sheets()
+
+        def _load_sheets(self):
+            p = self.path.text().strip().strip('"')
+            if p == self._loaded:
+                return
+            self._loaded = p
+            self.sheet.clear()
+            if not os.path.isfile(p) or p.lower().endswith(".csv"):
+                return
+            try:
+                with pd.ExcelFile(p) as book:
+                    names = list(book.sheet_names)
+            except Exception as exc:
+                self.sheet.addItem(f"(cannot open: {exc})", None)
+                return
+            for n in names:
+                self.sheet.addItem(n, n)
+            idx = next((i for i, n in enumerate(names) if self.hint.search(n)), 0)
+            self.sheet.setCurrentIndex(idx)
+
+        def refresh(self):
+            self.search_folder()
+
+        def ticked_layers(self):
+            """[(path, sheet, label)] or [] — same role as LayerPicker.ticked_layers."""
+            self._load_sheets()
+            p = self.path.text().strip().strip('"')
+            if not p or not os.path.isfile(p):
+                return []
+            sheet = self.sheet.currentData()
+            label = os.path.basename(p) + (f" [{sheet}]" if sheet else "")
+            return [(p, sheet, label)]
+
     def is_gpkg_layer(layer):
         return (layer.type() == QgsMapLayer.VectorLayer
                 and layer.geometryType() == QgsWkbTypes.PolygonGeometry
                 and layer.fields().indexOf("geocode") >= 0)
-
-    def is_sheet_layer(layer):
-        if layer.type() != QgsMapLayer.VectorLayer:
-            return False
-        path, _ = layer_path(layer)
-        return str(path).lower().endswith(SPREADSHEET_EXT)
 
     class Dialog(QtWidgets.QDialog):
         def __init__(self, iface, parent=None):
@@ -784,15 +894,17 @@ def make_dialog_class():
             left.setFixedWidth(330)
             lv = QtWidgets.QVBoxLayout(left)
             lv.setContentsMargins(0, 0, 0, 0)
-            hint = QtWidgets.QLabel("Choose the layers loaded in the Layers panel. All three are required. "
-                                    "For a spreadsheet, add its sheet to QGIS first.")
+            hint = QtWidgets.QLabel("Choose the GeoPackage layer from the Layers panel, then the two "
+                                    "spreadsheet files (Browse…, or found in the GeoPackage's folder) "
+                                    "and their sheets. All three are required.")
             hint.setWordWrap(True)
             hint.setStyleSheet(f"color:{th['hint']}; font-size:11px;")
             lv.addWidget(hint)
             self.gpkg_list = LayerPicker("1. EA GeoPackage (ea2026)", is_gpkg_layer, r"ea2026")
-            self.earf_list = LayerPicker("2. Preliminary EARF", is_sheet_layer, r"earf")
-            self.hh_list = LayerPicker("3. Est. No. of Households", is_sheet_layer,
-                                       r"household|popcen|estimated")
+            self.earf_list = FilePicker("2. Preliminary EARF", r"earf", self._gpkg_folder)
+            self.hh_list = FilePicker("3. Est. No. of Households",
+                                      r"household|hh|popcen|estimated", self._gpkg_folder)
+            self.gpkg_list.combo.currentIndexChanged.connect(self.refresh_layers)
             for w in (self.gpkg_list, self.earf_list, self.hh_list):
                 lv.addWidget(w)
             refresh = QtWidgets.QPushButton("Refresh Layers")
@@ -917,12 +1029,18 @@ def make_dialog_class():
                 self.say(f"  GeoPackage '{layer.name()}': {len(df)} EAs")
             return pd.concat(frames, ignore_index=True) if frames else None
 
-        def _read_sheets(self, layers, reader, what):
+        def _gpkg_folder(self):
+            lyr = self.gpkg_list.layer() if hasattr(self, "gpkg_list") else None
+            if lyr is None:
+                return ""
+            path, _ = layer_path(lyr)
+            return os.path.dirname(str(path))
+
+        def _read_sheets(self, files, reader, what):
             frames = []
-            for layer in layers:
-                path, sheet = layer_path(layer)
-                frames.append(reader(path, sheet, f"{layer.name()}"))
-                self.say(f"  {what} '{layer.name()}': {len(frames[-1])} EA rows")
+            for path, sheet, label in files:
+                frames.append(reader(path, sheet, label))
+                self.say(f"  {what} '{label}': {len(frames[-1])} EA rows")
             return pd.concat(frames, ignore_index=True) if frames else None
 
         def run(self):
@@ -931,11 +1049,11 @@ def make_dialog_class():
             missing = [name for name, lyr in (("EA GeoPackage", g), ("Preliminary EARF", e),
                                               ("Est. No. of Households", h)) if not lyr]
             if missing:
-                QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, "Choose a layer for: " + ", ".join(missing))
+                QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, "Choose an input for: " + ", ".join(missing))
                 return
-            if e[0].id() == h[0].id():
+            if (os.path.normcase(e[0][0]), e[0][1]) == (os.path.normcase(h[0][0]), h[0][1]):
                 QtWidgets.QMessageBox.warning(self, DIALOG_TITLE,
-                                              "The Preliminary EARF and the household worksheet are the same layer.")
+                                              "The Preliminary EARF and the household worksheet are the same sheet.")
                 return
             self.run_btn.setEnabled(False)
             self.progress.setRange(0, 0)
