@@ -122,6 +122,14 @@ jobs:
           sed -i "s#^homepage=.*#homepage=${REPO_URL}#; s#^repository=.*#repository=${REPO_URL}#; s#^tracker=.*#tracker=${REPO_URL}/issues#" "$META"
           grep -E '^(version|description|experimental|homepage|repository|tracker)=' "$META"
 
+      - name: Write the changelog (merged pull requests per release of this channel)
+        env:
+          GH_TOKEN: ${{ github.token }}   # to read each PR's description for its brief detail
+        run: |
+          python .github/scripts/make_changelog.py \
+            --metadata "build/${PLUGIN_DIR}/metadata.txt" \
+            --version "${VERSION}" --channel "${CHANNEL}"
+
       - name: Build zip
         run: |
           cd build
