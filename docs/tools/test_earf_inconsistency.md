@@ -26,7 +26,7 @@ Estimated Number of Households worksheet. It writes two workbooks in the *EA Lis
 
 ```mermaid
 flowchart LR
-  G[EA GeoPackage layers<br/>attributes only] --> C{14 checks}
+  G[EA GeoPackage layers<br/>attributes only] --> C{13 checks}
   E[Preliminary EARF sheets<br/>re-read with real header] --> C
   H[Household worksheet] --> C
   C --> W1["GPKG workbook<br/>Summary + 1 sheet per check found"]
@@ -52,7 +52,6 @@ flowchart LR
 | `inv_ea_type` | EA Type is something other than Retained, Delineated or Merged |
 | `inv_hhcount` | Household count equals building count. In the EARF workbook the Geocode is the Prelim EARF geocode (Prov+Mun+Brgy+New EA Code, or EA when blank) |
 | `inv_new_ean` | New EA Code is not 6 digits |
-| `inv_sy` | Source year is wrong for the EA Type: Retained must be 2024, Delineated or Merged must be 2026 |
 | `null_ea_count` | EA count is blank. In the EARF, only the first row of each 2024 EA is checked |
 | `null_ea_type`, `null_hhcount`, `null_sy` | The value is blank |
 | `null_new_ean` | A Delineated or Merged EA has no New EA Code |
