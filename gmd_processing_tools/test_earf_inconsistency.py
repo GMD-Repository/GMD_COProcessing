@@ -14,7 +14,7 @@ does not understand the multi-row EARF header).
 Checks (same validation_id in both workbooks unless noted):
   dup_ea          two or more records with every attribute identical (feature id / Excel row ignored)
   dup_new_ean     the same New EA Code is used twice in one barangay (Merged EAs excepted)
-  missing_geo     GPKG workbook: EARF geocodes (final, with the New EA Code) not in the GeoPackage
+  missing_geo     GPKG workbook: household-worksheet geocodes not in the GeoPackage (Merged excepted)
   earf_missing_geo EARF workbook: household-worksheet geocodes not in the EARF (EARF's city/muns only)
   inv_ea_type     EA Type other than Retained, Delineated, Merged
   inv_hhcount     Household count equal to building count
@@ -54,9 +54,11 @@ CHECKS = [
     ("dup_new_ean", "Duplicate New EA Code",
      "Multiple records share the same New EA Code where uniqueness is expected"),
     ("missing_geo", "Missing Geocode Match",
-     "Geocodes present in the Prelim EARF that are not present in the GeoPackage"),
+     "Geocodes present in the 2024 POPCEN Estimated Number of Households that are not present in the "
+     "GeoPackage (Merged EAs excepted)"),
     ("earf_missing_geo", "Missing Geocode Match",
-     "Geocodes present in the 2024 POPCEN Estimated Number of Households that are not present in the Prelim EARF"),
+     "Geocodes present in the 2024 POPCEN Estimated Number of Households that are not present in the Prelim EARF "
+     "(Merged EAs excepted)"),
     ("inv_ea_type", "Invalid EA Type", "Entries with values other than Retained, Delineated, and Merged"),
     ("inv_hhcount", "Invalid Household Count", "Household count is equal to building count"),
     ("inv_new_ean", "Invalid New EA Code", "Entries with values other than the required 6-digit EA code"),
@@ -74,7 +76,7 @@ CHECK_INFO = {c[0]: c for c in CHECKS}
 GPKG_IDS = [c[0] for c in CHECKS if c[0] != "earf_missing_geo"]
 EARF_IDS = [c[0] for c in CHECKS if c[0] != "missing_geo"]
 TABS = {"gpkg": "GeoPackage", "earf": "prelim EARF"}
-CROSS_TABS = {("gpkg", "missing_geo"): "Prelim and GeoPackage",
+CROSS_TABS = {("gpkg", "missing_geo"): "2024 POPCEN and GeoPackage",
               ("earf", "earf_missing_geo"): "2024 POPCEN and Prelim EARF"}
 
 # Value column(s) of each sheet: (internal column, GPKG header, EARF header)
@@ -429,24 +431,29 @@ def run_checks(gpkg=None, earf=None, household=None, step=print):
         s = household[household["subject"] != ""]
         subject = s.set_index("geocode")["subject"]
     out = {"gpkg": {}, "earf": {}, "skipped": {}}
+    # 2024 EAs the GeoPackage marks Merged: absorbed into another EA, so never "missing"
+    merged = set()
+    if gpkg is not None and not gpkg.empty:
+        m = gpkg[gpkg["ea_type"] == "MERGED"]
+        merged = set(m["old_geocode"]) | set(m["geocode"])
 
     if gpkg is not None and not gpkg.empty:
         res = common_checks(gpkg, subject, "old_geocode")
-        if earf is not None and not earf.empty:
-            have = set(gpkg["geocode"])
-            miss = earf[~earf["final_geocode"].isin(have)].copy()
-            miss = miss.drop_duplicates("final_geocode")
-            # names from the GeoPackage where its barangay / city is there
+        if household is not None and not household.empty:
+            # 2024 household-worksheet EAs (GeoPackage's city/muns) with no GeoPackage record, by the
+            # final geocode or the 2024 EA code; EAs the GeoPackage marks Merged are not missing.
+            have = set(gpkg["geocode"]) | set(gpkg["old_geocode"])
+            scope = household[household["mun5"].isin(set(gpkg["mun5"]))]
+            miss = scope[~scope["geocode"].isin(have) & ~scope["geocode"].isin(merged)].copy()
             for colname, key in (("region", "mun5"), ("province", "mun5"), ("city_mun", "mun5"),
                                  ("barangay", "bgy8")):
                 lut = gpkg[gpkg[colname] != ""].drop_duplicates(key).set_index(key)[colname]
-                miss[colname] = miss[key].map(lut).fillna(miss[colname])
-            miss["geocode"] = miss["final_geocode"]
+                miss[colname] = miss[key].map(lut).fillna("")
             miss["_fid"], miss["_layer_id"] = None, None
-            res["missing_geo"] = (miss, pd.Series("in the EARF (" + miss["ref"] + ") but not in the GeoPackage",
-                                                  index=miss.index))
+            res["missing_geo"] = (miss, pd.Series("in the household worksheet (" + miss["ref"]
+                                                  + ") but not in the GeoPackage", index=miss.index))
         else:
-            out["skipped"][("gpkg", "missing_geo")] = "no Preliminary EARF ticked"
+            out["skipped"][("gpkg", "missing_geo")] = "no household worksheet ticked"
         if subject is None:
             out["skipped"][("gpkg", "null_remarks")] = "no household worksheet ticked"
         out["gpkg"] = {cid: _shape(rows, note, cid, "gpkg") for cid, (rows, note) in res.items()}
@@ -455,9 +462,9 @@ def run_checks(gpkg=None, earf=None, household=None, step=print):
     if earf is not None and not earf.empty:
         res = common_checks(earf, subject, "geocode", first_only_count=True)
         if household is not None and not household.empty:
-            in_earf = set(earf["geocode"])
+            in_earf = set(earf["geocode"]) | set(earf["final_geocode"])
             scope = household[household["mun5"].isin(set(earf["mun5"]))]
-            miss = scope[~scope["geocode"].isin(in_earf)].copy()
+            miss = scope[~scope["geocode"].isin(in_earf) & ~scope["geocode"].isin(merged)].copy()
             res["earf_missing_geo"] = (miss, pd.Series("in the household worksheet (" + miss["ref"]
                                                        + ") but not in the EARF", index=miss.index))
         else:
@@ -475,6 +482,9 @@ def _shape(rows, note, cid, wb):
     if cid in ("dup_ea",) and wb == "gpkg":
         ids = ids + [("ean", "ean")]
     vals = [(c, g if wb == "gpkg" else e) for c, g, e in VALUE_COLS[cid]]
+    if wb == "earf" and cid == "inv_hhcount":
+        # geocode as in the Preliminary EARF: Prov+Mun+Brgy+New EA Code (EA when blank)
+        ids = [("final_geocode", "Geocode")] + ids[1:]
     data = {}
     for c, header in ids + vals:
         data[header] = rows[c] if c in rows.columns else ""
@@ -496,9 +506,11 @@ def write_workbook(results, wb_key, path):
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
-    ids = GPKG_IDS if wb_key == "gpkg" else EARF_IDS
     found = results[wb_key]
     skipped = results.get("skipped", {})
+    # checks with no inconsistency are left out (a check that could not run is still listed)
+    ids = [cid for cid in (GPKG_IDS if wb_key == "gpkg" else EARF_IDS)
+           if (wb_key, cid) in skipped or len(found.get(cid, ()))]
     head_font = Font(bold=True, color="FFFFFF")
     head_fill = PatternFill("solid", fgColor="1F4E78")
     zero_fill = PatternFill("solid", fgColor="E2EFDA")
@@ -534,13 +546,19 @@ def write_workbook(results, wb_key, path):
         for j, v in enumerate(row, start=2):
             cell = ws.cell(row=i, column=j, value=v)
             cell.border, cell.alignment = box, wrap
-        link = ws.cell(row=i, column=2)
-        link.hyperlink = f"#'{cid}'!A1"
-        link.font = Font(color="0563C1", underline="single")
+        if not reason:
+            link = ws.cell(row=i, column=2)
+            link.hyperlink = f"#'{cid}'!A1"
+            link.font = Font(color="0563C1", underline="single")
         if n is not None:
             ws.cell(row=i, column=6).fill = zero_fill if n == 0 else hit_fill
+    if not ids:
+        ws["B4"] = "No inconsistencies found."
+        ws["B4"].font = Font(bold=True, color="375623")
 
     for cid in ids:
+        if (wb_key, cid) in skipped:
+            continue   # not checked: listed on the Summary only
         sh = wb.create_sheet(cid)
         sh["A1"] = CHECK_INFO[cid][1]
         sh["A1"].font = Font(bold=True, size=13)
@@ -655,9 +673,14 @@ table, or every column of the EARF row). Only the feature id (<code>fid</code>) 
 are ignored. The remarks column gives a group number so the copies can be paired.</li>
 <li><b>dup_new_ean</b>: the same New EA Code value on two or more records in one barangay. Merged EAs are not counted, since
 merged parts can share the code they merge into.</li>
-<li><b>missing_geo</b> (GPKG workbook): EARF final geocodes not found in the GeoPackage.</li>
+<li><b>missing_geo</b> (GPKG workbook): household-worksheet geocodes not in the GeoPackage (neither as
+<code>geocode</code> nor as barangay + <code>ean</code>), only for the city/municipalities in the GeoPackage.</li>
 <li><b>earf_missing_geo</b> (EARF workbook): household-worksheet geocodes not in the EARF, only for the
 city/municipalities present in the EARF.</li>
+<li>In both missing checks, an EA whose <code>ea_type</code> is <b>Merged</b> in the GeoPackage is not
+counted as missing, since it was merged into another EA.</li>
+<li><b>inv_hhcount</b> (EARF workbook): the Geocode column is the Preliminary EARF geocode,
+Prov+Mun+Brgy+New EA Code (or EA when blank).</li>
 <li><b>inv_sy</b>: Retained must be 2024; Delineated and Merged must be 2026.</li>
 <li><b>null_ea_count</b> (EARF): only the first row of each 2024 EA is checked, because split rows leave
 <i>Number of EAs</i> blank.</li>
@@ -667,7 +690,8 @@ still Retained and has no remarks.</li>
 
 <h3>Output</h3>
 <p>Each workbook has a <b>Summary</b> sheet (frequency of each check, with links) and one sheet per
-<code>validation_id</code>. The <b>remarks</b> column explains the problem. The file name starts with the
+<code>validation_id</code> that found something. Checks with no inconsistency are left out of the
+results table and of the workbooks. The <b>remarks</b> column explains the problem. The file name starts with the
 city/municipality code (or the province code, or <i>combined</i>).</p>
 
 <h3>Troubleshooting</h3>
@@ -1092,6 +1116,8 @@ def make_dialog_class():
                 for cid in ids:
                     reason = self.results["skipped"].get((wb, cid))
                     n = None if reason else len(self.results[wb].get(cid, ()))
+                    if n == 0:
+                        continue   # no inconsistency: not listed
                     r = t.rowCount()
                     t.insertRow(r)
                     vals = ["GPKG" if wb == "gpkg" else "EARF", cid, CHECK_INFO[cid][1],
