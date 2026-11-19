@@ -29,8 +29,8 @@ flowchart LR
   G[EA GeoPackage layers<br/>attributes only] --> C{14 checks}
   E[Preliminary EARF sheets<br/>re-read with real header] --> C
   H[Household worksheet] --> C
-  C --> W1["GPKG workbook<br/>Summary + 1 sheet per check"]
-  C --> W2["EARF workbook<br/>Summary + 1 sheet per check"]
+  C --> W1["GPKG workbook<br/>Summary + 1 sheet per check found"]
+  C --> W2["EARF workbook<br/>Summary + 1 sheet per check found"]
 ```
 
 1. **GeoPackage**: features are read without geometry, which is fast. Unsaved edits are included. `geocode` is
@@ -47,16 +47,19 @@ flowchart LR
 |---|---|
 | `dup_ea` | Two or more records whose attributes are all identical. Only `fid` and the Excel row number are ignored |
 | `dup_new_ean` | The same New EA Code value on two or more records in one barangay. Merged EAs are excepted |
-| `missing_geo` | GPKG workbook only: EARF final geocodes that are not in the GeoPackage |
-| `earf_missing_geo` | EARF workbook only: household geocodes that are not in the EARF (only the EARF's city/muns are checked) |
+| `missing_geo` | GPKG workbook only: household geocodes that are not in the GeoPackage (as `geocode` or barangay + `ean`; only the GeoPackage's city/muns). EAs the GeoPackage marks **Merged** are not missing |
+| `earf_missing_geo` | EARF workbook only: household geocodes that are not in the EARF (only the EARF's city/muns are checked). EAs the GeoPackage marks **Merged** are not missing |
 | `inv_ea_type` | EA Type is something other than Retained, Delineated or Merged |
-| `inv_hhcount` | Household count equals building count |
+| `inv_hhcount` | Household count equals building count. In the EARF workbook the Geocode is the Prelim EARF geocode (Prov+Mun+Brgy+New EA Code, or EA when blank) |
 | `inv_new_ean` | New EA Code is not 6 digits |
 | `inv_sy` | Source year is wrong for the EA Type: Retained must be 2024, Delineated or Merged must be 2026 |
 | `null_ea_count` | EA count is blank. In the EARF, only the first row of each 2024 EA is checked |
 | `null_ea_type`, `null_hhcount`, `null_sy` | The value is blank |
 | `null_new_ean` | A Delineated or Merged EA has no New EA Code |
 | `null_remarks` | The EA is marked for delineation or merging, is still Retained, and has no remarks |
+
+Checks that find no inconsistency are left out of the results table and of the exported workbooks. A check
+that could not run (for example, no household worksheet) is still listed on the Summary as *Not checked*.
 
 
 ## Troubleshooting
