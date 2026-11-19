@@ -56,7 +56,7 @@ flowchart LR
 | `null_ea_count` | EA count is blank. In the EARF, only the first row of each 2024 EA is checked |
 | `null_ea_type`, `null_hhcount`, `null_sy` | The value is blank |
 | `null_new_ean` | A Delineated or Merged EA has no New EA Code |
-| `null_remarks` | The EA is marked for delineation or merging, is still Retained, and has no remarks |
+| `null_remarks` | Reads the 3 files together: the household worksheet marks the EA for delineation or merging, but it is Retained with no remarks in the GeoPackage **or** the EARF. Listed in both workbooks; the remarks column names the file(s) |
 
 Checks that find no inconsistency are left out of the results table and of the exported workbooks. A check
 that could not run (for example, no household worksheet) is still listed on the Summary as *Not checked*.

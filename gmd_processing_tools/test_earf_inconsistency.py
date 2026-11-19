@@ -371,7 +371,7 @@ def gpkg_frame(records, label=""):
 
 
 # ═════════════════════════════ checks ═════════════════════════════
-def common_checks(df, subject_by_geocode, old_key, first_only_count=False):
+def common_checks(df, subject_by_geocode, old_key, first_only_count=False, null_remarks_where=None):
     """The 12 checks shared by the GeoPackage and the EARF. Returns {id: (rows, note Series)}."""
     t, sy, nean = df["ea_type"], df["sy"], df["new_ean"]
     res = {}
@@ -412,8 +412,12 @@ def common_checks(df, subject_by_geocode, old_key, first_only_count=False):
 
     if subject_by_geocode is not None:
         subj = df[old_key].map(subject_by_geocode).fillna("")
-        add("null_remarks", (subj != "") & (t == "RETAINED") & (df["remarks"] == ""),
-            "subject for " + subj + " in the household worksheet, kept Retained, no remarks")
+        if null_remarks_where is None:   # this file only
+            where = pd.Series("", index=df.index).where(~((t == "RETAINED") & (df["remarks"] == "")), "this file")
+        else:                            # GeoPackage and EARF read together (see run_checks)
+            where = df[old_key].map(null_remarks_where).fillna("")
+        add("null_remarks", (subj != "") & (where != ""),
+            "subject for " + subj + " in the household worksheet; Retained with no remarks in " + where)
 
     add("null_sy", sy == "", "Source Year is blank")
     return res
@@ -437,8 +441,22 @@ def run_checks(gpkg=None, earf=None, household=None, step=print):
         m = gpkg[gpkg["ea_type"] == "MERGED"]
         merged = set(m["old_geocode"]) | set(m["geocode"])
 
+    # null_remarks reads the 3 files together: an EA the household worksheet marks for delineation /
+    # merging is flagged (in both workbooks) when it is Retained with no remarks in the GeoPackage
+    # OR in the EARF. 2024 geocode -> "GeoPackage", "EARF" or "GeoPackage, EARF".
+    where = None
+    if subject is not None:
+        hits = {}
+        for name, frame, key in (("GeoPackage", gpkg, "old_geocode"), ("EARF", earf, "geocode")):
+            if frame is not None and not frame.empty:
+                bad = frame[(frame["ea_type"] == "RETAINED") & (frame["remarks"] == "")
+                            & frame[key].isin(subject.index)]
+                for g in bad[key].unique():
+                    hits.setdefault(g, []).append(name)
+        where = pd.Series({g: ", ".join(v) for g, v in hits.items()}, dtype=str)
+
     if gpkg is not None and not gpkg.empty:
-        res = common_checks(gpkg, subject, "old_geocode")
+        res = common_checks(gpkg, subject, "old_geocode", null_remarks_where=where)
         if household is not None and not household.empty:
             # 2024 household-worksheet EAs (GeoPackage's city/muns) with no GeoPackage record, by the
             # final geocode or the 2024 EA code; EAs the GeoPackage marks Merged are not missing.
@@ -460,7 +478,7 @@ def run_checks(gpkg=None, earf=None, household=None, step=print):
         step(f"GeoPackage: {len(gpkg)} EAs checked")
 
     if earf is not None and not earf.empty:
-        res = common_checks(earf, subject, "geocode", first_only_count=True)
+        res = common_checks(earf, subject, "geocode", first_only_count=True, null_remarks_where=where)
         if household is not None and not household.empty:
             in_earf = set(earf["geocode"]) | set(earf["final_geocode"])
             scope = household[household["mun5"].isin(set(earf["mun5"]))]
@@ -684,8 +702,9 @@ Prov+Mun+Brgy+New EA Code (or EA when blank).</li>
 <li><b>inv_sy</b>: Retained must be 2024; Delineated and Merged must be 2026.</li>
 <li><b>null_ea_count</b> (EARF): only the first row of each 2024 EA is checked, because split rows leave
 <i>Number of EAs</i> blank.</li>
-<li><b>null_remarks</b>: the household worksheet marks the EA for delineation or merging, but the EA is
-still Retained and has no remarks.</li>
+<li><b>null_remarks</b>: reads the 3 files together. The household worksheet marks the EA for delineation
+or merging, but the EA is Retained with no remarks in the GeoPackage <i>or</i> in the EARF. It is listed in
+both workbooks, and the remarks column names the file(s) where it is Retained with no remarks.</li>
 </ul>
 
 <h3>Output</h3>
