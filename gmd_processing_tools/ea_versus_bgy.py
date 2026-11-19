@@ -407,6 +407,18 @@ def link_gaps_to_eas(gap, inside):
     return pd.DataFrame(links, columns=["gap", "ea_idx", "borders"]).astype({"gap": int, "ea_idx": int, "borders": bool})
 
 
+def detached_candidates(gap, inside, rows):
+    """For gaps no EA touches (e.g. an island of the barangay): every EA of the same barangay, nearest
+    first, so Switch Fix can pick the one the piece is copied into (the EA becomes multipart)."""
+    gap_m = gap.geometry.to_crs(AREA_CRS)
+    ea_m = inside[["key", "geometry"]].to_crs(AREA_CRS)
+    out = {}
+    for g in rows:
+        own = ea_m[ea_m["key"] == gap.at[g, "key"]]
+        out[int(g)] = [int(i) for i in own.distance(gap_m[g]).sort_values().index]
+    return out
+
+
 STATUS_PENDING = "Not snapped"
 STATUS_DONE = "Snapped"
 STATUS_FAILED = "Failed"
@@ -482,7 +494,9 @@ def find_discrepancies(ea, bgy, min_area, mode="ea_bgy"):
     snappable = borders & one_owner
     note = pd.Series(f"{unit[0].upper() + unit[1:]} does not reach its {ref} boundary here", index=gap.index,
                      dtype=object)
-    note = note.where(borders, f"No {unit} reaches this part of the {ref}; nearest {unit} listed")
+    note = note.where(borders, f"No {unit} reaches this detached part of the {ref} (e.g. an island): "
+                               f"pick the {unit} to copy it into with Switch Fix (nearest first)")
+    detached = detached_candidates(gap, inside, gap.index[~borders])
     note = note.where(~borders | one_owner,
                       "Borders " + n_eas.astype(str) + f" {unit}s and none has most of it: split it between "
                       "them by hand, or pick one with Switch Fix")
@@ -498,7 +512,7 @@ def find_discrepancies(ea, bgy, min_area, mode="ea_bgy"):
         "_ea_idx": owner.values,
         "_snappable": snappable.values,
         "_kind": "add",
-        "_candidates": [ranked.get(g, []) if b else [] for g, b in zip(gap.index, borders)],
+        "_candidates": [ranked.get(g, []) if b else detached.get(int(g), []) for g, b in zip(gap.index, borders)],
     }, geometry=gap.geometry.values, crs=DATA_CRS)
 
     # ===== TARGETS WITH NO REFERENCE: the whole feature is the discrepancy =====
@@ -794,6 +808,7 @@ class Scan:
         self.unit = MODES[mode]["unit"]
         self.messages = {}                  # row -> why it failed / what changed
         self.history = []                   # one entry per Snap Selected that changed something (for undo)
+        self.needs_multi = {}               # layer id -> rows the last snap refused: single-part layer
 
 
 def _set_layer_values(scan, rows, columns):
@@ -842,6 +857,7 @@ def snap_rows(scan, rows):
     d, ea, unit = scan.discrepancies, scan.ea, scan.unit
     Unit = unit[0].upper() + unit[1:]
     outcome, todo = {}, {}
+    scan.needs_multi = {}
     for r in rows:
         status = d.at[r, "Status"]
         if status == STATUS_DONE:
@@ -892,7 +908,8 @@ def snap_rows(scan, rows):
         parts = shapely.get_num_geometries(new)
         if parts > 1 and not QgsWkbTypes.isMultiType(ea_layer.wkbType()):
             fail(f"it would have {parts} parts, but '{ea_layer.name()}' is a single-part Polygon layer. "
-                 f"To allow it: Export > Save Features As, tick 'Force to multi-type', and scan that layer")
+                 f"Snap again and answer Yes to make a multipart copy of the layer")
+            scan.needs_multi.setdefault(layer_id, []).extend(ea_rows)
             continue
 
         geom, why = to_layer_geometry(new, ea_layer)
@@ -943,6 +960,84 @@ def snap_rows(scan, rows):
         if undo_layers:
             scan.history.append({"layers": undo_layers, "rows": done_rows, "geoms": undo_geoms})
     return outcome
+
+
+def make_multipart_copy(scan, layer_id):
+    """A single-part polygon layer cannot hold an EA with an island. Save a MultiPolygon copy of it next to
+    the original (<name>_multi.gpkg; in memory if the layer has no file), add it to the project above the
+    original with the same style, hide the original (its file is not changed; its unsaved edits move to the
+    copy) and point the scan's features at the copy. Returns (new layer, None) or (None, why)."""
+    from qgis.core import (QgsFeatureRequest, QgsMapLayerStyle, QgsProject, QgsProviderRegistry,
+                           QgsVectorFileWriter, QgsVectorLayer)
+
+    prj = QgsProject.instance()
+    old = prj.mapLayer(layer_id)
+    if old is None:
+        return None, "the layer was removed from the project"
+
+    name = f"{old.name()} (multipart)"
+    path = QgsProviderRegistry.instance().decodeUri(old.providerType(), old.source()).get("path") or ""
+    if path and os.path.isfile(path):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        out, n = os.path.join(os.path.dirname(path), f"{stem}_multi.gpkg"), 2
+        while os.path.exists(out):
+            out, n = os.path.join(os.path.dirname(path), f"{stem}_multi_{n}.gpkg"), n + 1
+        opts = QgsVectorFileWriter.SaveVectorOptions()
+        opts.driverName = "GPKG"
+        opts.layerName = re.sub(r"\W+", "_", stem).strip("_") or "layer"
+        opts.forceMulti = True
+        res = QgsVectorFileWriter.writeAsVectorFormatV3(old, out, prj.transformContext(), opts)
+        if res[0] != QgsVectorFileWriter.NoError:
+            return None, f"could not write {out}: {res[1]}"
+        new = QgsVectorLayer(f"{out}|layername={opts.layerName}", name, "ogr")
+    else:
+        new = QgsVectorLayer(f"MultiPolygon?crs={old.crs().authid()}", name, "memory")
+        new.dataProvider().addAttributes(old.fields().toList())
+        new.updateFields()
+        feats = []
+        for f in old.getFeatures(QgsFeatureRequest().addOrderBy("$id")):
+            g = f.geometry()
+            g.convertToMultiType()
+            f.setGeometry(g)
+            feats.append(f)
+        new.dataProvider().addFeatures(feats)
+    if not new.isValid():
+        return None, "the multipart copy could not be opened"
+
+    # Same order in both (features are written in id order): pair them, checking each pair's area.
+    old_feats = sorted(old.getFeatures(), key=lambda f: f.id())
+    new_feats = sorted(new.getFeatures(), key=lambda f: f.id())
+    if len(old_feats) != len(new_feats) or any(
+            abs(a.geometry().area() - b.geometry().area()) > 1e-6 * max(a.geometry().area(), 1e-12)
+            for a, b in zip(old_feats, new_feats)):
+        return None, "the multipart copy does not match the original feature for feature"
+    fid_map = {a.id(): b for a, b in zip(old_feats, new_feats)}
+
+    # The copy already holds the original's unsaved edits (e.g. earlier snaps): drop them from the original
+    # so it stays as saved, and forget the snaps made there (they can no longer be undone from here).
+    if old.isEditable():
+        old.rollBack()
+    if any(lid == layer_id for e in scan.history for lid, *_ in e["layers"]):
+        scan.history.clear()
+
+    style = QgsMapLayerStyle()
+    style.readFromLayer(old)
+    style.writeToLayer(new)
+    prj.addMapLayer(new, False)
+    root = prj.layerTreeRoot()
+    node = root.findLayer(old.id())
+    parent = node.parent() if node is not None else root
+    parent.insertLayer(parent.children().index(node) if node is not None else 0, new)
+    if node is not None:
+        node.setItemVisibilityChecked(False)
+
+    ea = scan.ea
+    for idx in ea.index[ea["src_layer"] == layer_id]:
+        f = fid_map[int(ea.at[idx, "src_fid"])]
+        ea.at[idx, "src_layer"] = new.id()
+        ea.at[idx, "src_fid"] = int(f.id())
+        ea.at[idx, "src_hash"] = geometry_hash(f.geometry())
+    return new, None
 
 
 def undo_last_snap(scan):
@@ -1312,7 +1407,12 @@ HELP_HTML = f"""
       ("Outside &hellip;", "The part of a feature outside its reference (<i>Outside BGY</i>, <i>Outside ref BGY</i>, "
                            "<i>Outside ref EA</i>). Snapping cuts it off."),
       ("Short of &hellip;", "Reference land the feature does not reach. Snapping adds it to the feature that shares "
-                            "the longest border with it (all bordering features are named)."),
+                            "the longest border with it (all bordering features are named). A detached piece "
+                            "no feature touches (e.g. an island) is <i>Fix manually</i>: pick the feature with "
+                            "<b>Switch Fix</b> (nearest first) and snap to copy the piece into it (it becomes "
+                            "multipart). If its layer is single-part, Snap offers to make a multipart copy "
+                            "(<i>&lt;name&gt;_multi.gpkg</i> next to the original, which is hidden but not "
+                            "changed) and snaps into that."),
       ("No matching &hellip;", "The feature's geocode is not in the reference layer. Fix it by hand."),
       ("Overlap", "<i>Self check.</i> Two features cover the same land. Snapping cuts it from the larger one; "
                   "use <b>Switch Fix</b> to cut it from the other one instead."),
@@ -1331,7 +1431,8 @@ HELP_HTML = f"""
                            "the dotted green preview of each Fix feature after Snap Selected."),
       ("Switch Fix", "For overlaps and gaps (and shortfalls bordering several features): gives the selected row "
                      "to the next feature that could take it. Also lets you snap a row marked <i>Fix manually</i> "
-                     "because no feature had most of its border."),
+                     "because no feature had most of its border, or a detached piece such as an island "
+                     "(the features of its reference area, nearest first)."),
       ("Snap Selected", "Changes the features named in Fix for the selected rows. Unsaved, undoable edits."),
       ("Undo Last Snap", "Takes back the last <b>Snap Selected</b>: the features return to their shape before it and "
                          "its rows to the status they had before it (normally <i>Not snapped</i>). Press again to "
@@ -2426,6 +2527,7 @@ def make_dialog_class():
                 return
             finally:
                 self.set_busy(False)
+            outcome.update(self.snap_into_multipart_copies())
 
             # one log line per feature (rows of the same feature share their message)
             for message in dict.fromkeys(m for _, m in outcome.values()):
@@ -2446,6 +2548,46 @@ def make_dialog_class():
                 self.log(f"The changes are UNSAVED edits in {len(names)} layer(s): {', '.join(names)}. "
                          "Keep: Layer > Current Edits > Save for All Layers. Undo: Edit > Undo (per layer).")
             self.apply_filter()
+
+        def snap_into_multipart_copies(self):
+            """Rows refused because their feature would get a second part (e.g. an island) in a single-part
+            layer: offer to make a multipart copy of that layer, switch the scan to it and snap them again.
+            Returns the new outcome of those rows ({} if declined or not needed)."""
+            scan = self.scan_result
+            pending = dict(scan.needs_multi)
+            if not pending:
+                return {}
+            names = [QgsProject.instance().mapLayer(i).name() for i in pending
+                     if QgsProject.instance().mapLayer(i) is not None]
+            answer = QtWidgets.QMessageBox.question(
+                self, "Single-part layer",
+                f"{sum(map(len, pending.values())):,} row(s) would give a {scan.unit} a second part (e.g. an "
+                f"island), but these layers are single-part Polygon:\n\n  " + "\n  ".join(names) +
+                "\n\nMake a multipart copy of each? It is saved next to the original as <name>_multi.gpkg, "
+                "added above it with the same style and used from now on. The original is hidden, not changed.")
+            if answer != QtWidgets.QMessageBox.Yes:
+                return {}
+            outcome, retry = {}, []
+            for layer_id, rows in pending.items():
+                new, why = make_multipart_copy(scan, layer_id)
+                if new is None:
+                    self.log(f"  Multipart copy not made: {why}")
+                    continue
+                self.log(f"  Made multipart copy '{new.name()}' ({new.source().split('|')[0]}); "
+                         "it replaces the original in this scan")
+                ids = (self.target.checked_ids() - {layer_id}) | {new.id()}
+                self.refresh_lists()
+                self.target.set_ticks(ids)
+                self.manual["target"] = True
+                self.sync_lists()
+                retry.extend(rows)
+            if retry:
+                self.set_busy(True)
+                try:
+                    outcome = snap_rows(scan, sorted(retry))
+                finally:
+                    self.set_busy(False)
+            return outcome
 
         def undo_snap(self):
             """Undo Last Snap: takes back the last Snap Selected and gives its rows their earlier status."""

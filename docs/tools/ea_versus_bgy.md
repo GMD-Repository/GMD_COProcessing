@@ -57,7 +57,7 @@ narrow it; the magnifier button next to them zooms to the selected rows.
 |--------|--------------|
 | **Select Not Snapped** | Selects every listed row that can still be snapped. |
 | **Zoom to Selected** | Zooms to the selected rows (with the blinking outlines if ticked). |
-| **Switch Fix** | Gives the selected row to the next feature that could take it. |
+| **Switch Fix** | Gives the selected row to the next feature that could take it. For a detached piece (island), goes through the features of its reference area, nearest first. |
 | **Snap Selected** | Changes the features named in **Fix** for the selected rows. |
 | **Undo Last Snap** | Takes back the last snap (see Safety checks and saving). |
 | **Clear** (left column) | Clears the list and the log. |
@@ -102,7 +102,13 @@ flowchart LR
    - **Outside:** feature − its reference. Each piece names the reference area it extends into.
    - **Short of:** reference − the union of its features. The gap is linked to the features within 1 m of
      it. It is given to the one with the longest shared border, but only if that feature has at least 30%
-     of the bordering length; otherwise it is marked *Fix manually*.
+     of the bordering length; otherwise it is marked *Fix manually*. A piece no feature touches (a detached
+     part such as an island) is marked *Fix manually* too. **Switch Fix** goes through the features of the same
+     reference area, nearest first, and **Snap Selected** copies the piece into the chosen one, which becomes
+     multipart. If that layer is single-part Polygon, Snap asks to make a multipart copy: it is saved next to
+     the original as `<name>_multi.gpkg`, added above it with the same style, and used from then on (also
+     ticked in the list). The original is hidden and its file is not changed. Any unsaved edits move to the
+     copy, and they are already saved there, so earlier snaps on that layer can no longer be undone.
    - **No matching:** features whose key is not in the reference; the whole feature is listed.
 3. **Self check (no reference).**
    - **Overlap:** the shared area of two features, cut from the larger one.
@@ -122,7 +128,7 @@ flowchart LR
 | Type | Meaning | Snap does |
 |------|---------|-----------|
 | **Outside …** | Part of a feature outside its reference | Cuts it off the feature |
-| **Short of …** | Reference land the feature does not reach (all bordering features listed) | Adds it to the feature with the longest shared border |
+| **Short of …** | Reference land the feature does not reach (all bordering features listed) | Adds it to the feature with the longest shared border. A detached piece (island): choose the feature with Switch Fix, nearest first |
 | **No matching …** | The feature's geocode is not in the reference layer | Nothing — fix by hand |
 | **Overlap** | Self check: land in two features | Cuts it from the larger one (Switch Fix: the other) |
 | **Gap** | Self check: land enclosed by the features but in none | Adds it to the feature with the longest border (Switch Fix: the next one) |
