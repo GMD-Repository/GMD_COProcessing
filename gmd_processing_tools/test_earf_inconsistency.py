@@ -19,7 +19,6 @@ Checks (same validation_id in both workbooks unless noted):
   inv_ea_type     EA Type other than Retained, Delineated, Merged
   inv_hhcount     Household count equal to building count
   inv_new_ean     New EA Code that is not 6 digits
-  inv_sy          Retained must be 2024; Delineated / Merged must be 2026
   null_ea_count   EA count blank (EARF: only the first row of each old EA; split rows leave it blank)
   null_ea_type / null_hhcount / null_sy   blank values
   null_new_ean    Delineated or Merged EA without a New EA Code
@@ -43,7 +42,6 @@ import pandas as pd
 
 # ═════════════════════════════ configuration ═════════════════════════════
 VALID_TYPES = ("RETAINED", "DELINEATED", "MERGED")
-EXPECTED_SY = {"RETAINED": "2024", "DELINEATED": "2026", "MERGED": "2026"}
 TRUTHY = {"1", "Y", "YES", "TRUE", "X", "✓", "✔"}
 BLANKS = {"", "nan", "none", "null", "<na>", "nat"}
 SPREADSHEET_EXT = (".xlsx", ".xlsm", ".xls", ".ods", ".csv")
@@ -62,8 +60,6 @@ CHECKS = [
     ("inv_ea_type", "Invalid EA Type", "Entries with values other than Retained, Delineated, and Merged"),
     ("inv_hhcount", "Invalid Household Count", "Household count is equal to building count"),
     ("inv_new_ean", "Invalid New EA Code", "Entries with values other than the required 6-digit EA code"),
-    ("inv_sy", "Inconsistent EA Type and Source Year",
-     "Mismatch between EA Type and SY (Delineated/Merged = 2026, \nRetained = 2024)"),
     ("null_ea_count", "Missing EA Count", "EA count should not be Null"),
     ("null_ea_type", "Missing EA Type", "EA Type is blank or null"),
     ("null_hhcount", "Missing Household Count", "Household count is blank or null"),
@@ -88,7 +84,6 @@ VALUE_COLS = {
     "inv_ea_type": [("ea_type", "ea_type", "EA Type")],
     "inv_hhcount": [("hh_count", "hh_count", "Household\nCount"), ("bldg_count", "bldg_count", "Building\nCount")],
     "inv_new_ean": [("new_ean", "new_ean", "New EA Code")],
-    "inv_sy": [("ea_type", "ea_type", "EA Type"), ("sy", "sy", "Source Year")],
     "null_ea_count": [("ea_count", "eacount", "Number of EAs")],
     "null_ea_type": [("ea_type", "ea_type", "EA Type")],
     "null_hhcount": [("hh_count", "hh_count", "Household Count")],
@@ -372,7 +367,7 @@ def gpkg_frame(records, label=""):
 
 # ═════════════════════════════ checks ═════════════════════════════
 def common_checks(df, subject_by_geocode, old_key, first_only_count=False, null_remarks_where=None):
-    """The 12 checks shared by the GeoPackage and the EARF. Returns {id: (rows, note Series)}."""
+    """The 11 checks shared by the GeoPackage and the EARF. Returns {id: (rows, note Series)}."""
     t, sy, nean = df["ea_type"], df["sy"], df["new_ean"]
     res = {}
 
@@ -400,9 +395,6 @@ def common_checks(df, subject_by_geocode, old_key, first_only_count=False, null_
 
     add("inv_new_ean", (nean != "") & ~nean.str.fullmatch(r"\d{6}"), "New EA Code '" + nean + "' is not 6 digits")
 
-    exp = t.map(EXPECTED_SY)
-    add("inv_sy", exp.notna() & (sy != "") & (sy != exp.fillna("")),
-        t.str.title() + " EA should have SY " + exp.fillna("") + ", found " + sy)
 
     cnt_scope = ~df[old_key].duplicated(keep="first") if first_only_count else pd.Series(True, index=df.index)
     add("null_ea_count", cnt_scope & (df["ea_count"] == ""), "EA count is blank")
@@ -699,7 +691,6 @@ city/municipalities present in the EARF.</li>
 counted as missing, since it was merged into another EA.</li>
 <li><b>inv_hhcount</b> (EARF workbook): the Geocode column is the Preliminary EARF geocode,
 Prov+Mun+Brgy+New EA Code (or EA when blank).</li>
-<li><b>inv_sy</b>: Retained must be 2024; Delineated and Merged must be 2026.</li>
 <li><b>null_ea_count</b> (EARF): only the first row of each 2024 EA is checked, because split rows leave
 <i>Number of EAs</i> blank.</li>
 <li><b>null_remarks</b>: reads the 3 files together. The household worksheet marks the EA for delineation
