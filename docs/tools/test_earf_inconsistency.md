@@ -13,9 +13,11 @@ Estimated Number of Households worksheet. It writes two workbooks in the *EA Lis
 
 ## Quick start
 
-1. Add the inputs to the QGIS project. For each spreadsheet, choose its sheet (for example `EA2026`).
-2. Choose the inputs in the dropdowns: **1. EA GeoPackage (ea2026)**, **2. Preliminary EARF** and
-   **3. Est. No. of Households**. Choose one layer in each dropdown; all three are required.
+1. Add the EA GeoPackage layer to the QGIS project and choose it in **1. EA GeoPackage (ea2026)**.
+2. **2. Preliminary EARF** and **3. Est. No. of Households** are files, not layers. The tool searches the
+   GeoPackage's folder and fills in the spreadsheet whose name matches (`earf`; `household`, `hh`,
+   `popcen` or `estimated`). Otherwise press **Browse…** (it opens in that folder) or type the path,
+   then pick the **Sheet** (for example `EA2026`). All three inputs are required.
 3. Press **Run Check**. The upper table lists each check with its **Frequency**.
 4. Click a check to see its records. Double-click a GeoPackage record to zoom to that EA.
 5. Set **4. Output folder**, then press **Export Excel**.
