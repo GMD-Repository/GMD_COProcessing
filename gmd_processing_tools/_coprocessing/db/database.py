@@ -825,6 +825,10 @@ def export_matched_to_excel(
     deduped_records = []
     seen_brgy_entries = {}
     for r in records:
+        if r.get("from_exported_gpkg"):
+            deduped_records.append(r)
+            continue
+
         gc = str(r.get("geocode", "") or "").strip()
         brgy_c = str(r.get("barangay_code", "") or (gc[5:8] if len(gc) >= 8 else "")).strip().zfill(3)
         prov_c = str(r.get("province_code", "") or (gc[:3] if len(gc) >= 3 else "")).strip().zfill(3)
@@ -860,6 +864,21 @@ def export_matched_to_excel(
             seen_brgy_entries[b_key] = r
         deduped_records.append(r)
     records = deduped_records
+
+    # Strictly sort records by geocode
+    def _extract_sort_geocode(r_item: Dict[str, Any]) -> str:
+        gc_val = str(r_item.get("ea_geocode") or r_item.get("geocode") or "").strip()
+        if not gc_val or len(gc_val) < 8:
+            p = str(r_item.get("province_code") or "").strip().zfill(3)
+            m = str(r_item.get("city_mun_code") or "").strip().zfill(2)
+            b = str(r_item.get("barangay_code") or "").strip().zfill(3)
+            e = str(r_item.get("final_ean") or r_item.get("recoded_ean") or r_item.get("ean") or "").strip()
+            if e.isdigit() and len(e) < 6:
+                e = e.zfill(6)
+            gc_val = f"{p}{m}{b}{e}"
+        return gc_val
+
+    records = sorted(records, key=_extract_sort_geocode)
 
     # Ensure recoded_ean is populated across records
     if any(not r.get("recoded_ean") for r in records):
@@ -1027,6 +1046,10 @@ def export_matched_to_excel(
             if m_val:
                 resolved_mun_code = m_val.zfill(2)
         if not resolved_prov_name or not resolved_mun_name:
+            if f_rec.get("province"):
+                resolved_prov_name = resolved_prov_name or str(f_rec.get("province")).strip().upper()
+            if f_rec.get("city_mun"):
+                resolved_mun_name = resolved_mun_name or str(f_rec.get("city_mun")).strip().upper()
             try:
                 db_inst = POPCENDatabase()
                 h_info = db_inst.get_citymun_hierarchy(f_gc[:5])
@@ -1139,8 +1162,8 @@ def export_matched_to_excel(
 
         # Iterate Barangays
         for b_code in sorted(brgys_map.keys()):
-            b_recs = brgys_map[b_code]
-            b_name = str(b_recs[0].get("geographic_name") or b_recs[0].get("areaname") or "").strip().upper()
+            b_recs = sorted(brgys_map[b_code], key=_extract_sort_geocode)
+            b_name = str(b_recs[0].get("geographic_name") or b_recs[0].get("areaname") or b_recs[0].get("barangay") or "").strip().upper()
             if " - EA" in b_name:
                 b_name = b_name.split(" - EA")[0].strip()
 
@@ -1850,6 +1873,10 @@ def export_output_summary_to_excel(
         if not resolved_mun_code and len(f_gc) >= 5:
             resolved_mun_code = f_gc[3:5]
         if not resolved_prov_name or not resolved_mun_name:
+            if f_rec.get("province"):
+                resolved_prov_name = resolved_prov_name or str(f_rec.get("province")).strip().upper()
+            if f_rec.get("city_mun"):
+                resolved_mun_name = resolved_mun_name or str(f_rec.get("city_mun")).strip().upper()
             try:
                 db_inst = POPCENDatabase()
                 h_info = db_inst.get_citymun_hierarchy(f_gc[:5])
@@ -4143,42 +4170,47 @@ class POPCENDatabase:
             }
             all_records.append(rec)
 
-        # Check map_uuid for duplicates: if there are duplicates, check ea_type for Delineated values
-        # and update with a new UUID to prevent duplicate map_uuid
-        seen_map_uuids = collections.defaultdict(list)
-        for idx, rec in enumerate(all_records):
-            u = rec.get("map_uuid", "")
-            if u:
-                seen_map_uuids[u].append(idx)
-
+        # Deduplicate map_uuid: 1st occurrence keeps its map_uuid.
+        # The 2nd (and subsequent) duplicate value is changed using a unique UUID for QGIS.
         import uuid
-        for u, indices in seen_map_uuids.items():
-            if len(indices) > 1:
-                delin_indices = []
-                other_indices = []
-                for idx in indices:
-                    rec = all_records[idx]
-                    ea_t = str(rec.get("ea_type") or "").strip().upper()
-                    rem = str(rec.get("remarks") or "").strip().lower()
-                    if "DELIN" in ea_t or "delineat" in rem or "split" in ea_t or "split" in rem:
-                        delin_indices.append(idx)
-                    else:
-                        other_indices.append(idx)
+        seen_uuids = set()
+        with self._get_gpkg_connection() as conn:
+            cur = conn.cursor()
+            if replace:
+                cur.execute("DELETE FROM gpkg_records")
+                conn.commit()
+            else:
+                cur.execute("SELECT DISTINCT map_uuid FROM gpkg_records WHERE map_uuid IS NOT NULL AND map_uuid != ''")
+                for row in cur.fetchall():
+                    u_db = str(row[0]).strip()
+                    if u_db:
+                        seen_uuids.add(u_db)
 
-                # Delineated duplicates receive new UUIDs to prevent duplication
-                target_indices = delin_indices if other_indices else delin_indices[1:]
-                for idx in target_indices:
-                    all_records[idx]["map_uuid"] = str(uuid.uuid4())
+        for rec in all_records:
+            u = str(rec.get("map_uuid") or "").strip()
+            if not u or u.lower() in ("nan", "none", "null"):
+                while True:
+                    new_u = str(uuid.uuid4())
+                    if new_u not in seen_uuids:
+                        rec["map_uuid"] = new_u
+                        seen_uuids.add(new_u)
+                        break
+            elif u in seen_uuids:
+                # 2nd or subsequent duplicate value: change using unique UUID for QGIS
+                while True:
+                    new_u = str(uuid.uuid4())
+                    if new_u not in seen_uuids:
+                        rec["map_uuid"] = new_u
+                        seen_uuids.add(new_u)
+                        break
+            else:
+                seen_uuids.add(u)
 
         placeholders = ", ".join(["?"] * len(cols))
         insert_sql = f"INSERT INTO gpkg_records ({', '.join(cols)}) VALUES ({placeholders})"
 
         with self._get_gpkg_connection() as conn:
             cur = conn.cursor()
-            if replace:
-                cur.execute("DELETE FROM gpkg_records")
-                conn.commit()
-
             batch_size = 5000
             total_recs = len(all_records)
             for i in range(0, total_recs, batch_size):
@@ -4196,8 +4228,8 @@ class POPCENDatabase:
     def deduplicate_gpkg_map_uuids(self) -> int:
         """
         Scans gpkg_records for duplicate map_uuid values.
-        When duplicates are found, checks the ea_type for Delineated values
-        and updates them with a new UUID to prevent duplicates.
+        The 1st occurrence keeps its original map_uuid.
+        The 2nd (and subsequent) duplicate occurrences are updated with a new unique uuid.uuid4() for QGIS.
         Returns the number of records updated.
         """
         import uuid
@@ -4206,7 +4238,7 @@ class POPCENDatabase:
             cur.execute("""
                 SELECT map_uuid, COUNT(*) as cnt
                 FROM gpkg_records
-                WHERE map_uuid IS NOT NULL AND map_uuid != ''
+                WHERE map_uuid IS NOT NULL AND map_uuid != '' AND LOWER(map_uuid) NOT IN ('nan', 'none', 'null')
                 GROUP BY map_uuid
                 HAVING cnt > 1
             """)
@@ -4214,24 +4246,23 @@ class POPCENDatabase:
             if not dup_uuids:
                 return 0
 
+            # Gather all existing map_uuid values to guarantee newly generated UUIDs are 100% unique
+            cur.execute("SELECT DISTINCT map_uuid FROM gpkg_records WHERE map_uuid IS NOT NULL AND map_uuid != ''")
+            all_existing_uuids = {str(r[0]).strip() for r in cur.fetchall()}
+
             updates = []
             for u in dup_uuids:
-                cur.execute("SELECT id, geocode, ean, ea_type, remarks FROM gpkg_records WHERE map_uuid = ? ORDER BY id", (u,))
-                rows = [dict(r) for r in cur.fetchall()]
-
-                delin_rows = []
-                other_rows = []
-                for r in rows:
-                    ea_t = str(r.get("ea_type") or "").strip().upper()
-                    rem = str(r.get("remarks") or "").strip().lower()
-                    if "DELIN" in ea_t or "delineat" in rem or "split" in ea_t or "split" in rem:
-                        delin_rows.append(r)
-                    else:
-                        other_rows.append(r)
-
-                target_rows = delin_rows if other_rows else delin_rows[1:]
-                for r in target_rows:
-                    updates.append((str(uuid.uuid4()), r["id"]))
+                cur.execute("SELECT id FROM gpkg_records WHERE map_uuid = ? ORDER BY id ASC", (u,))
+                rows = cur.fetchall()
+                # rows[0] is the 1st occurrence -> keep original
+                # rows[1:] are the 2nd and subsequent duplicates -> change to new unique UUID
+                for r in rows[1:]:
+                    while True:
+                        new_uuid = str(uuid.uuid4())
+                        if new_uuid not in all_existing_uuids:
+                            all_existing_uuids.add(new_uuid)
+                            updates.append((new_uuid, r[0]))
+                            break
 
             if updates:
                 cur.executemany("UPDATE gpkg_records SET map_uuid = ? WHERE id = ?", updates)
@@ -4349,14 +4380,20 @@ class POPCENDatabase:
             results["summary"] = val_out.get("summary", [])
             results["issues_by_rule"] = val_out.get("issues_by_rule", {})
 
-            # 2. Count geocodes and files
+            # 2. Count geocodes, map_uuids, and files
             import collections
             gc_map = collections.defaultdict(list)
+            uuid_map = collections.defaultdict(list)
             for r in rows:
                 gc = str(r.get("geocode") or "").strip()
                 gc_map[gc].append(r)
+                u = str(r.get("map_uuid") or r.get("uuid") or "").strip()
+                if u and u.lower() not in ("nan", "none", "null"):
+                    uuid_map[u].append(r)
 
             results["unique_geocodes"] = len([gc for gc in gc_map if gc])
+            dup_uuid_count = len([u for u, rlist in uuid_map.items() if len(rlist) > 1])
+            results["duplicate_map_uuids"] = dup_uuid_count
 
             # Attribute conflict detection
             conflict_geocodes = set()
@@ -4407,6 +4444,9 @@ class POPCENDatabase:
                 if r_nt:
                     details.append(r_nt)
 
+                m_uuid = str(r.get("map_uuid") or r.get("uuid") or "").strip()
+                is_dup_uuid = bool(m_uuid and m_uuid.lower() not in ("nan", "none", "null") and len(uuid_map.get(m_uuid, [])) > 1)
+
                 if is_invalid_gc:
                     st = "INVALID_GEOCODE"
                     details.append("Geocode is empty or malformed (<9 chars)")
@@ -4415,6 +4455,11 @@ class POPCENDatabase:
                     st = "NO_GEOMETRY"
                     details.append("Feature lacks valid geometry or has empty polygon")
                     missing_geom_cnt += 1
+                elif is_dup_uuid:
+                    st = "DUPLICATE_MAP_UUID"
+                    u_cnt = len(uuid_map[m_uuid])
+                    if "dup_map_uuid" not in r_nt:
+                        details.append(f"[dup_map_uuid] map_uuid '{m_uuid}' duplicated across {u_cnt} features")
                 elif gc in conflict_geocodes:
                     st = "CONFLICTING_DATA"
                     details.append(f"Attribute mismatch across duplicates ({conflict_notes.get(gc, '')})")
@@ -4441,7 +4486,7 @@ class POPCENDatabase:
             results["missing_geometry"] = missing_geom_cnt
             results["invalid_geocodes"] = invalid_gc_cnt
 
-            if results["cross_file_overlaps"] > 0 or results["attribute_conflicts"] > 0:
+            if results["cross_file_overlaps"] > 0 or results["attribute_conflicts"] > 0 or dup_uuid_count > 0:
                 results["status_level"] = "OVERLAPS_FOUND"
             elif results["multipart_geocodes"] > 0 or missing_geom_cnt > 0 or invalid_gc_cnt > 0 or results["errors"] > 0 or results["warnings"] > 0:
                 results["status_level"] = "WARNING"
@@ -4643,6 +4688,8 @@ class POPCENDatabase:
                 conditions.append("(consistency_status NOT IN ('UNIQUE', 'PASS') OR consistency_detail LIKE '%[%]%')")
             elif issue_filter == "Cross-File Overlaps Only":
                 conditions.append("consistency_status IN ('CROSS_FILE_DUP', 'CONFLICTING_DATA') AND file_count > 1")
+            elif "duplicate map_uuid" in issue_filter.lower() or "dup_map_uuid" in issue_filter.lower() or issue_filter == "Duplicate map_uuid Only":
+                conditions.append("(consistency_status = 'DUPLICATE_MAP_UUID' OR consistency_detail LIKE '%dup_map_uuid%' OR consistency_detail LIKE '%map_uuid%')")
             elif issue_filter == "Intra-File Multipart Only":
                 conditions.append("consistency_status = 'MULTIPART_PARTS'")
             elif issue_filter == "Conflicting Data Only":
@@ -5629,6 +5676,223 @@ class POPCENDatabase:
         df = pd.DataFrame(data, columns=headers)
         df.to_csv(out_csv, index=False, encoding="utf-8")
 
+    def load_records_from_exported_gpkg(
+        self,
+        gpkg_path: str,
+        city_mun: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Reads features directly from the exported final data GeoPackage.
+        Enriches each feature with baseline 2024 EARF/POPCEN data from the database
+        (matching by map_uuid, ea_geocode, or (bgy_geocode, ean)) while strictly
+        preserving 100% of the exported GeoPackage's polygon features and attributes.
+        """
+        if not gpkg_path or not os.path.exists(gpkg_path):
+            return []
+
+        import sqlite3
+
+        raw_rows = []
+        try:
+            with sqlite3.connect(gpkg_path) as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT table_name FROM gpkg_contents WHERE LOWER(data_type) IN ('features', 'vector')")
+                tbl_rows = cur.fetchall()
+                if not tbl_rows:
+                    cur.execute("SELECT table_name FROM gpkg_geometry_columns")
+                    tbl_rows = cur.fetchall()
+
+                if not tbl_rows:
+                    return []
+
+                table_name = tbl_rows[0][0]
+                cur.execute(f'PRAGMA table_info("{table_name}")')
+                cols = [r[1] for r in cur.fetchall()]
+
+                # Exclude binary geometry column from selection to maximize performance
+                geom_cols = {"geom", "geometry", "the_geom", "shape"}
+                select_cols = [c for c in cols if c.lower() not in geom_cols]
+                cols_str = ', '.join([f'"{c}"' for c in select_cols])
+
+                cur.execute(f'SELECT {cols_str} FROM "{table_name}"')
+                for r in cur.fetchall():
+                    raw_rows.append(dict(zip(select_cols, r)))
+        except Exception:
+            return []
+
+        if not raw_rows:
+            return []
+
+        # Load database records for 2024 baseline enrichment
+        db_rows = []
+        try:
+            db_rows, _ = self.query_matched_records(
+                city_mun=city_mun,
+                limit=1000000,
+                offset=0,
+            )
+        except Exception:
+            db_rows = []
+
+        db_by_uuid = {}
+        db_by_ea_gc = {}
+        db_by_bgy_final_ean = {}
+        db_by_bgy_orig_ean = {}
+        db_by_bgy_prelim_ean = {}
+
+        for r in db_rows:
+            u = str(r.get("map_uuid") or "").strip()
+            if u:
+                db_by_uuid[u] = r
+            egc = str(r.get("ea_geocode") or r.get("geocode") or "").strip()
+            if egc:
+                db_by_ea_gc[egc] = r
+
+            gc = str(r.get("geocode") or "").strip()
+            p = str(r.get("province_code") or (gc[:3] if len(gc) >= 3 else "")).zfill(3)
+            m = str(r.get("city_mun_code") or (gc[3:5] if len(gc) >= 5 else "")).zfill(2)
+            b = str(r.get("barangay_code") or (gc[5:8] if len(gc) >= 8 else "")).zfill(3)
+            bgy = f"{p}{m}{b}"
+
+            fean = str(r.get("recoded_ean") or r.get("final_ean") or "").strip()
+            if fean:
+                fean = fean.zfill(6) if fean.isdigit() and len(fean) < 6 else fean
+                db_by_bgy_final_ean[(bgy, fean)] = r
+
+            oean = str(r.get("ean") or "").strip()
+            if oean:
+                oean = oean.zfill(6) if oean.isdigit() and len(oean) < 6 else oean
+                db_by_bgy_orig_ean[(bgy, oean)] = r
+
+            pean = str(r.get("new_enumeration_area_code") or r.get("new_ean") or r.get("code") or "").strip()
+            if pean:
+                pean = pean.zfill(6) if pean.isdigit() and len(pean) < 6 else pean
+                db_by_bgy_prelim_ean[(bgy, pean)] = r
+
+        output_records = []
+        for d in raw_rows:
+            m_uuid = str(d.get("map_uuid") or "").strip()
+            ea_gc = str(d.get("ea_geocode") or "").strip()
+            bgy_gc = str(d.get("bgy_geocode") or "").strip()
+            p_code = str(d.get("province_code") or "").strip().zfill(3) if str(d.get("province_code") or "").strip() else ""
+            m_code = str(d.get("city_mun_code") or "").strip().zfill(2) if str(d.get("city_mun_code") or "").strip() else ""
+            b_code = str(d.get("barangay_code") or "").strip().zfill(3) if str(d.get("barangay_code") or "").strip() else ""
+
+            final_ean = to_whole_number_str(d.get("ean") or "").replace(".0", "").strip()
+            if final_ean.isdigit() and len(final_ean) < 6:
+                final_ean = final_ean.zfill(6)
+
+            code_val = to_whole_number_str(d.get("code") or "").replace(".0", "").strip()
+            if code_val.isdigit() and len(code_val) < 6:
+                code_val = code_val.zfill(6)
+
+            ea_type = str(d.get("ea_type") or "RETAINED").strip().upper()
+            if "MERG" in ea_type:
+                ea_type = "MERGED"
+            elif "SPLIT" in ea_type or "DELIN" in ea_type or "RESET" in ea_type:
+                ea_type = "DELINEATED"
+            elif "RETAIN" in ea_type:
+                ea_type = "RETAINED"
+
+            hhcount = to_whole_number_str(d.get("hhcount") or "").replace(".0", "").strip()
+            bldgcount = to_whole_number_str(d.get("bldgcount") or "").replace(".0", "").strip()
+            sy = str(d.get("sy") or ("2024" if ea_type == "RETAINED" else "2026")).replace(".0", "").strip()
+            remarks = str(d.get("remarks") or "").strip()
+            name_val = str(d.get("name") or (f"EA {final_ean}" if final_ean else "EA")).strip()
+
+            reg_code = to_whole_number_str(d.get("region_code") or "").replace(".0", "").strip()
+            reg_name = str(d.get("region") or "").strip()
+            prov_name = str(d.get("province") or "").strip()
+            mun_name = str(d.get("city_mun") or "").strip()
+            brgy_name = str(d.get("barangay") or "").strip()
+
+            if not bgy_gc and (p_code and m_code and b_code):
+                bgy_gc = f"{p_code}{m_code}{b_code}"
+            if not ea_gc and bgy_gc and final_ean:
+                ea_gc = f"{bgy_gc}{final_ean}"
+
+            # Match with DB for 2024 EARF baseline info
+            matched_db = None
+            if m_uuid and m_uuid in db_by_uuid:
+                matched_db = db_by_uuid[m_uuid]
+            elif ea_gc and ea_gc in db_by_ea_gc:
+                matched_db = db_by_ea_gc[ea_gc]
+            elif (bgy_gc, final_ean) in db_by_bgy_final_ean:
+                matched_db = db_by_bgy_final_ean[(bgy_gc, final_ean)]
+            elif (bgy_gc, code_val) in db_by_bgy_prelim_ean:
+                matched_db = db_by_bgy_prelim_ean[(bgy_gc, code_val)]
+            elif (bgy_gc, final_ean) in db_by_bgy_orig_ean:
+                matched_db = db_by_bgy_orig_ean[(bgy_gc, final_ean)]
+
+            orig_2024_ea = ""
+            if matched_db:
+                orig_2024_ea = to_whole_number_str(matched_db.get("ean") or "").replace(".0", "").strip()
+            if not orig_2024_ea:
+                if ea_type == "RETAINED":
+                    orig_2024_ea = final_ean
+                elif code_val and code_val.isdigit() and len(code_val) >= 3:
+                    orig_2024_ea = f"{int(code_val[:3]):03d}000"
+                elif final_ean and final_ean.isdigit() and len(final_ean) >= 3:
+                    orig_2024_ea = f"{int(final_ean[:3]):03d}000"
+                else:
+                    orig_2024_ea = code_val or final_ean
+
+            if orig_2024_ea.isdigit() and len(orig_2024_ea) < 6:
+                orig_2024_ea = f"{int(orig_2024_ea):03d}000" if len(orig_2024_ea) <= 3 else f"{int(orig_2024_ea):06d}"
+
+            base_hh = ""
+            base_bldg = ""
+            if matched_db:
+                base_hh = to_whole_number_str(matched_db.get("no_of_households") or matched_db.get("popcen_households") or matched_db.get("household_count") or "").replace(".0", "").strip()
+                base_bldg = to_whole_number_str(matched_db.get("number_of_buildings") or matched_db.get("building_count") or "").replace(".0", "").strip()
+            elif ea_type == "RETAINED":
+                base_hh = hhcount
+                base_bldg = bldgcount
+
+            rec = {
+                "map_uuid": m_uuid,
+                "geocode": ea_gc or f"{bgy_gc}{final_ean}",
+                "ea_geocode": ea_gc or f"{bgy_gc}{final_ean}",
+                "bgy_geocode": bgy_gc,
+                "province_code": p_code,
+                "city_mun_code": m_code,
+                "barangay_code": b_code,
+                "ean": orig_2024_ea or final_ean,
+                "final_ean": final_ean,
+                "recoded_ean": final_ean,
+                "new_enumeration_area_code": code_val or (matched_db.get("new_enumeration_area_code") if matched_db else "") or final_ean,
+                "new_ean": code_val or final_ean,
+                "name": name_val,
+                "geographic_name": brgy_name or (matched_db.get("geographic_name") if matched_db else ""),
+                "areaname": brgy_name or (matched_db.get("areaname") if matched_db else ""),
+                "province": prov_name or (matched_db.get("province") if matched_db else ""),
+                "city_mun": mun_name or (matched_db.get("city_mun") if matched_db else ""),
+                "barangay": brgy_name or (matched_db.get("barangay") if matched_db else ""),
+                "region_code": reg_code or (matched_db.get("region_code") if matched_db else ""),
+                "region": reg_name or (matched_db.get("region") if matched_db else ""),
+                "no_of_households": base_hh,
+                "number_of_buildings": base_bldg,
+                "popcen_households": base_hh,
+                "household_count": hhcount,
+                "building_count": bldgcount,
+                "earf_household_count": hhcount,
+                "earf_building_count": bldgcount,
+                "ea_type": ea_type,
+                "ea_lifecycle": ea_type,
+                "source_year": sy,
+                "remarks": remarks,
+                "earf_remarks": remarks,
+                "in_popcen": matched_db.get("in_popcen", 1) if matched_db else 1,
+                "in_earf": 1,
+                "in_gpkg": 1,
+                "has_geometry": 1,
+                "from_exported_gpkg": True,
+            }
+            output_records.append(rec)
+
+        output_records.sort(key=lambda r: str(r.get("ea_geocode") or r.get("geocode") or "").strip())
+        return output_records
+
     def export_filtered_matched_to_pcd_excel(
         self,
         out_excel: str,
@@ -5637,32 +5901,78 @@ class POPCENDatabase:
         ea_lifecycle: Optional[str] = None,
         discrepancy_only: bool = False,
         city_mun: Optional[str] = None,
+        out_gpkg_path: Optional[str] = None,
     ):
         """
         Exports filtered matched records to the PCD deliverable (<pppmm>_earf2026_PCD.xlsx).
+        Strictly based on the exported final data GeoPackage when available.
         - RETAINED: 100% kept.
         - DELINEATED / SPLIT: 100% kept (all subdivided parts).
-        - MERGED: Absorbed partner rows are excluded, retaining only the primary survivor.
+        - MERGED: Surviving consolidated polygon EA record is kept.
         """
-        rows, _ = self.query_matched_records(
-            search=search,
-            status=status,
-            ea_lifecycle=ea_lifecycle,
-            discrepancy_only=discrepancy_only,
-            city_mun=city_mun,
-            limit=1000000,
-            offset=0,
-        )
-        if not rows:
-            return
+        target_gpkg = None
+        if out_gpkg_path and os.path.exists(out_gpkg_path):
+            target_gpkg = out_gpkg_path
+        elif out_excel:
+            parent_dir = os.path.dirname(out_excel)
+            if parent_dir and os.path.exists(parent_dir):
+                base_excel = os.path.basename(out_excel)
+                pppmm = base_excel.split("_")[0] if "_" in base_excel else ""
+                candidates = []
+                if pppmm:
+                    candidates.extend([
+                        os.path.join(parent_dir, f"{pppmm}_ea2026.gpkg"),
+                        os.path.join(parent_dir, f"{pppmm}_earf2026.gpkg"),
+                        os.path.join(parent_dir, f"{pppmm}_final_data.gpkg"),
+                    ])
+                try:
+                    for f in os.listdir(parent_dir):
+                        if f.endswith(".gpkg") and not f.startswith("consolidated_"):
+                            if pppmm and pppmm in f:
+                                candidates.append(os.path.join(parent_dir, f))
+                except Exception:
+                    pass
+                for cand in candidates:
+                    if os.path.exists(cand):
+                        target_gpkg = cand
+                        break
 
-        pcd_rows = filter_pcd_records(rows)
+        pcd_rows = []
+        if target_gpkg and os.path.exists(target_gpkg):
+            try:
+                pcd_rows = self.load_records_from_exported_gpkg(target_gpkg, city_mun=city_mun)
+            except Exception:
+                pcd_rows = []
+
+        if not pcd_rows:
+            rows, _ = self.query_matched_records(
+                search=search,
+                status=status,
+                ea_lifecycle=ea_lifecycle,
+                discrepancy_only=discrepancy_only,
+                city_mun=city_mun,
+                limit=1000000,
+                offset=0,
+            )
+            if not rows:
+                return
+
+            pcd_rows = filter_pcd_records(rows)
+
         if not pcd_rows:
             return
 
         meta = None
         if city_mun and city_mun not in ("All Records", "All City/Mun", "All Uploaded City/Mun", ""):
             meta = self.get_citymun_hierarchy(city_mun)
+        elif pcd_rows:
+            p_c = pcd_rows[0].get("province_code")
+            m_c = pcd_rows[0].get("city_mun_code")
+            if p_c and m_c:
+                meta = self.get_citymun_hierarchy(f"{p_c}{m_c}")
+
+        # Strictly sort by geocode before generating PCD Excel
+        pcd_rows.sort(key=lambda r: str(r.get("ea_geocode") or r.get("geocode") or "").strip())
 
         export_matched_to_excel(pcd_rows, out_excel, metadata=meta)
 
@@ -5744,6 +6054,12 @@ class POPCENDatabase:
         )
         if not rows:
             return 0, 0
+
+        # Ensure Recoded Enumeration Area (Final EAN) is computed across all records
+        try:
+            compute_recoded_enumeration_areas(rows)
+        except Exception:
+            pass
 
         # Strict constraint: Do not create EAs in the GPKG that only exist in EARF or POPCEN.
         # Retain only physical records that actually belong to the GeoPackage.

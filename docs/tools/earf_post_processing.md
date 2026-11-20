@@ -77,7 +77,7 @@ Every geocode found in **any** source is kept; `match_status` says which sources
 
 ### Official GeoPackage Attribute Schema (20 Fields)
 
-The exported `<pppmm>_ea2026.gpkg` contains the original polygon geometries and the following 20 attribute fields (all numeric and code fields are strictly whole numbers with **no decimals**):
+The exported `<pppmm>_ea2026.gpkg` contains the exact polygon geometries directly from the input GeoPackage (100% geometry pass-through with zero alterations, zero deletions, and native layer CRS preserved) and the following 20 attribute fields (all numeric and code fields are strictly whole numbers with **no decimals**):
 
 | # | Field Name | Data Type | Example | Description |
 |---|---|---|---|---|
@@ -93,7 +93,7 @@ The exported `<pppmm>_ea2026.gpkg` contains the original polygon geometries and 
 | 10 | `province` | String | `Antique` | Full name of the Province |
 | 11 | `city_mun` | String | `Tibiao` | Full name of the City/Municipality |
 | 12 | `barangay` | String | `Poblacion` | Full name of the Barangay |
-| 13 | `name` | String | `EA 001000` | EA designation label matching the Final EAN (no decimals) |
+| 13 | `name` | String | `EA 001000` | EA designation label strictly formatted as `EA ` + `ean` matching the Final EAN (no decimals) |
 | 14 | `code` | String | `1004` | Cartographic category classification code (no decimals) |
 | 15 | `correspondence_geocode` | String | `00604015001000:b9f3d142-3a52...:2026` | Composite correspondence code: `ea_geocode:map_uuid:sy` (no decimals) |
 | 16 | `remarks` | String | `Delineated` | Cartographer notes and delineation remarks |

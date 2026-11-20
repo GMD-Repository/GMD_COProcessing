@@ -411,6 +411,13 @@ def analyze_gpkg_consistency(df: pd.DataFrame):
     gc_counts = df["geocode"].value_counts().to_dict()
     df["dup_count"] = df["geocode"].map(gc_counts).fillna(1).astype(int)
 
+    # Check duplicate map_uuid
+    uuid_col = next((c for c in df.columns if c.strip().lower() in ("map_uuid", "uuid")), None)
+    uuid_counts = {}
+    if uuid_col:
+        valid_uuids = df[df[uuid_col].notna() & (df[uuid_col].astype(str).str.strip() != "") & (~df[uuid_col].astype(str).str.lower().isin(["nan", "none", "null"]))][uuid_col].astype(str).str.strip()
+        uuid_counts = valid_uuids.value_counts().to_dict()
+
     file_col = "layer_source" if "layer_source" in df.columns else None
     if file_col:
         file_counts = df.groupby("geocode")[file_col].nunique().to_dict()
@@ -454,12 +461,18 @@ def analyze_gpkg_consistency(df: pd.DataFrame):
         is_missing_geom = (not geom or "No Geometry" in geom or "none" in geom.lower())
         is_invalid_gc = (not gc or len(gc) < 9 or not gc.isalnum())
 
+        row_u = str(row.get(uuid_col, "") or "").strip() if uuid_col else ""
+        is_dup_uuid = bool(row_u and row_u.lower() not in ("nan", "none", "null") and uuid_counts.get(row_u, 0) > 1)
+
         if is_invalid_gc:
             statuses.append("INVALID_GEOCODE")
             details.append("Geocode is empty or malformed (<9 chars)")
         elif is_missing_geom:
             statuses.append("NO_GEOMETRY")
             details.append("Feature lacks valid geometry or has empty polygon")
+        elif is_dup_uuid:
+            statuses.append("DUPLICATE_MAP_UUID")
+            details.append(f"[dup_map_uuid] map_uuid '{row_u}' is duplicated across {uuid_counts[row_u]} records")
         elif gc in conflict_geocodes:
             statuses.append("CONFLICTING_DATA")
             details.append(f"Attribute mismatch across duplicates ({conflict_notes.get(gc, '')})")
@@ -483,10 +496,11 @@ def analyze_gpkg_consistency(df: pd.DataFrame):
     attribute_conflicts = len(conflict_geocodes)
     missing_geom_cnt = int((df["consistency_status"] == "NO_GEOMETRY").sum())
     invalid_gc_cnt = int((df["consistency_status"] == "INVALID_GEOCODE").sum())
-    total_dup_rows = int((df["dup_count"] > 1).sum())
+    duplicate_map_uuids = len([u for u, cnt in uuid_counts.items() if cnt > 1])
+    total_dup_rows = int(((df["dup_count"] > 1) | (df["consistency_status"] == "DUPLICATE_MAP_UUID")).sum())
 
     status_level = "CLEAN"
-    if cross_file_overlaps > 0 or attribute_conflicts > 0:
+    if cross_file_overlaps > 0 or attribute_conflicts > 0 or duplicate_map_uuids > 0:
         status_level = "OVERLAPS_FOUND"
     elif multipart_geocodes > 0 or missing_geom_cnt > 0 or invalid_gc_cnt > 0:
         status_level = "WARNING"
@@ -512,6 +526,7 @@ def analyze_gpkg_consistency(df: pd.DataFrame):
         "total_features": total_features,
         "unique_geocodes": unique_geocodes,
         "total_duplicates": total_dup_rows,
+        "duplicate_map_uuids": duplicate_map_uuids,
         "cross_file_overlaps": cross_file_overlaps,
         "multipart_geocodes": multipart_geocodes,
         "attribute_conflicts": attribute_conflicts,
@@ -798,7 +813,7 @@ class GPKGConsistencyDialog(QDialog):
 
                 st = issue.get("status", "")
                 st_item = SmartTableWidgetItem(st)
-                if "CROSS_FILE" in st:
+                if "CROSS_FILE" in st or "UUID" in st:
                     st_item.setBackground(QColor("#fee2e2"))
                     st_item.setForeground(QColor("#b91c1c"))
                 elif "CONFLICT" in st:
@@ -1779,6 +1794,7 @@ class DeliverablesExportWorker(QThread):
                             status=status,
                             ea_lifecycle=ea_lifecycle,
                             city_mun=c_code,
+                            out_gpkg_path=out_gpkg,
                         )
 
                     task_res["success"] = True
@@ -4587,6 +4603,7 @@ class COProcessingDialog(QDialog):
             "All Records",
             "Passed (PASS)",
             "All Issues (Warnings & Errors)",
+            "Duplicate map_uuid Only",
             "Cross-File Overlaps Only",
             "Intra-File Multipart Only",
             "Missing Geometry Only",
@@ -4617,6 +4634,12 @@ class COProcessingDialog(QDialog):
         btn_run_consistency.setStyleSheet("font-weight: 600; color: #4338ca; background-color: #e0e7ff; border: 1px solid #c7d2fe; border-radius: 4px; padding: 4px 8px;")
         btn_run_consistency.clicked.connect(self._run_gpkg_consistency_dispatcher)
         filter_bar.addWidget(btn_run_consistency)
+
+        self.btn_resolve_duplicate_uuids = QPushButton("Resolve Duplicate UUIDs")
+        self.btn_resolve_duplicate_uuids.setToolTip("Change the 2nd (and subsequent) duplicate value of map_uuid using a unique UUID for QGIS, preserving the 1st occurrence")
+        self.btn_resolve_duplicate_uuids.setStyleSheet("font-weight: 600; color: #b45309; background-color: #fef3c7; border: 1px solid #fde68a; border-radius: 4px; padding: 4px 8px;")
+        self.btn_resolve_duplicate_uuids.clicked.connect(self._resolve_duplicate_gpkg_uuids)
+        filter_bar.addWidget(self.btn_resolve_duplicate_uuids)
 
         filter_bar.addWidget(QLabel("Page Size:"))
         self.cmb_gpkg_page_size = QComboBox()
@@ -7306,6 +7329,83 @@ class COProcessingDialog(QDialog):
         else:
             self._run_gpkg_consistency_check()
 
+    def _resolve_duplicate_gpkg_uuids(self):
+        """
+        Deduplicates map_uuid across GeoPackage records.
+        The 1st occurrence retains its original map_uuid.
+        The 2nd (and subsequent) duplicate occurrences are replaced with a newly generated,
+        guaranteed unique UUID for QGIS (uuid.uuid4()).
+        Works across both SQLite DB mode and in-memory DataFrame mode.
+        """
+        import uuid
+        is_db_mode = getattr(self, "cmb_gpkg_source_mode", None) is not None and self.cmb_gpkg_source_mode.currentIndex() == 0
+
+        updated_count = 0
+        if is_db_mode:
+            updated_count = self.db.deduplicate_gpkg_map_uuids()
+            if updated_count > 0:
+                self._fetch_and_render_gpkg_db_page()
+                self._load_gpkg_db_kpis()
+        else:
+            if not hasattr(self, "gpkg_df") or self.gpkg_df.empty:
+                QMessageBox.information(self, "No Records", "No GeoPackage records are currently loaded.")
+                return
+
+            uuid_col = next((c for c in self.gpkg_df.columns if c.strip().lower() in ("map_uuid", "uuid")), None)
+            if not uuid_col:
+                QMessageBox.information(self, "No UUID Column", "No 'map_uuid' column found in the loaded GeoPackage dataset.")
+                return
+
+            seen_uuids = set()
+            for val in self.gpkg_df[uuid_col].dropna():
+                u_str = str(val).strip()
+                if u_str and u_str.lower() not in ("nan", "none", "null"):
+                    seen_uuids.add(u_str)
+
+            processed_seen = set()
+            for idx in self.gpkg_df.index:
+                val = str(self.gpkg_df.at[idx, uuid_col] or "").strip()
+                if not val or val.lower() in ("nan", "none", "null"):
+                    while True:
+                        new_u = str(uuid.uuid4())
+                        if new_u not in seen_uuids:
+                            self.gpkg_df.at[idx, uuid_col] = new_u
+                            seen_uuids.add(new_u)
+                            updated_count += 1
+                            break
+                elif val in processed_seen:
+                    # 2nd or subsequent duplicate value: change using unique UUID for QGIS
+                    while True:
+                        new_u = str(uuid.uuid4())
+                        if new_u not in seen_uuids:
+                            self.gpkg_df.at[idx, uuid_col] = new_u
+                            seen_uuids.add(new_u)
+                            updated_count += 1
+                            break
+                else:
+                    processed_seen.add(val)
+
+            if updated_count > 0:
+                self.gpkg_df, summary = analyze_gpkg_consistency(self.gpkg_df)
+                self.gpkg_df._consistency_summary = summary
+                self._update_gpkg_kpis()
+                self._apply_gpkg_filters()
+
+        if updated_count > 0:
+            QMessageBox.information(
+                self,
+                "Duplicate UUIDs Resolved",
+                f"Successfully updated {updated_count:,} duplicate map_uuid value(s) using unique QGIS UUIDs.\n\n"
+                "The 1st occurrence of each map_uuid was preserved, while the 2nd and subsequent "
+                "duplicates were assigned newly generated unique UUIDs."
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "No Duplicate UUIDs",
+                "All map_uuid values in the dataset are already unique. No records needed modification."
+            )
+
     def _fetch_and_render_gpkg_db_page(self):
         search_txt = self.search_gpkg.text().strip()
         issue_filter = self.cmb_gpkg_issue_filter.currentText()
@@ -7578,6 +7678,8 @@ class COProcessingDialog(QDialog):
             issue_filter = self.cmb_gpkg_issue_filter.currentText()
             if "Any Issue" in issue_filter:
                 df = df[df["consistency_status"] != "UNIQUE"]
+            elif "Duplicate map_uuid" in issue_filter or "dup_map_uuid" in issue_filter:
+                df = df[(df["consistency_status"] == "DUPLICATE_MAP_UUID") | df["consistency_detail"].astype(str).str.contains(r"dup_map_uuid|map_uuid", case=False, na=False)]
             elif "Cross-File Overlaps" in issue_filter:
                 df = df[df["consistency_status"].isin(["CROSS_FILE_DUP", "CONFLICTING_DATA"]) & (df["file_count"] > 1)]
             elif "Multipart" in issue_filter:
@@ -7588,6 +7690,11 @@ class COProcessingDialog(QDialog):
                 df = df[df["consistency_status"] == "NO_GEOMETRY"]
             elif "Unique" in issue_filter:
                 df = df[df["consistency_status"] == "UNIQUE"]
+            elif "[" in issue_filter and "]" in issue_filter:
+                rule_match = re.search(r"\[([a-zA-Z0-9_]+)\]", issue_filter)
+                if rule_match:
+                    r_code = rule_match.group(1)
+                    df = df[df["consistency_detail"].astype(str).str.contains(rf"\[{r_code}\]", case=False, na=False)]
 
         # EA type filter
         ea_type_filter = self.cmb_gpkg_type_filter.currentText()
@@ -7848,6 +7955,21 @@ class COProcessingDialog(QDialog):
                         item.setText("INVALID CODE")
                         item.setBackground(QColor("#f1f5f9"))
                         item.setForeground(QColor("#475569"))
+                    elif "UUID" in v_up:
+                        item.setText("DUP MAP_UUID")
+                        item.setBackground(QColor("#fee2e2"))
+                        item.setForeground(QColor("#b91c1c"))
+                elif col_low in ("map_uuid", "uuid"):
+                    u_val = str(val).strip()
+                    c_det = str(row.get("consistency_detail", "") or "")
+                    c_st = str(row.get("consistency_status", "") or "").upper()
+                    if u_val and (("dup_map_uuid" in c_det) or ("DUPLICATE_MAP_UUID" in c_st) or ("UUID" in c_st and "DUP" in c_st)):
+                        font = item.font()
+                        font.setBold(True)
+                        item.setFont(font)
+                        item.setBackground(QColor("#fee2e2"))
+                        item.setForeground(QColor("#b91c1c"))
+                        item.setToolTip(f"Duplicate map_uuid: '{u_val}' is shared across multiple features")
                 elif "dup_count" in col_low:
                     try:
                         d_cnt = int(row.get("dup_count", 1))
@@ -8258,6 +8380,8 @@ class COProcessingDialog(QDialog):
             act_remove = menu.addAction(f"🗑 Remove {checked_count:,} Checked Feature(s)")
         else:
             act_remove = menu.addAction("🗑 Remove This Feature")
+        menu.addSeparator()
+        act_fix_uuids = menu.addAction("🔑 Resolve Duplicate map_uuid Values")
 
         action = menu.exec_(self.table_gpkg.viewport().mapToGlobal(pos))
         if action == act_toggle:
@@ -8275,6 +8399,8 @@ class COProcessingDialog(QDialog):
                 if chk:
                     chk.setCheckState(Qt.Checked)
                 self._remove_selected_gpkg_records()
+        elif action == act_fix_uuids:
+            self._resolve_duplicate_gpkg_uuids()
 
     def _remove_selected_gpkg_records(self):
         """Permanently removes all checked GeoPackage features and cascades removal across POPCEN, EARF, and matching workspaces."""
