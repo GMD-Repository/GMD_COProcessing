@@ -2727,23 +2727,27 @@ class COProcessingDialog(QDialog):
             bldg_cnt_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.table_matching.setItem(row_idx, 18, bldg_cnt_item)
 
-            # 19: EA Type (Displayed based on GPKG / EARF)
-            ea_t_val = str(r.get("ea_type") or r.get("ea_lifecycle") or "").strip().upper()
+            # 19: EA Type (Displayed based on GPKG / EARF: strictly RETAINED, DELINEATED, or MERGED)
+            raw_ea_t = str(r.get("ea_type") or r.get("ea_lifecycle") or "").strip().upper()
+            if "DELIN" in raw_ea_t or "SPLIT" in raw_ea_t:
+                ea_t_val = "DELINEATED"
+            elif "MERG" in raw_ea_t:
+                ea_t_val = "MERGED"
+            else:
+                ea_t_val = "RETAINED"
+
             ea_t_item = SmartTableWidgetItem(ea_t_val)
             ea_t_item.setTextAlignment(Qt.AlignCenter)
-            if "RETAIN" in ea_t_val:
+            if ea_t_val == "RETAINED":
                 ea_t_item.setForeground(QColor("#15803d"))
-            elif "SPLIT" in ea_t_val or "DELIN" in ea_t_val or "RESET" in ea_t_val:
+            elif ea_t_val == "DELINEATED":
                 ea_t_item.setForeground(QColor("#1d4ed8"))
-            elif "MERG" in ea_t_val:
+            elif ea_t_val == "MERGED":
                 ea_t_item.setForeground(QColor("#b45309"))
             self.table_matching.setItem(row_idx, 19, ea_t_item)
 
-            # 20: Source Year
-            sy = str(r.get("source_year", "") or "").replace(".0", "")
-            if not sy:
-                ea_life = str(r.get("ea_lifecycle") or "").upper()
-                sy = "2024" if "RETAIN" in ea_life else "2026"
+            # 20: Source Year: 2024 for Retained, 2026 for Delineated/Merged
+            sy = "2024" if ea_t_val == "RETAINED" else "2026"
             sy_item = SmartTableWidgetItem(sy)
             sy_item.setFont(mono_font)
             sy_item.setTextAlignment(Qt.AlignCenter)
@@ -3220,12 +3224,16 @@ class COProcessingDialog(QDialog):
                     if bldg_cnt.lower() in ("nan", "none", "null"):
                         bldg_cnt = ""
                     ea_type_val = ea_t or lifecycle
-                    gpkg_ea_type = str(g_row.get("ea_type") or g_row.get("type") or g_row.get("code") or e_row.get("ea_type") or ea_type_val or "").strip().upper()
-                    if "SPLIT" in gpkg_ea_type:
+                    raw_gpkg_ea_type = str(g_row.get("ea_type") or g_row.get("type") or g_row.get("code") or e_row.get("ea_type") or ea_type_val or "").strip().upper()
+                    if "DELIN" in raw_gpkg_ea_type or "SPLIT" in raw_gpkg_ea_type:
                         gpkg_ea_type = "DELINEATED"
-                    src_year = to_whole_number_str(e_row.get("source_year") or g_row.get("sy") or "")
-                    if not src_year:
-                        src_year = "2024" if "RETAIN" in gpkg_ea_type.upper() else "2026"
+                        src_year = "2026"
+                    elif "MERG" in raw_gpkg_ea_type:
+                        gpkg_ea_type = "MERGED"
+                        src_year = "2026"
+                    else:
+                        gpkg_ea_type = "RETAINED"
+                        src_year = "2024"
                     e_remarks = str(e_row.get("remarks") or g_row.get("remarks") or "").strip()
 
                     rec = {
