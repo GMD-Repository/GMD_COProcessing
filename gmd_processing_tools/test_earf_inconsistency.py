@@ -25,7 +25,8 @@ Checks (same validation_id in both workbooks unless noted):
   null_new_ean    Delineated or Merged EA without a New EA Code
   null_remarks    EA flagged for delineation/merging in the household worksheet, kept Retained, no remarks
 
-Fixes (the template's "Recommended Action"; plan_fixes / apply_earf_fixes):
+Fixes (the template's "Recommended Action"; plan_fixes / apply_earf_fixes), only for the
+validation_ids ticked in the results table:
   dup_ea          extra copies deleted (first record kept)
   inv_ea_type     set to Retained
   inv_sy/null_sy  Source Year from the EA Type (after inv_ea_type)
@@ -594,13 +595,15 @@ def _first3(code6):
     return int(code6[:3]) if len(code6) == 6 and code6.isdigit() else None
 
 
-def plan_fixes(df, wb, hh_sum=None):
+def plan_fixes(df, wb, hh_sum=None, only=None):
     """
     The template's Recommended Actions as a list of changes; no file is touched.
 
     df: frame from gpkg_frame / read_earf; wb: 'gpkg' or 'earf'.
     hh_sum: building-point recount (sum of est_hhcount per EA) — GPKG {(layer_id, fid): n},
             EARF {final geocode: n}; None skips the household fixes.
+    only: the validation_ids to fix (None = every fixable one). A fix left out is skipped, so the later
+          fixes see the unfixed value (e.g. without inv_ea_type an invalid type gets no Source Year).
     Fixes run in order on a working copy, so each sees the earlier ones:
       dup_ea (delete copies) -> inv_ea_type -> inv_sy / null_sy -> inv_hhcount / null_hhcount
       -> null_new_ean (Delineated) -> dup_new_ean.
@@ -615,6 +618,9 @@ def plan_fixes(df, wb, hh_sum=None):
     w = df.copy()
     mother_col = "ean" if wb == "gpkg" else "ea"
 
+    def on(*cids):
+        return only is None or any(c in only for c in cids)
+
     def emit(cid, idx, field, old, new, action="set"):
         r = w.loc[idx]
         changes.append({"validation_id": cid, "action": action, "field": field, "old": old, "new": new,
@@ -622,7 +628,7 @@ def plan_fixes(df, wb, hh_sum=None):
                         **{k: r.get(k) for k in ("_fid", "_layer_id", "_path", "_sheet", "_xrow")}})
 
     # dup_ea: keep the first record of each identical group, delete the others
-    dup = w["_rowkey"].duplicated(keep="first")
+    dup = w["_rowkey"].duplicated(keep="first") & on("dup_ea")
     for idx in w.index[dup]:
         emit("dup_ea", idx, "", "", "", action="delete")
     w = w[~dup].copy()
@@ -630,18 +636,20 @@ def plan_fixes(df, wb, hh_sum=None):
     # inv_ea_type: anything else becomes Retained
     retained = "Retained" if _type_style(w["_ea_type_raw"]) == "title" else "RETAINED"
     t = w["ea_type"]
-    for idx in w.index[(t != "") & ~t.isin(VALID_TYPES)]:
+    for idx in w.index[(t != "") & ~t.isin(VALID_TYPES)] if on("inv_ea_type") else ():
         emit("inv_ea_type", idx, "ea_type", w.at[idx, "_ea_type_raw"], retained)
         w.at[idx, "ea_type"] = "RETAINED"
 
     # inv_sy / null_sy: Source Year from the (fixed) EA Type; a blank EA Type is left flagged
     exp = w["ea_type"].map(EXPECTED_SY)
     for idx in w.index[exp.notna() & (w["sy"] != exp.fillna(""))]:
+        if not on("null_sy" if w.at[idx, "sy"] == "" else "inv_sy"):
+            continue
         emit("null_sy" if w.at[idx, "sy"] == "" else "inv_sy", idx, "sy", w.at[idx, "sy"], exp[idx])
         w.at[idx, "sy"] = exp[idx]
 
     # inv_hhcount / null_hhcount: recount from the building points
-    if hh_sum is not None:
+    if hh_sum is not None and on("inv_hhcount", "null_hhcount"):
         hh = pd.to_numeric(w["hh_count"], errors="coerce")
         bl = pd.to_numeric(w["bldg_count"], errors="coerce")
         for idx in w.index[(w["hh_count"] == "") | (hh.notna() & bl.notna() & (hh == bl))]:
@@ -654,7 +662,7 @@ def plan_fixes(df, wb, hh_sum=None):
             if n is None:
                 continue
             new, old = str(int(round(n))), w.at[idx, "hh_count"]
-            if new == old:
+            if new == old or not on("null_hhcount" if old == "" else "inv_hhcount"):
                 continue
             emit("null_hhcount" if old == "" else "inv_hhcount", idx, "hh_count", old, new)
             w.at[idx, "hh_count"] = new
@@ -687,11 +695,11 @@ def plan_fixes(df, wb, hh_sum=None):
         w.at[idx, "new_ean"] = new
 
     blank = w[(w["ea_type"] == "DELINEATED") & (w["new_ean"] == "")]
-    for idx in blank.sort_values(["bgy8", mother_col], kind="mergesort").index:
+    for idx in blank.sort_values(["bgy8", mother_col], kind="mergesort").index if on("null_new_ean") else ():
         renumber("null_new_ean", idx, True)
     cand = (w["new_ean"] != "") & (w["ea_type"] != "MERGED")
     key = (w["bgy8"] + "|" + w["new_ean"]).where(cand)
-    for idx in w.index[cand & key.duplicated(keep="first")]:
+    for idx in w.index[cand & key.duplicated(keep="first")] if on("dup_new_ean") else ():
         renumber("dup_new_ean", idx, True)
 
     return pd.DataFrame(changes, columns=FIX_COLS)
@@ -819,7 +827,8 @@ def write_workbook(results, wb_key, path, plan=None, applied=False):
         elif ACTIONS[cid][1] is None:
             note = "flag only"
         else:
-            note = f"{fixed.get(cid, 0)} {status} automatically" if plan is not None else ""
+            note = (f"{fixed[cid]} {status} automatically" if cid in fixed
+                    else "not fixed automatically" if plan is not None else "")
         row = [cid, tab, title, desc, ACTIONS[cid][0], n if n is not None else "n/a", note]
         for j, v in enumerate(row, start=2):
             cell = ws.cell(row=i, column=j, value=v)
@@ -943,10 +952,13 @@ the <b>Sheet</b>. The spreadsheets do not need to be loaded in QGIS. These three
 <li>Optional: choose the <b>Building points</b> layer (a point layer with <code>est_hhcount</code>) so the
 household counts can be recounted. With <i>(none)</i>, the household checks are flagged only.</li>
 <li>Press <b>Run Check</b>. The table on the right shows each check, how many records it found, how many
-will be fixed automatically (<b>Auto-fix</b>) and the template's <b>Recommended Action</b>.</li>
-<li>Click a check to list its records below. Double-click a GeoPackage record to zoom to the EA. The
-<b>Planned Fixes</b> tab lists every change, with the old and new value.</li>
-<li>Press <b>Apply Fixes</b>. GeoPackage fixes go into the layer's edit session: review them on the map
+can be fixed automatically (<b>Auto-fix</b>) and the template's <b>Recommended Action</b>.</li>
+<li>Click a check to list its records below. Double-click a GeoPackage record to zoom to the EA.</li>
+<li>Nothing is fixed until you choose: tick the <b>Auto-fix</b> box of each validation_id to fix
+(GPKG and EARF rows are ticked separately). The <b>Planned Fixes</b> tab lists the changes of the ticked
+checks only, with the old and new value. Some fixes depend on others: Source Year is set from the EA Type,
+so an invalid EA Type gets a Source Year only when <code>inv_ea_type</code> is ticked too.</li>
+<li>Press <b>Apply Selected Fixes</b>. GeoPackage fixes go into the layer's edit session: review them on the map
 and in the attribute table, then <b>Save</b> (or <b>Roll Back</b>) the layer edits in QGIS. EARF fixes are
 saved to <code>&lt;EARF name&gt;_fixed.xlsx</code> in the output folder; the original is not changed.
 The tool then checks again (using the fixed EARF) so only what is left is listed.</li>
@@ -971,7 +983,7 @@ It is required: it gives <code>earf_missing_geo</code> and the subject flags use
 <table cellspacing="0" cellpadding="4" style="border-collapse:collapse; width:100%;">{_CHECK_HEAD}{_CHECK_ROWS}</table>
 
 <h3>Automatic fixes (Recommended Action)</h3>
-<p>The fixes run in this order, each on the result of the one before:</p>
+<p>Only the ticked validation_ids are fixed. They run in this order, each on the result of the one before:</p>
 <ol>
 <li><b>dup_ea</b>: the first record of each identical group is kept; the copies are deleted.</li>
 <li><b>inv_ea_type</b>: any EA Type other than Retained, Delineated or Merged becomes <b>Retained</b>
@@ -1021,9 +1033,9 @@ both workbooks, and the remarks column names the file(s) where it is Retained wi
 
 <h3>Output</h3>
 <p>Each workbook has a <b>Summary</b> sheet (frequency and Recommended Action of each check, with links;
-the remarks column says how many records were or will be fixed automatically, or <i>flag only</i>), one
+the remarks column says how many records were or will be fixed automatically, <i>not fixed automatically</i> when the check was not ticked, or <i>flag only</i>), one
 sheet per <code>validation_id</code> that found something, and a <b>fixes</b> sheet that lists every
-automatic change (old and new value). Exported after <b>Apply Fixes</b>, the frequencies are what is left
+automatic change (old and new value). Exported after <b>Apply Selected Fixes</b>, the frequencies are what is left
 and the fixes are listed as <i>fixed</i>. Checks with no inconsistency are left out of the
 results table and of the workbooks. The <b>remarks</b> column explains the problem. The file name starts with the
 city/municipality code (or the province code, or <i>combined</i>).</p>
@@ -1037,7 +1049,7 @@ city/municipality code (or the province code, or <i>combined</i>).</p>
 <code>est_hhcount</code> field.</li>
 <li><i>only .xlsx / .xlsm EARF files can be fixed</i>: save the EARF as .xlsx first.</li>
 <li><i>Cannot write the fixed EARF</i>: close the <code>_fixed.xlsx</code> in Excel and press
-<b>Apply Fixes</b> again.</li>
+<b>Apply Selected Fixes</b> again.</li>
 <li>Fixes in the GeoPackage are lost if the layer edits are rolled back or QGIS is closed without saving.</li>
 </ul>
 """
@@ -1228,7 +1240,10 @@ def make_dialog_class():
             self.results = None
             self.frames = (None, None, None)
             self.plans = {"gpkg": pd.DataFrame(columns=FIX_COLS), "earf": pd.DataFrame(columns=FIX_COLS)}
-            self.applied_plans = None   # the fixes last applied (listed as 'fixed' in the export)
+            self.applied_plans = None   # the fixes applied since the last Run Check (listed as 'fixed')
+            self.selected = set()       # (workbook, validation_id) ticked for fixing
+            self.fixable = {}           # workbook -> {validation_id: records that can be fixed}
+            self.hh_sums = {}
             self.dark = self.palette().color(self.palette().Window).lightness() < 128
             th = THEMES[self.dark]
 
@@ -1342,6 +1357,7 @@ def make_dialog_class():
             self.check_table.verticalHeader().setVisible(False)
             self.check_table.horizontalHeader().setStretchLastSection(True)
             self.check_table.itemSelectionChanged.connect(self.show_rows)
+            self.check_table.itemChanged.connect(self.fix_ticked)
             split.addWidget(self.check_table)
 
             lower = QtWidgets.QWidget()
@@ -1376,9 +1392,10 @@ def make_dialog_class():
             right.addWidget(split, 1)
 
             act = QtWidgets.QHBoxLayout()
-            self.apply_btn = QtWidgets.QPushButton("Apply Fixes")
+            self.apply_btn = QtWidgets.QPushButton("Apply Selected Fixes")
             self.apply_btn.setEnabled(False)
-            self.apply_btn.setToolTip("GeoPackage: the fixes go into the layer's edit session (review, then Save "
+            self.apply_btn.setToolTip("Fixes only the checks ticked in the Auto-fix column.\n"
+                                      "GeoPackage: the fixes go into the layer's edit session (review, then Save "
                                       "or Roll Back in QGIS).\nEARF: a '_fixed' copy is saved in the output "
                                       "folder; the original is not changed.")
             self.apply_btn.setStyleSheet("QPushButton { background:#2e7d32; color:white; font-weight:bold;"
@@ -1522,19 +1539,21 @@ def make_dialog_class():
                 if bldg is not None:
                     self.say(f"Recounting households from '{bldg.name()}' ({bldg_field(bldg)})…")
                     by_fid, by_geo = self._hh_sums(g, bldg)
-                self.plans = {"gpkg": plan_fixes(gpkg, "gpkg", by_fid), "earf": plan_fixes(earf, "earf", by_geo)}
-                n_fix = sum(len(p) for p in self.plans.values())
-                self.say(f"Planned fixes: GeoPackage {len(self.plans['gpkg'])}, EARF {len(self.plans['earf'])}"
-                         + ("" if bldg is not None else " (no building points: household counts flagged only)"))
+                self.hh_sums = {"gpkg": by_fid, "earf": by_geo}
+                # every possible fix, for the Auto-fix counts; nothing is selected yet
+                self.fixable = {wb: fix_counts(plan_fixes(f, wb, self.hh_sums[wb]))
+                                for wb, f in (("gpkg", gpkg), ("earf", earf))}
+                self.selected = set()
+                self.replan()
+                if bldg is None:
+                    self.say("No building points: household counts are flagged only.")
                 self.fill_check_table()
-                self.fill_fix_table()
                 total = sum(counts(self.results).values())
                 self.summary.setText(f"{total} inconsistent record(s) found in "
-                                     f"{sum(1 for v in counts(self.results).values() if v)} check(s), "
-                                     f"{n_fix} automatic fix(es) planned — {time.time() - t0:.1f}s. "
-                                     "Click a check to list its records.")
+                                     f"{sum(1 for v in counts(self.results).values() if v)} check(s) "
+                                     f"— {time.time() - t0:.1f}s. Click a check to list its records; tick "
+                                     "Auto-fix for the checks to fix, then press Apply Selected Fixes.")
                 self.export_btn.setEnabled(True)
-                self.apply_btn.setEnabled(n_fix > 0)
             except Exception as exc:
                 self.say(f"ERROR: {exc}")
                 self.say(traceback.format_exc())
@@ -1548,6 +1567,7 @@ def make_dialog_class():
         def fill_check_table(self):
             th = THEMES[self.dark]
             t = self.check_table
+            t.blockSignals(True)
             t.setRowCount(0)
             for wb, ids in (("gpkg", GPKG_IDS), ("earf", EARF_IDS)):
                 if not self.results[wb]:
@@ -1559,8 +1579,9 @@ def make_dialog_class():
                         continue   # no inconsistency: not listed
                     r = t.rowCount()
                     t.insertRow(r)
+                    can = self.fixable.get(wb, {}).get(cid, 0)
                     auto = ("flag only" if ACTIONS[cid][1] is None
-                            else str(fix_counts(self.plans.get(wb)).get(cid, 0)))
+                            else f"Fix {can}" if can else "0 (nothing to fix)")
                     vals = ["GPKG" if wb == "gpkg" else "EARF", cid, CHECK_INFO[cid][1],
                             "n/a" if n is None else str(n), auto, ACTIONS[cid][0].replace("\n", " "),
                             f"Not checked: {reason}" if reason else ""]
@@ -1572,9 +1593,41 @@ def make_dialog_class():
                         if c == 5:
                             it.setToolTip(ACTIONS[cid][0] + (f"\n\nAutomatic: {ACTIONS[cid][1]}"
                                                              if ACTIONS[cid][1] else ""))
+                        if c == 4 and can and n:
+                            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+                            it.setCheckState(Qt.Checked if (wb, cid) in self.selected else Qt.Unchecked)
+                            it.setToolTip(f"Tick to fix this check: {ACTIONS[cid][1]}.\nThe count assumes the "
+                                          "checks above it are fixed too (e.g. Source Year needs a valid EA "
+                                          "Type); the Planned Fixes tab shows what will really change.")
+                        else:
+                            it.setFlags(it.flags() & ~Qt.ItemIsUserCheckable)
                         t.setItem(r, c, it)
             t.resizeColumnsToContents()
             t.setColumnWidth(5, min(t.columnWidth(5), 320))
+            t.blockSignals(False)
+
+        def fix_ticked(self, item):
+            if item.column() != 4 or not (item.flags() & Qt.ItemIsUserCheckable):
+                return
+            key = item.data(Qt.UserRole)
+            if item.checkState() == Qt.Checked:
+                self.selected.add(key)
+            else:
+                self.selected.discard(key)
+            self.replan()
+
+        def replan(self):
+            """Plan only the ticked validation_ids (in the fix order, so the chain stays right)."""
+            gpkg, earf, _ = self.frames
+            self.plans = {}
+            for wb, frame in (("gpkg", gpkg), ("earf", earf)):
+                only = {cid for w, cid in self.selected if w == wb}
+                self.plans[wb] = (plan_fixes(frame, wb, self.hh_sums.get(wb), only=only) if only
+                                  else pd.DataFrame(columns=FIX_COLS))
+            n = sum(len(p) for p in self.plans.values())
+            self.fill_fix_table()
+            self.apply_btn.setText(f"Apply Selected Fixes ({n})" if n else "Apply Selected Fixes")
+            self.apply_btn.setEnabled(n > 0)
 
         def fill_fix_table(self):
             names = ["Workbook", "validation_id", "geocode", "action", "field", "old value", "new value", "ref"]
@@ -1661,7 +1714,9 @@ def make_dialog_class():
                 return
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
-            applied = {k: v for k, v in self.plans.items()}
+            prev = self.applied_plans or {}
+            applied = {wb: pd.concat([prev[wb], p], ignore_index=True) if wb in prev else p
+                       for wb, p in self.plans.items()}
             self.say("Re-checking with the fixes applied…")
             self.run(keep_applied=True)
             self.applied_plans = applied
