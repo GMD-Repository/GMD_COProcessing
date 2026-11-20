@@ -3,7 +3,7 @@ name: Release QGIS plugin
 # Two release channels, each with its own branch, version line and QGIS plugin repository URL:
 #
 #   Channel  Pushed / merged into  Version (tag)              Published to branch   Release type
-#   Beta     beta                  vX.Y.Z-beta.N              plugin-repo-beta      pre-release (experimental)
+#   Beta     dev                   vX.Y.Z-beta.N              plugin-repo-beta      pre-release (experimental)
 #   Stable   main                  vX.Y.Z                     plugin-repo           full release
 #
 # Versions:
@@ -18,11 +18,11 @@ name: Release QGIS plugin
 #   Beta:   https://raw.githubusercontent.com/<owner>/<repo>/plugin-repo-beta/plugins.xml
 #
 # Who can release is controlled by the branch rules on GitHub (see README.md > Contributing):
-# only the maintainer can merge into beta and main.
+# only the maintainer can merge into dev and main.
 
 on:
   push:
-    branches: [main, beta]
+    branches: [main, dev]
     paths-ignore: ["README.md", ".gitignore", ".gitattributes", "docs/**", ".claude/**", ".github/CODEOWNERS",
                    ".github/ISSUE_TEMPLATE/**", ".github/pull_request_template.md"]
   release:
@@ -71,7 +71,7 @@ jobs:
           if [ "${{ github.event_name }}" = "release" ]; then
             TAG="$RELEASE_TAG"
             PRERELEASE="$RELEASE_PRERELEASE"
-          elif [ "$BRANCH" = "beta" ]; then
+          elif [ "$BRANCH" = "dev" ]; then
             # Next stable version + -beta.N, N = number of betas of that version so far + 1
             N=$(git tag -l "v${NEXT}-beta.*" | grep -cE "^v${NEXT//./\\.}-beta\.[0-9]+$" || true)
             TAG="v${NEXT}-beta.$((N + 1))"
