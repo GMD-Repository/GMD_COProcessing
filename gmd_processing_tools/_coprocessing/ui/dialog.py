@@ -1794,6 +1794,7 @@ class DeliverablesExportWorker(QThread):
                             status=status,
                             ea_lifecycle=ea_lifecycle,
                             city_mun=c_code,
+                            out_gpkg_path=out_gpkg,
                         )
 
                     task_res["success"] = True
