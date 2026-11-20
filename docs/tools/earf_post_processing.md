@@ -72,5 +72,32 @@ Every geocode found in **any** source is kept; `match_status` says which sources
 
 - Matched GeoPackage layer (geometry from the EA GeoPackages where available), optional CSV mirror.
 - Final deliverables: `<pppmm>_ea2026.gpkg`, `<pppmm>_final_earf_<citymun>.xlsx`,
-  `<pppmm>_MIS_<citymun>.xlsx` — checked against the PSA output QA rules.
+  `<pppmm>_MIS_<citymun>.xlsx`, `<pppmm>_earf2026_PCD.xlsx` — checked against the PSA output QA rules.
 - Excel output summary and a duplicates report (CSV).
+
+### Official GeoPackage Attribute Schema (20 Fields)
+
+The exported `<pppmm>_ea2026.gpkg` contains the original polygon geometries and the following 20 attribute fields (all numeric and code fields are strictly whole numbers with **no decimals**):
+
+| # | Field Name | Data Type | Example | Description |
+|---|---|---|---|---|
+| 1 | `map_uuid` | String | `b9f3d142-3a52...` | Unique feature UUID (retained from input GPKG or generated) |
+| 2 | `ea_geocode` | String | `00604015001000` | Full 14-digit geocode built from `bgy_geocode` + **Final EAN** (no decimals) |
+| 3 | `bgy_geocode` | String | `00604015` | 8-digit Barangay PSGC code (no decimals) |
+| 4 | `province_code` | String | `006` | 3-digit zero-padded Province code (no decimals) |
+| 5 | `city_mun_code` | String | `04` | 2-digit zero-padded City/Municipality code (no decimals) |
+| 6 | `barangay_code` | String | `015` | 3-digit zero-padded Barangay code (no decimals) |
+| 7 | `ean` | String | `001000` | **Final EAN** (from Sub-tab 3 GeoPackage / Recoded EAN, 6 digits, no decimals) |
+| 8 | `region_code` | String | `06` | 2-digit zero-padded Region code (no decimals) |
+| 9 | `region` | String | `Western Visayas` | Full name of the Region |
+| 10 | `province` | String | `Antique` | Full name of the Province |
+| 11 | `city_mun` | String | `Tibiao` | Full name of the City/Municipality |
+| 12 | `barangay` | String | `Poblacion` | Full name of the Barangay |
+| 13 | `name` | String | `EA 001000` | EA designation label matching the Final EAN (no decimals) |
+| 14 | `code` | String | `1004` | Cartographic category classification code (no decimals) |
+| 15 | `correspondence_geocode` | String | `00604015001000:b9f3d142-3a52...:2026` | Composite correspondence code: `ea_geocode:map_uuid:sy` (no decimals) |
+| 16 | `remarks` | String | `Delineated` | Cartographer notes and delineation remarks |
+| 17 | `hhcount` | Integer | `145` | Reconciled household count for this EA (integer, no decimals) |
+| 18 | `bldgcount` | Integer | `132` | Reconciled building count for this EA (integer, no decimals) |
+| 19 | `ea_type` | String | `DELINEATED` | EA Lifecycle type: `RETAINED`, `DELINEATED`, or `MERGED` (any other value defaults to `RETAINED`) |
+| 20 | `sy` | String | `2026` | Source Year (strictly `2024` if `ea_type` is `RETAINED`; `2026` if `DELINEATED` or `MERGED`, no decimals) |

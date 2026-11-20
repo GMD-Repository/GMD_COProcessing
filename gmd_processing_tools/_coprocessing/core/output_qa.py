@@ -94,9 +94,9 @@ AUDIT_RULES = {
 }
 
 EXPECTED_GPKG_COLS = [
-    "fid", "ea_geocode", "map_uuid", "bgy_geocode", "province_code", "city_mun_code",
+    "fid", "map_uuid", "ea_geocode", "bgy_geocode", "province_code", "city_mun_code",
     "barangay_code", "ean", "region_code", "region", "province", "city_mun", "barangay",
-    "name", "code", "correspondence_geocode", "remarks", "hhcount", "bldgcount", "sy"
+    "name", "code", "correspondence_geocode", "remarks", "hhcount", "bldgcount", "ea_type", "sy"
 ]
 
 EXPECTED_FINAL_EARF_COLS_SHEET1 = [
