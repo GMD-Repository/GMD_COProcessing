@@ -42,6 +42,7 @@ TOOL_NAME = "[TEST] EARF Inconsistency Checks"
 TOOL_GROUP = "[TEST] EA Post-Processing"
 TOOL_ICON = "icons/earf_post_processing.svg"
 
+import math
 import os
 import re
 import sys
@@ -517,21 +518,23 @@ def run_checks(gpkg=None, earf=None, household=None, step=print):
                     hits.setdefault(g, []).append(name)
         where = pd.Series({g: ", ".join(v) for g, v in hits.items()}, dtype=str)
 
+    # geocodes each file has (final or 2024 code), for the missing-geocode remarks
+    in_gpkg = (set(gpkg["geocode"]) | set(gpkg["old_geocode"])) if gpkg is not None and not gpkg.empty else None
+    in_earf = (set(earf["geocode"]) | set(earf["final_geocode"])) if earf is not None and not earf.empty else None
+
     if gpkg is not None and not gpkg.empty:
         res = common_checks(gpkg, subject, "old_geocode", null_remarks_where=where)
         if household is not None and not household.empty:
             # 2024 household-worksheet EAs (GeoPackage's city/muns) with no GeoPackage record, by the
             # final geocode or the 2024 EA code; EAs the GeoPackage marks Merged are not missing.
-            have = set(gpkg["geocode"]) | set(gpkg["old_geocode"])
             scope = household[household["mun5"].isin(set(gpkg["mun5"]))]
-            miss = scope[~scope["geocode"].isin(have) & ~scope["geocode"].isin(merged)].copy()
+            miss = scope[~scope["geocode"].isin(in_gpkg) & ~scope["geocode"].isin(merged)].copy()
             for colname, key in (("region", "mun5"), ("province", "mun5"), ("city_mun", "mun5"),
                                  ("barangay", "bgy8")):
                 lut = gpkg[gpkg[colname] != ""].drop_duplicates(key).set_index(key)[colname]
                 miss[colname] = miss[key].map(lut).fillna("")
             miss["_fid"], miss["_layer_id"] = None, None
-            res["missing_geo"] = (miss, pd.Series("in the household worksheet (" + miss["ref"]
-                                                  + ") but not in the GeoPackage", index=miss.index))
+            res["missing_geo"] = (miss, missing_note(miss["geocode"], "GeoPackage", "EARF", in_earf))
         else:
             out["skipped"][("gpkg", "missing_geo")] = "no household worksheet ticked"
         if subject is None:
@@ -542,11 +545,9 @@ def run_checks(gpkg=None, earf=None, household=None, step=print):
     if earf is not None and not earf.empty:
         res = common_checks(earf, subject, "geocode", first_only_count=True, null_remarks_where=where)
         if household is not None and not household.empty:
-            in_earf = set(earf["geocode"]) | set(earf["final_geocode"])
             scope = household[household["mun5"].isin(set(earf["mun5"]))]
             miss = scope[~scope["geocode"].isin(in_earf) & ~scope["geocode"].isin(merged)].copy()
-            res["earf_missing_geo"] = (miss, pd.Series("in the household worksheet (" + miss["ref"]
-                                                       + ") but not in the EARF", index=miss.index))
+            res["earf_missing_geo"] = (miss, missing_note(miss["geocode"], "EARF", "GeoPackage", in_gpkg))
         else:
             out["skipped"][("earf", "earf_missing_geo")] = "no household worksheet ticked"
             out["skipped"][("earf", "null_remarks")] = "no household worksheet ticked"
@@ -555,6 +556,17 @@ def run_checks(gpkg=None, earf=None, household=None, step=print):
 
     step(f"Checks done in {time.time() - t0:.2f}s")
     return out
+
+
+def missing_note(geocodes, this, other, other_codes):
+    """'02011005003000 missing in the GeoPackage and in the EARF' / '... (found in the EARF)'."""
+    def one(g):
+        if other_codes is None:
+            return f"{g} missing in the {this}"
+        if g in other_codes:
+            return f"{g} missing in the {this} (found in the {other})"
+        return f"{g} missing in the {this} and in the {other}"
+    return pd.Series([one(g) for g in geocodes], index=geocodes.index, dtype=object)
 
 
 def _shape(rows, note, cid, wb):
@@ -569,10 +581,68 @@ def _shape(rows, note, cid, wb):
     for c, header in ids + vals:
         data[header] = rows[c] if c in rows.columns else ""
     data["remarks" if wb == "gpkg" else "Remarks"] = note
-    for extra in ("source", "ref", "_fid", "_layer_id"):
+    for extra in ("source", "ref", "_fid", "_layer_id", "_xrow"):
         data[extra] = rows[extra] if extra in rows.columns else None
+    data["_ea_type"] = rows["ea_type"] if "ea_type" in rows.columns else ""
+    data["_rowkey"] = rows["_rowkey"] if "_rowkey" in rows.columns else ""
     first = (ids[0][1])
     return pd.DataFrame(data).sort_values(first, kind="mergesort").reset_index(drop=True)
+
+
+NEW_EAN_IDS = ("null_new_ean", "dup_new_ean", "inv_new_ean")
+
+
+def _record_key(rec, wb):
+    if wb == "gpkg":
+        fid = rec.get("_fid")
+        return (rec.get("_layer_id"), int(fid)) if fid is not None and pd.notna(fid) else None
+    xr = rec.get("_xrow")   # one EARF file per run: the Excel row is enough
+    return int(xr) if xr is not None and pd.notna(xr) else None
+
+
+def annotate_new_ean(df, cid, wb, plan, ticked=(), applied=False):
+    """
+    Remarks of a New EA Code sheet with what happened to each record: the old and the new New EA Code and
+    the EADM explanation when it is (to be) fixed, or why it is not fixed.
+    Returns (annotated copy, mask of the records that are fixed by the plan).
+    """
+    if df is None or df.empty or cid not in NEW_EAN_IDS:
+        return df, pd.Series(False, index=getattr(df, "index", None), dtype=bool)
+    rcol = "remarks" if wb == "gpkg" else "Remarks"
+    fixes = {}
+    if plan is not None and len(plan):
+        p = plan[(plan["field"] == "new_ean") & (plan["validation_id"] == cid)]
+        for _, r in p.iterrows():
+            fixes[_record_key(r, wb)] = r
+    out = df.copy()
+    copies = out["_rowkey"].map(out["_rowkey"].value_counts()) if "_rowkey" in out.columns else None
+    status = "FIXED" if applied else "TO BE FIXED"
+    hit = []
+    notes = []
+    for i, rec in out.iterrows():
+        f = fixes.get(_record_key(rec, wb))
+        base = rec[rcol] or ""
+        if f is not None:
+            old = f["old"] or "(blank)"
+            notes.append(f"{base}. {status}: new_ean {old} -> {f['new']} ({f['reason']})")
+            hit.append(True)
+            continue
+        hit.append(False)
+        if cid == "inv_new_ean":
+            why = "not fixed: flag only, renumber manually"
+        elif cid == "null_new_ean" and str(rec.get("_ea_type", "")).upper() == "MERGED":
+            why = "not fixed: Merged EA, flag only (no numbering rule)"
+        elif cid not in ticked:
+            why = f"not fixed: {cid} not ticked"
+        elif cid == "dup_new_ean" and copies is not None and rec["_rowkey"] != "" and copies[i] > 1:
+            why = "not fixed: identical copy of another record (dup_ea); tick dup_ea to delete the copy"
+        elif cid == "dup_new_ean":
+            why = f"kept: first record with New EA Code {rec.get('new_ean') or rec.get('New EA Code')}"
+        else:
+            why = "not fixed: the EA code is not 6 digits or no EA number is left"
+        notes.append(f"{base}. {why}")
+    out[rcol] = notes
+    return out, pd.Series(hit, index=out.index, dtype=bool)
 
 
 def counts(results):
@@ -580,7 +650,7 @@ def counts(results):
 
 
 # ═════════════════════════════ fixes (Recommended Action) ═════════════════════════════
-FIX_COLS = ["validation_id", "action", "field", "old", "new", "geocode", "source", "ref",
+FIX_COLS = ["validation_id", "action", "field", "old", "new", "reason", "geocode", "source", "ref",
             "_fid", "_layer_id", "_path", "_sheet", "_xrow"]
 
 
@@ -621,9 +691,10 @@ def plan_fixes(df, wb, hh_sum=None, only=None):
     def on(*cids):
         return only is None or any(c in only for c in cids)
 
-    def emit(cid, idx, field, old, new, action="set"):
+    def emit(cid, idx, field, old, new, action="set", reason=""):
         r = w.loc[idx]
         changes.append({"validation_id": cid, "action": action, "field": field, "old": old, "new": new,
+                        "reason": reason,
                         "geocode": r["geocode"], "source": r.get("source"), "ref": r.get("ref"),
                         **{k: r.get(k) for k in ("_fid", "_layer_id", "_path", "_sheet", "_xrow")}})
 
@@ -661,7 +732,7 @@ def plan_fixes(df, wb, hh_sum=None, only=None):
             n = hh_sum.get(key)
             if n is None:
                 continue
-            new, old = str(int(round(n))), w.at[idx, "hh_count"]
+            new, old = str(math.ceil(round(n, 6))), w.at[idx, "hh_count"]   # rounded up: 168.963 -> 169
             if new == old or not on("null_hhcount" if old == "" else "inv_hhcount"):
                 continue
             emit("null_hhcount" if old == "" else "inv_hhcount", idx, "hh_count", old, new)
@@ -682,14 +753,23 @@ def plan_fixes(df, wb, hh_sum=None, only=None):
             return
         if keep_mother and m != "000000" and b + m not in taken:
             new = m
+            why = f"EADM: kept its own (mother) EA code {m}, which is not used yet in the barangay"
         else:
-            last[b] = last.get(b, 0) + 1
+            prev = last.get(b, 0)
+            last[b] = prev + 1
             if last[b] > 999:
                 return
-            new = f"{last[b]:03d}{'000' if m == '000000' else m[:3]}"
-        emit(cid, idx, "new_ean", w.at[idx, "new_ean"], new)
+            if m == "000000":
+                new = f"{last[b]:03d}000"
+                why = (f"EADM: the barangay's single EA 000000 is split; next EA number {last[b]:03d} "
+                       f"+ 000 = {new}")
+            else:
+                new = f"{last[b]:03d}{m[:3]}"
+                why = (f"EADM: next EA number after the barangay's last EA ({prev:03d}) is {last[b]:03d}, "
+                       f"followed by the mother EA {m[:3]} = {new}")
+        emit(cid, idx, "new_ean", w.at[idx, "new_ean"], new, reason=why)
         if wb == "gpkg":   # the GeoPackage geocode is barangay + New EA Code
-            emit(cid, idx, "geocode", w.at[idx, "geocode"], b + new)
+            emit(cid, idx, "geocode", w.at[idx, "geocode"], b + new, reason="geocode = barangay + New EA Code")
             w.at[idx, "geocode"] = b + new
         taken.add(b + new)
         w.at[idx, "new_ean"] = new
@@ -697,7 +777,8 @@ def plan_fixes(df, wb, hh_sum=None, only=None):
     blank = w[(w["ea_type"] == "DELINEATED") & (w["new_ean"] == "")]
     for idx in blank.sort_values(["bgy8", mother_col], kind="mergesort").index if on("null_new_ean") else ():
         renumber("null_new_ean", idx, True)
-    cand = (w["new_ean"] != "") & (w["ea_type"] != "MERGED")
+    # an identical copy of another record is a dup_ea case (deleted there), not renumbered
+    cand = (w["new_ean"] != "") & (w["ea_type"] != "MERGED") & ~w["_rowkey"].duplicated(keep=False)
     key = (w["bgy8"] + "|" + w["new_ean"]).where(cand)
     for idx in w.index[cand & key.duplicated(keep="first")] if on("dup_new_ean") else ():
         renumber("dup_new_ean", idx, True)
@@ -774,11 +855,13 @@ def fixed_copy_path(path, folder=None):
 
 
 # ═════════════════════════════ Excel output ═════════════════════════════
-def write_workbook(results, wb_key, path, plan=None, applied=False):
+def write_workbook(results, wb_key, path, plan=None, applied=False, ticked=(), fixed_rows=None):
     """Write one 'EA List of Inconsistencies' workbook in the template layout.
 
     plan: this workbook's fixes (plan_fixes); listed on a 'fixes' sheet and counted on the Summary.
     applied: whether those fixes were already applied (otherwise they are listed as planned).
+    ticked: the validation_ids selected for fixing (for the New EA Code remarks).
+    fixed_rows: {validation_id: rows already fixed (annotated)}, listed on top of the check's sheet.
     """
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -787,8 +870,9 @@ def write_workbook(results, wb_key, path, plan=None, applied=False):
     found = results[wb_key]
     skipped = results.get("skipped", {})
     # checks with no inconsistency are left out (a check that could not run is still listed)
+    fixed_rows = fixed_rows or {}
     ids = [cid for cid in (GPKG_IDS if wb_key == "gpkg" else EARF_IDS)
-           if (wb_key, cid) in skipped or len(found.get(cid, ()))]
+           if (wb_key, cid) in skipped or len(found.get(cid, ())) or len(fixed_rows.get(cid, ()))]
     head_font = Font(bold=True, color="FFFFFF")
     head_fill = PatternFill("solid", fgColor="1F4E78")
     zero_fill = PatternFill("solid", fgColor="E2EFDA")
@@ -856,7 +940,14 @@ def write_workbook(results, wb_key, path, plan=None, applied=False):
             df = _shape(pd.DataFrame(), pd.Series(dtype=str), cid, wb_key)
             if (wb_key, cid) in skipped:
                 sh["D2"] = f"Not checked: {skipped[(wb_key, cid)]}"
-        cols = [c for c in df.columns if c not in ("source", "ref", "_fid", "_layer_id")]
+        if cid in NEW_EAN_IDS:
+            df, _ = annotate_new_ean(df, cid, wb_key, plan, ticked, applied)
+            if len(fixed_rows.get(cid, ())):
+                df = pd.concat([fixed_rows[cid], df], ignore_index=True)
+                key = ["_layer_id", "_fid"] if wb_key == "gpkg" else ["_xrow"]
+                known = df[key].notna().all(axis=1)
+                df = df[~(known & df[key].astype(str).duplicated(keep="first"))]   # a record listed once
+        cols = [c for c in df.columns if c not in ("source", "ref") and not str(c).startswith("_")]
         widths = [18 if i == 0 else (40 if c.lower() == "remarks" else 16) for i, c in enumerate(cols)]
         header(sh, cols, widths)
         for r, values in enumerate(df[cols].itertuples(index=False, name=None), start=4):
@@ -873,14 +964,14 @@ def write_workbook(results, wb_key, path, plan=None, applied=False):
         sh["A1"].font = Font(bold=True, size=13)
         sh["B2"] = '=HYPERLINK("#\'Summary\'!A1","< Summary")'
         sh["B2"].font = Font(color="0563C1", underline="single")
-        names = ["validation_id", "geocode", "action", "field", "old value", "new value", "ref"]
-        header(sh, names, [18, 18, 10, 14, 18, 18, 14])
+        names = ["validation_id", "geocode", "action", "field", "old value", "new value", "ref", "explanation"]
+        header(sh, names, [18, 18, 10, 14, 18, 18, 14, 60])
         for r, rec in enumerate(plan.itertuples(index=False), start=4):
-            vals = [rec.validation_id, rec.geocode, rec.action, rec.field, rec.old, rec.new, rec.ref]
+            vals = [rec.validation_id, rec.geocode, rec.action, rec.field, rec.old, rec.new, rec.ref, rec.reason]
             for j, v in enumerate(vals, start=2):
                 cell = sh.cell(row=r, column=j, value=None if v is None or v == "" else str(v))
                 cell.border, cell.number_format = box, "@"
-        sh.auto_filter.ref = f"B3:H{len(plan) + 3}"
+        sh.auto_filter.ref = f"B3:I{len(plan) + 3}"
     wb.save(path)
     return path
 
@@ -958,11 +1049,14 @@ can be fixed automatically (<b>Auto-fix</b>) and the template's <b>Recommended A
 (GPKG and EARF rows are ticked separately). The <b>Planned Fixes</b> tab lists the changes of the ticked
 checks only, with the old and new value. Some fixes depend on others: Source Year is set from the EA Type,
 so an invalid EA Type gets a Source Year only when <code>inv_ea_type</code> is ticked too.</li>
+<li>Choose the <b>Output folder</b> and press <b>Export Excel</b>. This is required before fixing: the
+workbooks keep a record of the records as they were and of the planned fixes. If you press
+<b>Apply Selected Fixes</b> without exporting, a popup asks you to export first (<b>Export Excel Now</b>).</li>
 <li>Press <b>Apply Selected Fixes</b>. GeoPackage fixes go into the layer's edit session: review them on the map
 and in the attribute table, then <b>Save</b> (or <b>Roll Back</b>) the layer edits in QGIS. EARF fixes are
 saved to <code>&lt;EARF name&gt;_fixed.xlsx</code> in the output folder; the original is not changed.
-The tool then checks again (using the fixed EARF) so only what is left is listed.</li>
-<li>Choose the <b>Output folder</b> and press <b>Export Excel</b>.</li>
+The tool then checks again (using the fixed EARF) so only what is left is listed. Export again to record
+what is left and the fixes made; each new check must be exported before its fixes are applied.</li>
 </ol>
 
 <h3>Inputs</h3>
@@ -991,7 +1085,8 @@ It is required: it gives <code>earf_missing_geo</code> and the subject flags use
 <li><b>inv_sy</b> / <b>null_sy</b>: Source Year from the EA Type: Retained = 2024, Delineated / Merged
 = 2026. A blank EA Type is left flagged.</li>
 <li><b>inv_hhcount</b> / <b>null_hhcount</b>: <code>hh_count</code> = the sum of <code>est_hhcount</code>
-of the building points inside the EA (a point on a shared boundary is counted once). The EARF row takes
+of the building points inside the EA, <b>rounded up</b> to a whole number (168.963 &rarr; 169). A point on a
+shared boundary is counted once. The EARF row takes
 the sum of the GeoPackage EA with the same final geocode. An EA with no building point is left flagged.</li>
 <li><b>null_new_ean</b> (Delineated EAs; Merged EAs stay flagged) and <b>dup_new_ean</b> (the first
 record keeps the code; the others are renumbered): the EADM rule. An EA keeps its own (mother) code when
@@ -999,8 +1094,22 @@ that code is free in the barangay. Otherwise it gets the next EA number after th
 barangay, followed by the mother's 3 digits: mother <code>005000</code>, last EA <code>009000</code>
 &rarr; <code>010005</code>. A barangay's single EA <code>000000</code> splits into <code>001000</code>,
 <code>002000</code>, and so on. In the GeoPackage the <code>geocode</code> is updated too (barangay + New
-EA Code).</li>
+EA Code). A repeated code on an identical copy of another record is not renumbered: it is a
+<code>dup_ea</code> case (tick <code>dup_ea</code> to delete the copy).</li>
 </ol>
+<p><b>New EA Code remarks</b> (<code>null_new_ean</code>, <code>dup_new_ean</code>, <code>inv_new_ean</code>):
+the remarks of each record say what happened to it, in the results table and in the exported sheet:</p>
+<ul>
+<li><i>TO BE FIXED</i> (before applying) or <i>FIXED</i> (after), with the old and the new New EA Code and
+the EADM explanation, e.g. <i>FIXED: new_ean (blank) -&gt; 008007 (EADM: next EA number after the
+barangay's last EA (007) is 008, followed by the mother EA 007 = 008007)</i>.</li>
+<li>Or why it is not fixed: not ticked, Merged EA (no numbering rule), <code>inv_new_ean</code> is flag
+only (renumber manually), an identical copy (<code>dup_ea</code>), or <i>kept</i> for the first record of a
+repeated code.</li>
+</ul>
+<p>Exported after <b>Apply Selected Fixes</b>, these sheets still list the records that were fixed (marked
+<i>FIXED</i>) above the ones that are left. The <b>fixes</b> sheet and the <b>Planned Fixes</b> tab have an
+<i>explanation</i> column too.</p>
 <p><code>missing_geo</code>, <code>earf_missing_geo</code>, <code>inv_new_ean</code>,
 <code>null_ea_count</code>, <code>null_ea_type</code> and <code>null_remarks</code> are flag only.
 The GeoPackage and the EARF are fixed separately, so check that renumbered codes agree in both.</p>
@@ -1021,6 +1130,9 @@ merged parts can share the code they merge into.</li>
 city/municipalities present in the EARF.</li>
 <li>In both missing checks, an EA whose <code>ea_type</code> is <b>Merged</b> in the GeoPackage is not
 counted as missing, since it was merged into another EA.</li>
+<li>The remarks of both missing checks name the missing geocode and where it is missing, e.g.
+<i>02011009000000 missing in the GeoPackage (found in the EARF)</i> or <i>02011009000000 missing in the
+GeoPackage and in the EARF</i>.</li>
 <li><b>inv_sy</b>: Retained must be 2024; Delineated and Merged must be 2026.</li>
 <li><b>inv_hhcount</b> (EARF workbook): the Geocode column is the Preliminary EARF geocode,
 Prov+Mun+Brgy+New EA Code (or EA when blank).</li>
@@ -1242,6 +1354,9 @@ def make_dialog_class():
             self.plans = {"gpkg": pd.DataFrame(columns=FIX_COLS), "earf": pd.DataFrame(columns=FIX_COLS)}
             self.applied_plans = None   # the fixes applied since the last Run Check (listed as 'fixed')
             self.selected = set()       # (workbook, validation_id) ticked for fixing
+            self.exported = False       # Export Excel done since the last Run Check
+            self.applied_ticked = {}    # workbook -> validation_ids applied since the last Run Check
+            self.fixed_rows = {}        # workbook -> {validation_id: New EA Code records fixed (annotated)}
             self.fixable = {}           # workbook -> {validation_id: records that can be fixed}
             self.hh_sums = {}
             self.dark = self.palette().color(self.palette().Window).lightness() < 128
@@ -1510,8 +1625,10 @@ def make_dialog_class():
             return by_fid, by_geo
 
         def run(self, *_, keep_applied=False):
+            self.exported = False       # a new check must be exported before its fixes are applied
             if not keep_applied:
                 self.applied_plans = None
+                self.applied_ticked, self.fixed_rows = {}, {}
             g, e, h = (self.gpkg_list.ticked_layers(), self.earf_list.ticked_layers(),
                        self.hh_list.ticked_layers())
             missing = [name for name, lyr in (("EA GeoPackage", g), ("Preliminary EARF", e),
@@ -1626,13 +1743,16 @@ def make_dialog_class():
                                   else pd.DataFrame(columns=FIX_COLS))
             n = sum(len(p) for p in self.plans.values())
             self.fill_fix_table()
+            if self.results is not None:
+                self.show_rows()
             self.apply_btn.setText(f"Apply Selected Fixes ({n})" if n else "Apply Selected Fixes")
             self.apply_btn.setEnabled(n > 0)
 
         def fill_fix_table(self):
-            names = ["Workbook", "validation_id", "geocode", "action", "field", "old value", "new value", "ref"]
+            names = ["Workbook", "validation_id", "geocode", "action", "field", "old value", "new value", "ref",
+                     "explanation"]
             rows = [("GPKG" if wb == "gpkg" else "EARF", r.validation_id, r.geocode, r.action, r.field,
-                     r.old, r.new, r.ref)
+                     r.old, r.new, r.ref, r.reason)
                     for wb in ("gpkg", "earf") for r in self.plans[wb].itertuples(index=False)]
             t = self.fix_table
             t.setRowCount(0)
@@ -1649,6 +1769,20 @@ def make_dialog_class():
             gp, ep = self.plans["gpkg"], self.plans["earf"]
             if gp.empty and ep.empty:
                 return
+            if not self.exported:
+                # keep a record of the inconsistencies (and the planned fixes) before anything changes
+                box = QtWidgets.QMessageBox(self)
+                box.setIcon(QtWidgets.QMessageBox.Warning)
+                box.setWindowTitle(DIALOG_TITLE)
+                box.setText("Export the Excel files first.")
+                box.setInformativeText("The List of Inconsistencies workbooks must be exported before the fixes "
+                                       "are applied, so there is a record of the records as they were and of "
+                                       "the planned fixes.")
+                export_btn = box.addButton("Export Excel Now", QtWidgets.QMessageBox.AcceptRole)
+                box.addButton(QtWidgets.QMessageBox.Cancel)
+                box.exec_()
+                if box.clickedButton() is not export_btn or not self.export():
+                    return
             folder = self.out_edit.text().strip()
             earf_src = ep["_path"].iloc[0] if not ep.empty else None
             earf_out = fixed_copy_path(earf_src, folder or None) if earf_src else None
@@ -1717,16 +1851,34 @@ def make_dialog_class():
             prev = self.applied_plans or {}
             applied = {wb: pd.concat([prev[wb], p], ignore_index=True) if wb in prev else p
                        for wb, p in self.plans.items()}
+            # New EA Code records fixed now: kept (marked FIXED) for the next export
+            for wb in ("gpkg", "earf"):
+                ticked = self.ticked(wb)
+                self.applied_ticked.setdefault(wb, set()).update(ticked)
+                for cid in NEW_EAN_IDS:
+                    ann, hit = annotate_new_ean(self.results[wb].get(cid), cid, wb, self.plans[wb], ticked,
+                                                applied=True)
+                    if ann is not None and hit.any():
+                        old = self.fixed_rows.setdefault(wb, {}).get(cid)
+                        rows = ann[hit].reset_index(drop=True)
+                        self.fixed_rows[wb][cid] = rows if old is None else pd.concat([old, rows],
+                                                                                      ignore_index=True)
             self.say("Re-checking with the fixes applied…")
             self.run(keep_applied=True)
             self.applied_plans = applied
+
+        def ticked(self, wb):
+            return {cid for w, cid in self.selected if w == wb}
 
         def current_df(self):
             items = self.check_table.selectedItems()
             if not items or self.results is None:
                 return None, None
             wb, cid = items[0].data(Qt.UserRole)
-            return wb, self.results[wb].get(cid)
+            df = self.results[wb].get(cid)
+            if cid in NEW_EAN_IDS:   # remarks say whether / how each record is (to be) renumbered
+                df, _ = annotate_new_ean(df, cid, wb, self.plans.get(wb), self.ticked(wb))
+            return wb, df
 
         def show_rows(self):
             wb, df = self.current_df()
@@ -1735,7 +1887,7 @@ def make_dialog_class():
             if df is None:
                 t.setColumnCount(0)
                 return
-            cols = [c for c in df.columns if c not in ("_fid", "_layer_id")]
+            cols = [c for c in df.columns if not str(c).startswith("_")]
             t.setColumnCount(len(cols))
             t.setHorizontalHeaderLabels([c.replace("\n", " ") for c in cols])
             t.setRowCount(len(df))
@@ -1772,10 +1924,11 @@ def make_dialog_class():
 
         def export(self):
             if self.results is None:
-                return
+                return False
             folder = self.out_edit.text().strip()
             if not folder:
-                return
+                QtWidgets.QMessageBox.warning(self, DIALOG_TITLE, "Choose the output folder first.")
+                return False
             os.makedirs(folder, exist_ok=True)
             prefix = output_prefix(self.frames)
             written = []
@@ -1784,17 +1937,21 @@ def make_dialog_class():
                     if self.results[wb]:
                         path = os.path.join(folder, f"{prefix}_EA List of Incons ({label}).xlsx")
                         if self.applied_plans is not None:
-                            write_workbook(self.results, wb, path, self.applied_plans[wb], applied=True)
+                            write_workbook(self.results, wb, path, self.applied_plans[wb], applied=True,
+                                           ticked=self.applied_ticked.get(wb, set()),
+                                           fixed_rows=self.fixed_rows.get(wb))
                         else:
-                            write_workbook(self.results, wb, path, self.plans[wb])
+                            write_workbook(self.results, wb, path, self.plans[wb], ticked=self.ticked(wb))
                         written.append(path)
                         self.say(f"Saved {path}")
             except PermissionError as exc:
                 QtWidgets.QMessageBox.critical(self, DIALOG_TITLE,
                                                f"Cannot write the file (is it open in Excel?)\n{exc}")
-                return
+                return False
             if written:
+                self.exported = True
                 QtWidgets.QMessageBox.information(self, DIALOG_TITLE, "Saved:\n" + "\n".join(written))
+            return bool(written)
 
     return Dialog
 
