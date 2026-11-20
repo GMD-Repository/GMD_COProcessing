@@ -20,7 +20,7 @@ from .script_registry import SCRIPTS_DIR, earf_icon, group_icon, grouped_scripts
 
 MENU_TITLE = "&GMD CO Processing"
 # Scripts listed directly under the GMD CO Processing menu instead of inside their group submenu
-TOP_LEVEL_SCRIPTS = ("mbi_coverage_selector.py", "national_mbi_checker.py", "test_earf_inconsistency.py")
+TOP_LEVEL_SCRIPTS = ("mbi_coverage_selector.py", "national_mbi_checker.py")
 HELP_URL ="https://github.com/GMD-Repository/GMD_COProcessing#readme"
 
 
@@ -133,13 +133,15 @@ class GMDCOProcessingPlugin:
                     top_level.append(script)
                 else:
                     in_group.append(script)
-            if not in_group:
-                continue
+            if not in_group and scripts:
+                continue  # every script in this group is shown at top level
             submenu = QMenu(group, self.menu)
             submenu.setIcon(group_icon(group))
             submenu.setToolTipsVisible(True)
             for script in in_group:
                 self._add_script_action(submenu, script)
+            if not scripts:
+                submenu.addAction("(no tools yet)").setEnabled(False)
             self._tool_actions.append(self.menu.insertMenu(self._tools_end, submenu))
 
         # Scripts shown directly under the GMD CO Processing menu, in TOP_LEVEL_SCRIPTS order
