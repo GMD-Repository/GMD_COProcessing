@@ -16,7 +16,7 @@ to your data (the rules, thresholds and matching keys it uses).
 | [EA vs Barangay Check](tools/ea_versus_bgy.md) | `ea_versus_bgy.py` | Compares EAs with their barangay (or barangays / EAs with each other) and snaps the mismatches |
 | [MBI Coverage Selector](tools/mbi_coverage_selector.md) | `mbi_coverage_selector.py` | Counter-checks the remaining MBIs, chooses the covering barangay, then the covering EA, and writes the coverage status |
 | [EARF Post-Processing](tools/earf_post_processing.md) | `earf_post_processing.py` | Matches POPCEN, Preliminary EARF and EA GeoPackages on geocode and exports the final deliverables |
-| [\[TEST\] EARF Inconsistency Checks](tools/test_earf_inconsistency.md) | `test_earf_inconsistency.py` | **Test.** Checks the EA GeoPackage and Preliminary EARF (against the 2024 household worksheet) and writes the two List of Inconsistencies workbooks |
+| [\[TEST\] EARF Inconsistency Checks](tools/test_earf_inconsistency.md) | `test_earf_inconsistency.py` | **Test.** Checks the EA GeoPackage and Preliminary EARF (against the 2024 household worksheet), fixes what the Recommended Actions allow (GeoPackage edit session, EARF `_fixed` copy) and writes the two List of Inconsistencies workbooks |
 
 ## Recommended order for MBIs
 

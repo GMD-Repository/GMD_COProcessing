@@ -19,16 +19,26 @@ Checks (same validation_id in both workbooks unless noted):
   inv_ea_type     EA Type other than Retained, Delineated, Merged
   inv_hhcount     Household count equal to building count
   inv_new_ean     New EA Code that is not 6 digits
+  inv_sy          Retained must be 2024; Delineated / Merged must be 2026
   null_ea_count   EA count blank (EARF: only the first row of each old EA; split rows leave it blank)
   null_ea_type / null_hhcount / null_sy   blank values
   null_new_ean    Delineated or Merged EA without a New EA Code
   null_remarks    EA flagged for delineation/merging in the household worksheet, kept Retained, no remarks
 
+Fixes (the template's "Recommended Action"; plan_fixes / apply_earf_fixes):
+  dup_ea          extra copies deleted (first record kept)
+  inv_ea_type     set to Retained
+  inv_sy/null_sy  Source Year from the EA Type (after inv_ea_type)
+  inv_hhcount/null_hhcount  hh_count = sum of est_hhcount of the building points in the EA
+  null_new_ean    Delineated EAs renumbered by the EADM rule (Merged: flag only)
+  dup_new_ean     later records renumbered by the EADM rule (first kept)
+  the others are flag only. GeoPackage fixes go to the layer's edit buffer; EARF fixes to a copy.
+
 The engine (everything above the "window" section) has no Qt code and can be run headless.
 """
 # Menu / panel entry (read by the GMD CO Processing plugin)
 TOOL_NAME = "[TEST] EARF Inconsistency Checks"
-TOOL_GROUP = "GMD CO Processing"  # shown directly under the menu (see TOP_LEVEL_SCRIPTS in plugin.py)
+TOOL_GROUP = "[TEST] EA Post-Processing"
 TOOL_ICON = "icons/earf_post_processing.svg"
 
 import os
@@ -42,6 +52,7 @@ import pandas as pd
 
 # ═════════════════════════════ configuration ═════════════════════════════
 VALID_TYPES = ("RETAINED", "DELINEATED", "MERGED")
+EXPECTED_SY = {"RETAINED": "2024", "DELINEATED": "2026", "MERGED": "2026"}
 TRUTHY = {"1", "Y", "YES", "TRUE", "X", "✓", "✔"}
 BLANKS = {"", "nan", "none", "null", "<na>", "nat"}
 SPREADSHEET_EXT = (".xlsx", ".xlsm", ".xls", ".ods", ".csv")
@@ -60,6 +71,8 @@ CHECKS = [
     ("inv_ea_type", "Invalid EA Type", "Entries with values other than Retained, Delineated, and Merged"),
     ("inv_hhcount", "Invalid Household Count", "Household count is equal to building count"),
     ("inv_new_ean", "Invalid New EA Code", "Entries with values other than the required 6-digit EA code"),
+    ("inv_sy", "Inconsistent EA Type and Source Year",
+     "Mismatch between EA Type and SY (Delineated/Merged = 2026, \nRetained = 2024)"),
     ("null_ea_count", "Missing EA Count", "EA count should not be Null"),
     ("null_ea_type", "Missing EA Type", "EA Type is blank or null"),
     ("null_hhcount", "Missing Household Count", "Household count is blank or null"),
@@ -69,6 +82,29 @@ CHECKS = [
     ("null_sy", "Missing Source Year", "Source Year is blank or null"),
 ]
 CHECK_INFO = {c[0]: c for c in CHECKS}
+
+# validation_id -> (Recommended Action as in the template, what the tool does automatically or None)
+SY_ACTION = "Delineated/Merged = 2026, \nRetained = 2024\n\nFix inv_ea_type first before fixing this"
+HH_ACTION = "Fill missing hh_count, count est_hhcount from bldg_point layer"
+ACTIONS = {
+    "dup_ea": ("De-dup", "deletes the extra copies (the first record is kept)"),
+    "dup_new_ean": ("De-dup", "renumbers the later records by the EADM rule (the first is kept)"),
+    "missing_geo": ("Match geocode, output list", None),
+    "earf_missing_geo": ("Match geocode, output list", None),
+    "inv_ea_type": ("Values other than Retained, Delineated, and Merged will be assigned as Retained",
+                    "sets EA Type to Retained"),
+    "inv_hhcount": (HH_ACTION, "sets hh_count to the sum of est_hhcount of the building points in the EA"),
+    "inv_new_ean": ("Renumber (flag only)", None),
+    "inv_sy": (SY_ACTION, "sets Source Year from the EA Type (after the EA Type fix)"),
+    "null_ea_count": ("(flag only) indicator for dedup", None),
+    "null_ea_type": ("(flag only)", None),
+    "null_hhcount": ("(flag only) " + HH_ACTION,
+                     "sets hh_count to the sum of est_hhcount of the building points in the EA"),
+    "null_new_ean": ("Renumber using EADM protocol",
+                     "renumbers Delineated EAs by the EADM rule (Merged EAs stay flagged)"),
+    "null_remarks": ("(flag only)", None),
+    "null_sy": (SY_ACTION, "sets Source Year from the EA Type (after the EA Type fix)"),
+}
 GPKG_IDS = [c[0] for c in CHECKS if c[0] != "earf_missing_geo"]
 EARF_IDS = [c[0] for c in CHECKS if c[0] != "missing_geo"]
 TABS = {"gpkg": "GeoPackage", "earf": "prelim EARF"}
@@ -84,6 +120,7 @@ VALUE_COLS = {
     "inv_ea_type": [("ea_type", "ea_type", "EA Type")],
     "inv_hhcount": [("hh_count", "hh_count", "Household\nCount"), ("bldg_count", "bldg_count", "Building\nCount")],
     "inv_new_ean": [("new_ean", "new_ean", "New EA Code")],
+    "inv_sy": [("ea_type", "ea_type", "EA Type"), ("sy", "sy", "Source Year")],
     "null_ea_count": [("ea_count", "eacount", "Number of EAs")],
     "null_ea_type": [("ea_type", "ea_type", "EA Type")],
     "null_hhcount": [("hh_count", "hh_count", "Household Count")],
@@ -227,8 +264,22 @@ def read_earf(path, sheet=None, label=""):
     # drop the '(2) (3) (4) ...' column-number row
     first = clean(df.iloc[:, 0])
     df = df[~first.str.fullmatch(r"\(\d+\)")]
-    cols = df.columns
-    c = {
+    c = earf_colmap(df.columns)
+    out = pd.DataFrame({
+        "prov": code(df[c["prov"]], 3), "mun": code(df[c["mun"]], 2),
+        "brgy": code(df[c["brgy"]], 3), "ea": code(df[c["ea"]], 6),
+    }, index=df.index)
+    out["_rowkey"] = row_key(df)
+    for k in ("ea_count", "new_ean", "hh_count", "bldg_count", "ea_type", "sy", "remarks"):
+        out[k] = col(df, c[k])
+    out["_ea_type_raw"] = out["ea_type"]
+    out["_path"], out["_sheet"], out["_xrow"] = path, sheet, df["_row"]
+    return _earf_rows(out, df, c, path, label)
+
+
+def earf_colmap(cols):
+    """EARF header names -> {internal field: column name (or None)}."""
+    return {
         "prov": pick(cols, "prov", "province_code"),
         "mun": pick(cols, "mun", "city_mun_code"),
         "brgy": pick(cols, "brgy", "barangay_code"),
@@ -243,13 +294,19 @@ def read_earf(path, sheet=None, label=""):
         "sy": pick(cols, "source_year", "sy", contains=["source_y"]),
         "remarks": pick(cols, "remarks", contains=["remark"]),
     }
-    out = pd.DataFrame({
-        "prov": code(df[c["prov"]], 3), "mun": code(df[c["mun"]], 2),
-        "brgy": code(df[c["brgy"]], 3), "ea": code(df[c["ea"]], 6),
-    }, index=df.index)
-    out["_rowkey"] = row_key(df)
-    for k in ("ea_count", "new_ean", "hh_count", "bldg_count", "ea_type", "sy", "remarks"):
-        out[k] = col(df, c[k])
+
+
+def earf_columns(path, sheet=None):
+    """{internal field: 1-based Excel column} of an EARF sheet."""
+    raw = read_sheet_raw(path, sheet, nrows=60)
+    h = find_header(raw, ["prov", "mun", "brgy", "ea"])
+    if h is None:
+        raise ValueError(f"{path}: no 'Prov / Mun / Brgy / EA' header row found")
+    names = list(frame_from(raw.iloc[:h + 1], h).columns)
+    return {k: names.index(v) + 1 for k, v in earf_colmap(names).items() if v}
+
+
+def _earf_rows(out, df, c, path, label):
     out["new_ean"] = out["new_ean"].where(~out["new_ean"].str.isdigit(), out["new_ean"].str.zfill(6))
     out["ea_type"] = out["ea_type"].str.upper()
     name = col(df, c["name"])
@@ -331,8 +388,13 @@ def read_household(path, sheet=None, label=""):
 def gpkg_frame(records, label=""):
     """Rows of GeoPackage attributes (list of dicts or DataFrame) -> checked frame."""
     df = records if isinstance(records, pd.DataFrame) else pd.DataFrame(records)
-    cols = df.columns
-    c = {
+    c = gpkg_colmap(df.columns)
+    return _gpkg_rows(df, c, label)
+
+
+def gpkg_colmap(cols):
+    """GeoPackage field names -> {internal field: field name (or None)}."""
+    return {
         "geocode": pick(cols, "geocode", "ea_geocode", "psgc_ea"),
         "region": pick(cols, "region"), "province": pick(cols, "province"),
         "city_mun": pick(cols, "city_mun", "municipality", "citymun"),
@@ -344,12 +406,16 @@ def gpkg_frame(records, label=""):
         "ea_count": pick(cols, "eacount", "ea_count", "number_of_eas"),
         "remarks": pick(cols, "remarks", "remark"),
     }
+
+
+def _gpkg_rows(df, c, label):
     if not c["geocode"]:
         raise ValueError(f"{label}: the layer has no 'geocode' field")
     out = pd.DataFrame(index=df.index)
     out["_rowkey"] = row_key(df)
     for k, name in c.items():
         out[k] = col(df, name)
+    out["_ea_type_raw"] = out["ea_type"]
     out["geocode"] = out["geocode"].str.replace(r"\D", "", regex=True)
     out["ean"] = out["ean"].where(~out["ean"].str.isdigit(), out["ean"].str.zfill(6))
     out["new_ean"] = out["new_ean"].where(~out["new_ean"].str.isdigit(), out["new_ean"].str.zfill(6))
@@ -367,7 +433,7 @@ def gpkg_frame(records, label=""):
 
 # ═════════════════════════════ checks ═════════════════════════════
 def common_checks(df, subject_by_geocode, old_key, first_only_count=False, null_remarks_where=None):
-    """The 11 checks shared by the GeoPackage and the EARF. Returns {id: (rows, note Series)}."""
+    """The 12 checks shared by the GeoPackage and the EARF. Returns {id: (rows, note Series)}."""
     t, sy, nean = df["ea_type"], df["sy"], df["new_ean"]
     res = {}
 
@@ -395,6 +461,9 @@ def common_checks(df, subject_by_geocode, old_key, first_only_count=False, null_
 
     add("inv_new_ean", (nean != "") & ~nean.str.fullmatch(r"\d{6}"), "New EA Code '" + nean + "' is not 6 digits")
 
+    exp = t.map(EXPECTED_SY)
+    add("inv_sy", exp.notna() & (sy != "") & (sy != exp.fillna("")),
+        t.str.title() + " EA should have SY " + exp.fillna("") + ", found " + sy)
 
     cnt_scope = ~df[old_key].duplicated(keep="first") if first_only_count else pd.Series(True, index=df.index)
     add("null_ea_count", cnt_scope & (df["ea_count"] == ""), "EA count is blank")
@@ -509,9 +578,200 @@ def counts(results):
     return {(wb, cid): len(df) for wb in ("gpkg", "earf") for cid, df in results[wb].items()}
 
 
+# ═════════════════════════════ fixes (Recommended Action) ═════════════════════════════
+FIX_COLS = ["validation_id", "action", "field", "old", "new", "geocode", "source", "ref",
+            "_fid", "_layer_id", "_path", "_sheet", "_xrow"]
+
+
+def _type_style(raw_values):
+    """'title' when the file mostly writes 'Retained', else 'upper' ('RETAINED')."""
+    valid = [v for v in raw_values if v.upper() in VALID_TYPES]
+    title = sum(1 for v in valid if v != v.upper())
+    return "title" if valid and title > len(valid) / 2 else "upper"
+
+
+def _first3(code6):
+    return int(code6[:3]) if len(code6) == 6 and code6.isdigit() else None
+
+
+def plan_fixes(df, wb, hh_sum=None):
+    """
+    The template's Recommended Actions as a list of changes; no file is touched.
+
+    df: frame from gpkg_frame / read_earf; wb: 'gpkg' or 'earf'.
+    hh_sum: building-point recount (sum of est_hhcount per EA) — GPKG {(layer_id, fid): n},
+            EARF {final geocode: n}; None skips the household fixes.
+    Fixes run in order on a working copy, so each sees the earlier ones:
+      dup_ea (delete copies) -> inv_ea_type -> inv_sy / null_sy -> inv_hhcount / null_hhcount
+      -> null_new_ean (Delineated) -> dup_new_ean.
+    EADM numbering: an EA keeps its own (mother) code when that code is free in the barangay; the other
+    delineated parts / repeated codes get (highest EA number in the barangay + 1) followed by the mother's 3 digits
+    (mother 005000, last EA 009000 -> 010005). A barangay's single EA 000000 splits into 001000, 002000...
+    Returns a DataFrame with FIX_COLS.
+    """
+    changes = []
+    if df is None or df.empty:
+        return pd.DataFrame(columns=FIX_COLS)
+    w = df.copy()
+    mother_col = "ean" if wb == "gpkg" else "ea"
+
+    def emit(cid, idx, field, old, new, action="set"):
+        r = w.loc[idx]
+        changes.append({"validation_id": cid, "action": action, "field": field, "old": old, "new": new,
+                        "geocode": r["geocode"], "source": r.get("source"), "ref": r.get("ref"),
+                        **{k: r.get(k) for k in ("_fid", "_layer_id", "_path", "_sheet", "_xrow")}})
+
+    # dup_ea: keep the first record of each identical group, delete the others
+    dup = w["_rowkey"].duplicated(keep="first")
+    for idx in w.index[dup]:
+        emit("dup_ea", idx, "", "", "", action="delete")
+    w = w[~dup].copy()
+
+    # inv_ea_type: anything else becomes Retained
+    retained = "Retained" if _type_style(w["_ea_type_raw"]) == "title" else "RETAINED"
+    t = w["ea_type"]
+    for idx in w.index[(t != "") & ~t.isin(VALID_TYPES)]:
+        emit("inv_ea_type", idx, "ea_type", w.at[idx, "_ea_type_raw"], retained)
+        w.at[idx, "ea_type"] = "RETAINED"
+
+    # inv_sy / null_sy: Source Year from the (fixed) EA Type; a blank EA Type is left flagged
+    exp = w["ea_type"].map(EXPECTED_SY)
+    for idx in w.index[exp.notna() & (w["sy"] != exp.fillna(""))]:
+        emit("null_sy" if w.at[idx, "sy"] == "" else "inv_sy", idx, "sy", w.at[idx, "sy"], exp[idx])
+        w.at[idx, "sy"] = exp[idx]
+
+    # inv_hhcount / null_hhcount: recount from the building points
+    if hh_sum is not None:
+        hh = pd.to_numeric(w["hh_count"], errors="coerce")
+        bl = pd.to_numeric(w["bldg_count"], errors="coerce")
+        for idx in w.index[(w["hh_count"] == "") | (hh.notna() & bl.notna() & (hh == bl))]:
+            if wb == "gpkg":
+                fid = w.at[idx, "_fid"]
+                key = (w.at[idx, "_layer_id"], int(fid)) if pd.notna(fid) else None
+            else:
+                key = w.at[idx, "final_geocode"]
+            n = hh_sum.get(key)
+            if n is None:
+                continue
+            new, old = str(int(round(n))), w.at[idx, "hh_count"]
+            if new == old:
+                continue
+            emit("null_hhcount" if old == "" else "inv_hhcount", idx, "hh_count", old, new)
+            w.at[idx, "hh_count"] = new
+
+    # renumbering (EADM)
+    codes = pd.concat([w[["bgy8", mother_col]].set_axis(["bgy8", "c"], axis=1),
+                       w[["bgy8", "new_ean"]].set_axis(["bgy8", "c"], axis=1)])
+    last = {}
+    for b, cs in codes.groupby("bgy8")["c"]:
+        nums = [x for x in map(_first3, cs) if x is not None]
+        last[b] = max(nums) if nums else 0
+    taken = set(w["bgy8"] + w["new_ean"])
+
+    def renumber(cid, idx, keep_mother):
+        b, m = w.at[idx, "bgy8"], w.at[idx, mother_col]
+        if not (len(m) == 6 and m.isdigit()):
+            return
+        if keep_mother and m != "000000" and b + m not in taken:
+            new = m
+        else:
+            last[b] = last.get(b, 0) + 1
+            if last[b] > 999:
+                return
+            new = f"{last[b]:03d}{'000' if m == '000000' else m[:3]}"
+        emit(cid, idx, "new_ean", w.at[idx, "new_ean"], new)
+        if wb == "gpkg":   # the GeoPackage geocode is barangay + New EA Code
+            emit(cid, idx, "geocode", w.at[idx, "geocode"], b + new)
+            w.at[idx, "geocode"] = b + new
+        taken.add(b + new)
+        w.at[idx, "new_ean"] = new
+
+    blank = w[(w["ea_type"] == "DELINEATED") & (w["new_ean"] == "")]
+    for idx in blank.sort_values(["bgy8", mother_col], kind="mergesort").index:
+        renumber("null_new_ean", idx, True)
+    cand = (w["new_ean"] != "") & (w["ea_type"] != "MERGED")
+    key = (w["bgy8"] + "|" + w["new_ean"]).where(cand)
+    for idx in w.index[cand & key.duplicated(keep="first")]:
+        renumber("dup_new_ean", idx, True)
+
+    return pd.DataFrame(changes, columns=FIX_COLS)
+
+
+def fix_counts(plan):
+    """{validation_id: number of records fixed} (a renumbered GeoPackage EA counts once)."""
+    if plan is None or plan.empty:
+        return {}
+    p = plan[plan["field"] != "geocode"]
+    return p.groupby("validation_id").size().to_dict()
+
+
+def _typed(new, old, field):
+    """The new value in the cell's own type (numbers stay numbers, codes stay text)."""
+    if field == "hh_count" or (isinstance(old, (int, float)) and not isinstance(old, bool)
+                               and field not in ("new_ean", "ea_type") and str(new).isdigit()):
+        return int(new)
+    return str(new)
+
+
+def _delete_row(ws, r):
+    """Delete Excel row r and move the merged ranges and row heights below it up."""
+    for m in list(ws.merged_cells.ranges):
+        if m.min_row <= r <= m.max_row:
+            ws.unmerge_cells(str(m))
+    heights = {i: d.height for i, d in ws.row_dimensions.items() if i > r}
+    ws.delete_rows(r)
+    for m in list(ws.merged_cells.ranges):
+        if m.min_row > r:
+            m.shift(0, -1)
+    for i in sorted(heights):
+        ws.row_dimensions[i - 1].height = heights[i]
+    if heights:
+        ws.row_dimensions[max(heights)].height = None
+
+
+def apply_earf_fixes(plan, out_path):
+    """Write the EARF part of a plan into a copy of the EARF workbook. The original is not touched."""
+    from openpyxl import load_workbook
+    ch = plan[plan["_path"].notna()] if plan is not None else pd.DataFrame()
+    if ch.empty:
+        return None
+    paths = ch["_path"].unique()
+    if len(paths) > 1:
+        raise ValueError("The EARF fixes span several files; fix one EARF at a time.")
+    path = paths[0]
+    if not path.lower().endswith((".xlsx", ".xlsm")):
+        raise ValueError(f"{os.path.basename(path)}: only .xlsx / .xlsm EARF files can be fixed.")
+    same = os.path.normcase(os.path.abspath(out_path)) == os.path.normcase(os.path.abspath(path))
+    if same and not os.path.splitext(path)[0].endswith("_fixed"):   # a _fixed copy may be updated again
+        raise ValueError("The fixed copy would overwrite the original EARF.")
+    book = load_workbook(path, keep_vba=path.lower().endswith(".xlsm"))
+    for sheet, part in ch.groupby(ch["_sheet"].fillna(""), sort=False):
+        ws = book[sheet] if sheet else book.worksheets[0]
+        cols = earf_columns(path, sheet or None)
+        for _, r in part[part["action"] == "set"].iterrows():
+            if r["field"] not in cols:
+                raise ValueError(f"No '{r['field']}' column in the EARF sheet")
+            cell = ws.cell(row=int(r["_xrow"]), column=cols[r["field"]])
+            cell.value = _typed(r["new"], cell.value, r["field"])
+        for xr in sorted(part.loc[part["action"] == "delete", "_xrow"].astype(int).unique(), reverse=True):
+            _delete_row(ws, xr)
+    book.save(out_path)
+    return out_path
+
+
+def fixed_copy_path(path, folder=None):
+    base, ext = os.path.splitext(os.path.basename(path))
+    base = re.sub(r"_fixed$", "", base)
+    return os.path.join(folder or os.path.dirname(path), f"{base}_fixed{ext}")
+
+
 # ═════════════════════════════ Excel output ═════════════════════════════
-def write_workbook(results, wb_key, path):
-    """Write one 'EA List of Inconsistencies' workbook in the template layout."""
+def write_workbook(results, wb_key, path, plan=None, applied=False):
+    """Write one 'EA List of Inconsistencies' workbook in the template layout.
+
+    plan: this workbook's fixes (plan_fixes); listed on a 'fixes' sheet and counted on the Summary.
+    applied: whether those fixes were already applied (otherwise they are listed as planned).
+    """
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
@@ -545,14 +805,22 @@ def write_workbook(results, wb_key, path):
     ws["A1"].font = Font(bold=True, size=14)
     ws["A2"] = f"Generated {datetime.now():%Y-%m-%d %H:%M}"
     ws["A2"].font = Font(italic=True, color="7F7F7F")
-    header(ws, ["validation_id", "tabs", "title", "description", "frequency", "remarks"],
-           [18, 26, 34, 60, 11, 34])
+    fixed = fix_counts(plan)
+    status = "fixed" if applied else "to be fixed"
+    header(ws, ["validation_id", "tabs", "title", "description", "Recommended Action", "frequency", "remarks"],
+           [18, 26, 34, 50, 44, 11, 34])
     for i, cid in enumerate(ids, start=4):
         _, title, desc = CHECK_INFO[cid]
         tab = CROSS_TABS.get((wb_key, cid), TABS[wb_key])
         reason = skipped.get((wb_key, cid))
         n = None if reason else len(found.get(cid, ()))
-        row = [cid, tab, title, desc, n if n is not None else "n/a", f"Not checked: {reason}" if reason else ""]
+        if reason:
+            note = f"Not checked: {reason}"
+        elif ACTIONS[cid][1] is None:
+            note = "flag only"
+        else:
+            note = f"{fixed.get(cid, 0)} {status} automatically" if plan is not None else ""
+        row = [cid, tab, title, desc, ACTIONS[cid][0], n if n is not None else "n/a", note]
         for j, v in enumerate(row, start=2):
             cell = ws.cell(row=i, column=j, value=v)
             cell.border, cell.alignment = box, wrap
@@ -561,7 +829,7 @@ def write_workbook(results, wb_key, path):
             link.hyperlink = f"#'{cid}'!A1"
             link.font = Font(color="0563C1", underline="single")
         if n is not None:
-            ws.cell(row=i, column=6).fill = zero_fill if n == 0 else hit_fill
+            ws.cell(row=i, column=7).fill = zero_fill if n == 0 else hit_fill
     if not ids:
         ws["B4"] = "No inconsistencies found."
         ws["B4"].font = Font(bold=True, color="375623")
@@ -589,6 +857,21 @@ def write_workbook(results, wb_key, path):
                 cell.number_format = "@"
         if len(df):
             sh.auto_filter.ref = f"B3:{get_column_letter(len(cols) + 1)}{len(df) + 3}"
+
+    if plan is not None and len(plan):
+        sh = wb.create_sheet("fixes")
+        sh["A1"] = "Automatic fixes (" + status + ")"
+        sh["A1"].font = Font(bold=True, size=13)
+        sh["B2"] = '=HYPERLINK("#\'Summary\'!A1","< Summary")'
+        sh["B2"].font = Font(color="0563C1", underline="single")
+        names = ["validation_id", "geocode", "action", "field", "old value", "new value", "ref"]
+        header(sh, names, [18, 18, 10, 14, 18, 18, 14])
+        for r, rec in enumerate(plan.itertuples(index=False), start=4):
+            vals = [rec.validation_id, rec.geocode, rec.action, rec.field, rec.old, rec.new, rec.ref]
+            for j, v in enumerate(vals, start=2):
+                cell = sh.cell(row=r, column=j, value=None if v is None or v == "" else str(v))
+                cell.border, cell.number_format = box, "@"
+        sh.auto_filter.ref = f"B3:H{len(plan) + 3}"
     wb.save(path)
     return path
 
@@ -609,7 +892,8 @@ def output_prefix(frames):
 DIALOG_NAME = "EAListOfInconsistenciesTestDialog"
 DIALOG_TITLE = "[TEST] EARF Inconsistency Checks"
 DIALOG_SUBTITLE = ("Checks the 2026 EA GeoPackage and the Preliminary EARF against the 2024 POPCEN Estimated "
-                   "Number of Households and writes the two List of Inconsistencies workbooks.")
+                   "Number of Households, fixes what the Recommended Actions allow, and writes the two List of "
+                   "Inconsistencies workbooks.")
 
 THEMES = {
     False: {"title": "#2C3E50", "sub": "#7F8C8D", "hint": "#455a64", "summary": "#37474f",
@@ -634,13 +918,16 @@ TAB_STYLE = """
 _CHECK_ROWS = "".join(
     f'<tr><td style="border:1px solid #e5e7eb;"><b>{cid}</b></td>'
     f'<td style="border:1px solid #e5e7eb;">{title}</td>'
-    f'<td style="border:1px solid #e5e7eb;">{desc}</td></tr>'
+    f'<td style="border:1px solid #e5e7eb;">{desc}</td>'
+    f'<td style="border:1px solid #e5e7eb;">{ACTIONS[cid][1] or "<i>flag only</i>"}</td></tr>'
     for cid, title, desc in CHECKS)
+_CHECK_HEAD = ('<tr><th align="left">validation_id</th><th align="left">Title</th>'
+               '<th align="left">Description</th><th align="left">Automatic fix</th></tr>')
 
 HELP_HTML = f"""
 <h2>{DIALOG_TITLE}</h2>
 <p>This is a <b>test</b> tool. It finds the inconsistencies listed below in the 2026 EA GeoPackage and the
-Preliminary EARF, and writes two workbooks in the <i>EA List of Inconsistencies</i> template:
+Preliminary EARF, fixes the ones whose <i>Recommended Action</i> can be automated, and writes two workbooks in the <i>EA List of Inconsistencies</i> template:
 <code>&lt;code&gt;_EA List of Incons (GPKG).xlsx</code> and <code>&lt;code&gt;_EA List of Incons (EARF).xlsx</code>.</p>
 
 <h3>Quick start</h3>
@@ -652,9 +939,17 @@ just added is missing).</li>
 <li>For <b>Preliminary EARF</b> and <b>Est. No. of Households</b>, the tool searches the GeoPackage's folder
 and fills in the spreadsheet whose name matches (<i>earf</i>; <i>household</i>, <i>hh</i>, <i>popcen</i>
 or <i>estimated</i>). Otherwise press <b>Browse…</b> (it opens in that folder) or type the path. Then pick
-the <b>Sheet</b>. The spreadsheets do not need to be loaded in QGIS. All three inputs are required.</li>
-<li>Press <b>Run Check</b>. The table on the right shows each check and how many records it found.</li>
-<li>Click a check to list its records below. Double-click a GeoPackage record to zoom to the EA.</li>
+the <b>Sheet</b>. The spreadsheets do not need to be loaded in QGIS. These three inputs are required.</li>
+<li>Optional: choose the <b>Building points</b> layer (a point layer with <code>est_hhcount</code>) so the
+household counts can be recounted. With <i>(none)</i>, the household checks are flagged only.</li>
+<li>Press <b>Run Check</b>. The table on the right shows each check, how many records it found, how many
+will be fixed automatically (<b>Auto-fix</b>) and the template's <b>Recommended Action</b>.</li>
+<li>Click a check to list its records below. Double-click a GeoPackage record to zoom to the EA. The
+<b>Planned Fixes</b> tab lists every change, with the old and new value.</li>
+<li>Press <b>Apply Fixes</b>. GeoPackage fixes go into the layer's edit session: review them on the map
+and in the attribute table, then <b>Save</b> (or <b>Roll Back</b>) the layer edits in QGIS. EARF fixes are
+saved to <code>&lt;EARF name&gt;_fixed.xlsx</code> in the output folder; the original is not changed.
+The tool then checks again (using the fixed EARF) so only what is left is listed.</li>
 <li>Choose the <b>Output folder</b> and press <b>Export Excel</b>.</li>
 </ol>
 
@@ -668,10 +963,35 @@ directly so its two-row header is understood. Barangay title rows are skipped; o
 <li><b>Est. No. of Households</b>: the 2024 POPCEN worksheet with <code>province_code,
 city_mun_code, barangay_code, ean</code> and the <i>EA Subject for Delineation / Merging</i> columns.
 It is required: it gives <code>earf_missing_geo</code> and the subject flags used by <code>null_remarks</code>.</li>
+<li><b>Building points</b> (optional): a point layer with an <code>est_hhcount</code> field (e.g.
+<code>bldg_point</code>). Used only for the household recount.</li>
 </ul>
 
 <h3>Checks</h3>
-<table cellspacing="0" cellpadding="4" style="border-collapse:collapse; width:100%;">{_CHECK_ROWS}</table>
+<table cellspacing="0" cellpadding="4" style="border-collapse:collapse; width:100%;">{_CHECK_HEAD}{_CHECK_ROWS}</table>
+
+<h3>Automatic fixes (Recommended Action)</h3>
+<p>The fixes run in this order, each on the result of the one before:</p>
+<ol>
+<li><b>dup_ea</b>: the first record of each identical group is kept; the copies are deleted.</li>
+<li><b>inv_ea_type</b>: any EA Type other than Retained, Delineated or Merged becomes <b>Retained</b>
+(written the way the file writes its types, <i>RETAINED</i> or <i>Retained</i>).</li>
+<li><b>inv_sy</b> / <b>null_sy</b>: Source Year from the EA Type: Retained = 2024, Delineated / Merged
+= 2026. A blank EA Type is left flagged.</li>
+<li><b>inv_hhcount</b> / <b>null_hhcount</b>: <code>hh_count</code> = the sum of <code>est_hhcount</code>
+of the building points inside the EA (a point on a shared boundary is counted once). The EARF row takes
+the sum of the GeoPackage EA with the same final geocode. An EA with no building point is left flagged.</li>
+<li><b>null_new_ean</b> (Delineated EAs; Merged EAs stay flagged) and <b>dup_new_ean</b> (the first
+record keeps the code; the others are renumbered): the EADM rule. An EA keeps its own (mother) code when
+that code is free in the barangay. Otherwise it gets the next EA number after the highest one in the
+barangay, followed by the mother's 3 digits: mother <code>005000</code>, last EA <code>009000</code>
+&rarr; <code>010005</code>. A barangay's single EA <code>000000</code> splits into <code>001000</code>,
+<code>002000</code>, and so on. In the GeoPackage the <code>geocode</code> is updated too (barangay + New
+EA Code).</li>
+</ol>
+<p><code>missing_geo</code>, <code>earf_missing_geo</code>, <code>inv_new_ean</code>,
+<code>null_ea_count</code>, <code>null_ea_type</code> and <code>null_remarks</code> are flag only.
+The GeoPackage and the EARF are fixed separately, so check that renumbered codes agree in both.</p>
 
 <h3>Rules used</h3>
 <ul>
@@ -689,6 +1009,7 @@ merged parts can share the code they merge into.</li>
 city/municipalities present in the EARF.</li>
 <li>In both missing checks, an EA whose <code>ea_type</code> is <b>Merged</b> in the GeoPackage is not
 counted as missing, since it was merged into another EA.</li>
+<li><b>inv_sy</b>: Retained must be 2024; Delineated and Merged must be 2026.</li>
 <li><b>inv_hhcount</b> (EARF workbook): the Geocode column is the Preliminary EARF geocode,
 Prov+Mun+Brgy+New EA Code (or EA when blank).</li>
 <li><b>null_ea_count</b> (EARF): only the first row of each 2024 EA is checked, because split rows leave
@@ -699,8 +1020,11 @@ both workbooks, and the remarks column names the file(s) where it is Retained wi
 </ul>
 
 <h3>Output</h3>
-<p>Each workbook has a <b>Summary</b> sheet (frequency of each check, with links) and one sheet per
-<code>validation_id</code> that found something. Checks with no inconsistency are left out of the
+<p>Each workbook has a <b>Summary</b> sheet (frequency and Recommended Action of each check, with links;
+the remarks column says how many records were or will be fixed automatically, or <i>flag only</i>), one
+sheet per <code>validation_id</code> that found something, and a <b>fixes</b> sheet that lists every
+automatic change (old and new value). Exported after <b>Apply Fixes</b>, the frequencies are what is left
+and the fixes are listed as <i>fixed</i>. Checks with no inconsistency are left out of the
 results table and of the workbooks. The <b>remarks</b> column explains the problem. The file name starts with the
 city/municipality code (or the province code, or <i>combined</i>).</p>
 
@@ -709,6 +1033,12 @@ city/municipality code (or the province code, or <i>combined</i>).</p>
 <li><i>no 'Prov / Mun / Brgy / EA' header row found</i>: the wrong sheet is loaded; add the EARF sheet.</li>
 <li><i>the layer has no 'geocode' field</i>: the chosen GeoPackage layer is not an ea2026 layer.</li>
 <li>The table counts are per check; one EA can appear in several checks.</li>
+<li>The building-point layer is not in the <b>Building points</b> list: it must be a point layer with an
+<code>est_hhcount</code> field.</li>
+<li><i>only .xlsx / .xlsm EARF files can be fixed</i>: save the EARF as .xlsx first.</li>
+<li><i>Cannot write the fixed EARF</i>: close the <code>_fixed.xlsx</code> in Excel and press
+<b>Apply Fixes</b> again.</li>
+<li>Fixes in the GeoPackage are lost if the layer edits are rolled back or QGIS is closed without saving.</li>
 </ul>
 """
 
@@ -732,9 +1062,9 @@ def make_dialog_class():
     class LayerPicker(QtWidgets.QGroupBox):
         """One dropdown of the matching layers in the Layers panel."""
 
-        def __init__(self, title, accept, hint, parent=None):
+        def __init__(self, title, accept, hint, parent=None, optional=None):
             super().__init__(title, parent)
-            self.accept, self.hint = accept, re.compile(hint, re.I)
+            self.accept, self.hint, self.optional = accept, re.compile(hint, re.I), optional
             lay = QtWidgets.QVBoxLayout(self)
             self.combo = QtWidgets.QComboBox()
             self.combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -747,15 +1077,20 @@ def make_dialog_class():
             self.combo.clear()
             layers = sorted((l for l in QgsProject.instance().mapLayers().values() if self.accept(l)),
                             key=lambda l: l.name().lower())
+            off = 0
+            if self.optional:
+                self.combo.addItem(self.optional, None)
+                off = 1
             for layer in layers:
                 self.combo.addItem(layer.name(), layer.id())
                 self.combo.setItemData(self.combo.count() - 1, layer.source(), Qt.ToolTipRole)
-            if not layers:
+            if not layers and not self.optional:
                 self.combo.addItem("(no matching layer in the Layers panel)", None)
             idx = self.combo.findData(current) if current else -1
             if idx < 0:   # first time / layer removed: pick the likeliest layer by name
-                idx = next((i for i, l in enumerate(layers)
-                            if self.hint.search(l.name() + " " + l.source())), 0)
+                hit = next((i for i, l in enumerate(layers)
+                            if self.hint.search(l.name() + " " + l.source())), None)
+                idx = hit + off if hit is not None else 0
             self.combo.setCurrentIndex(idx)
             self.combo.blockSignals(False)
 
@@ -858,6 +1193,23 @@ def make_dialog_class():
                 and layer.geometryType() == QgsWkbTypes.PolygonGeometry
                 and layer.fields().indexOf("geocode") >= 0)
 
+    def bldg_field(layer):
+        return pick(layer.fields().names(), "est_hhcount", "est_hh_count", "est_hh", contains=["est_hh"])
+
+    def is_bldg_layer(layer):
+        return (layer.type() == QgsMapLayer.VectorLayer
+                and layer.geometryType() == QgsWkbTypes.PointGeometry and bldg_field(layer) is not None)
+
+    def field_value(layer, name, value):
+        """The plan's text value in the field's type."""
+        fld = layer.fields().field(name)
+        if fld.isNumeric():
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return value
+        return str(value)
+
     class Dialog(QtWidgets.QDialog):
         def __init__(self, iface, parent=None):
             super().__init__(parent)
@@ -875,6 +1227,8 @@ def make_dialog_class():
             self.iface = iface
             self.results = None
             self.frames = (None, None, None)
+            self.plans = {"gpkg": pd.DataFrame(columns=FIX_COLS), "earf": pd.DataFrame(columns=FIX_COLS)}
+            self.applied_plans = None   # the fixes last applied (listed as 'fixed' in the export)
             self.dark = self.palette().color(self.palette().Window).lightness() < 128
             th = THEMES[self.dark]
 
@@ -938,14 +1292,16 @@ def make_dialog_class():
             self.earf_list = FilePicker("2. Preliminary EARF", r"earf", self._gpkg_folder)
             self.hh_list = FilePicker("3. Est. No. of Households",
                                       r"household|hh|popcen|estimated", self._gpkg_folder)
+            self.bldg_list = LayerPicker("4. Building points (household recount)", is_bldg_layer,
+                                         r"bldg|build", optional="(none: household counts flagged only)")
             self.gpkg_list.combo.currentIndexChanged.connect(self.refresh_layers)
-            for w in (self.gpkg_list, self.earf_list, self.hh_list):
+            for w in (self.gpkg_list, self.earf_list, self.hh_list, self.bldg_list):
                 lv.addWidget(w)
             refresh = QtWidgets.QPushButton("Refresh Layers")
             refresh.clicked.connect(self.refresh_layers)
             lv.addWidget(refresh)
 
-            out_box = QtWidgets.QGroupBox("4. Output folder")
+            out_box = QtWidgets.QGroupBox("5. Output folder")
             ob = QtWidgets.QHBoxLayout(out_box)
             self.out_edit = QtWidgets.QLineEdit(os.path.join(os.path.expanduser("~"), "Downloads"))
             browse = QtWidgets.QPushButton("…")
@@ -977,8 +1333,9 @@ def make_dialog_class():
             right.addWidget(self.summary)
 
             split = QtWidgets.QSplitter(Qt.Vertical)
-            self.check_table = QtWidgets.QTableWidget(0, 5)
-            self.check_table.setHorizontalHeaderLabels(["Workbook", "validation_id", "Title", "Frequency", "Note"])
+            self.check_table = QtWidgets.QTableWidget(0, 7)
+            self.check_table.setHorizontalHeaderLabels(["Workbook", "validation_id", "Title", "Frequency",
+                                                        "Auto-fix", "Recommended Action", "Note"])
             self.check_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
             self.check_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
             self.check_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -1005,11 +1362,30 @@ def make_dialog_class():
             self.row_table.horizontalHeader().setStretchLastSection(True)
             self.row_table.cellDoubleClicked.connect(self.zoom_to_row)
             lw.addWidget(self.row_table)
-            split.addWidget(lower)
+            self.fix_table = QtWidgets.QTableWidget(0, 0)
+            self.fix_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+            self.fix_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+            self.fix_table.setAlternatingRowColors(True)
+            self.fix_table.verticalHeader().setVisible(False)
+            self.fix_table.horizontalHeader().setStretchLastSection(True)
+            self.lower_tabs = QtWidgets.QTabWidget()
+            self.lower_tabs.addTab(lower, "Records")
+            self.lower_tabs.addTab(self.fix_table, "Planned Fixes")
+            split.addWidget(self.lower_tabs)
             split.setSizes([260, 380])
             right.addWidget(split, 1)
 
             act = QtWidgets.QHBoxLayout()
+            self.apply_btn = QtWidgets.QPushButton("Apply Fixes")
+            self.apply_btn.setEnabled(False)
+            self.apply_btn.setToolTip("GeoPackage: the fixes go into the layer's edit session (review, then Save "
+                                      "or Roll Back in QGIS).\nEARF: a '_fixed' copy is saved in the output "
+                                      "folder; the original is not changed.")
+            self.apply_btn.setStyleSheet("QPushButton { background:#2e7d32; color:white; font-weight:bold;"
+                                         " border-radius:4px; padding:4px 12px; }"
+                                         " QPushButton:disabled { background:#90a4ae; }")
+            self.apply_btn.clicked.connect(self.apply_fixes)
+            act.addWidget(self.apply_btn)
             self.export_btn = QtWidgets.QPushButton("Export Excel")
             self.export_btn.setEnabled(False)
             self.export_btn.clicked.connect(self.export)
@@ -1034,7 +1410,7 @@ def make_dialog_class():
             QtWidgets.QApplication.processEvents()
 
         def refresh_layers(self, *_):
-            for w in (self.gpkg_list, self.earf_list, self.hh_list):
+            for w in (self.gpkg_list, self.earf_list, self.hh_list, self.bldg_list):
                 w.refresh()
 
         def pick_folder(self):
@@ -1077,7 +1453,48 @@ def make_dialog_class():
                 self.say(f"  {what} '{label}': {len(frames[-1])} EA rows")
             return pd.concat(frames, ignore_index=True) if frames else None
 
-        def run(self):
+        def _hh_sums(self, gpkg_layers, bldg):
+            """Sum of est_hhcount of the building points in each EA: ({(layer_id, fid): n}, {geocode: n}).
+
+            A point on a shared boundary is counted once, in the first EA found.
+            """
+            from qgis.core import QgsCoordinateTransform, QgsGeometry, QgsSpatialIndex
+            fld = bldg_field(bldg)
+            by_fid, by_geo = {}, {}
+            for layer in gpkg_layers:
+                gname = gpkg_colmap(layer.fields().names())["geocode"]
+                index, polys = QgsSpatialIndex(), {}
+                for f in layer.getFeatures():
+                    if not f.hasGeometry():
+                        continue
+                    eng = QgsGeometry.createGeometryEngine(f.geometry().constGet())
+                    eng.prepareGeometry()
+                    polys[f.id()] = (eng, re.sub(r"\D", "", str(f[gname] or "")))
+                    index.addFeature(f)
+                xf = QgsCoordinateTransform(bldg.crs(), layer.crs(), QgsProject.instance())
+                same = bldg.crs() == layer.crs()
+                req = QgsFeatureRequest().setSubsetOfAttributes([fld], bldg.fields())
+                for p in bldg.getFeatures(req):
+                    if not p.hasGeometry():
+                        continue
+                    try:
+                        n = float(p[fld])
+                    except (TypeError, ValueError):
+                        n = 0.0
+                    geom = QgsGeometry(p.geometry())
+                    if not same:
+                        geom.transform(xf)
+                    for fid in index.intersects(geom.boundingBox()):
+                        eng, gc = polys[fid]
+                        if eng.intersects(geom.constGet()):
+                            by_fid[(layer.id(), fid)] = by_fid.get((layer.id(), fid), 0.0) + n
+                            by_geo[gc] = by_geo.get(gc, 0.0) + n
+                            break
+            return by_fid, by_geo
+
+        def run(self, *_, keep_applied=False):
+            if not keep_applied:
+                self.applied_plans = None
             g, e, h = (self.gpkg_list.ticked_layers(), self.earf_list.ticked_layers(),
                        self.hh_list.ticked_layers())
             missing = [name for name, lyr in (("EA GeoPackage", g), ("Preliminary EARF", e),
@@ -1100,12 +1517,24 @@ def make_dialog_class():
                 hh = self._read_sheets(h, read_household, "Households")
                 self.frames = (gpkg, earf, hh)
                 self.results = run_checks(gpkg, earf, hh, step=self.say)
+                by_fid = by_geo = None
+                bldg = self.bldg_list.layer()
+                if bldg is not None:
+                    self.say(f"Recounting households from '{bldg.name()}' ({bldg_field(bldg)})…")
+                    by_fid, by_geo = self._hh_sums(g, bldg)
+                self.plans = {"gpkg": plan_fixes(gpkg, "gpkg", by_fid), "earf": plan_fixes(earf, "earf", by_geo)}
+                n_fix = sum(len(p) for p in self.plans.values())
+                self.say(f"Planned fixes: GeoPackage {len(self.plans['gpkg'])}, EARF {len(self.plans['earf'])}"
+                         + ("" if bldg is not None else " (no building points: household counts flagged only)"))
                 self.fill_check_table()
+                self.fill_fix_table()
                 total = sum(counts(self.results).values())
                 self.summary.setText(f"{total} inconsistent record(s) found in "
-                                     f"{sum(1 for v in counts(self.results).values() if v)} check(s) "
-                                     f"— {time.time() - t0:.1f}s. Click a check to list its records.")
+                                     f"{sum(1 for v in counts(self.results).values() if v)} check(s), "
+                                     f"{n_fix} automatic fix(es) planned — {time.time() - t0:.1f}s. "
+                                     "Click a check to list its records.")
                 self.export_btn.setEnabled(True)
+                self.apply_btn.setEnabled(n_fix > 0)
             except Exception as exc:
                 self.say(f"ERROR: {exc}")
                 self.say(traceback.format_exc())
@@ -1130,15 +1559,112 @@ def make_dialog_class():
                         continue   # no inconsistency: not listed
                     r = t.rowCount()
                     t.insertRow(r)
+                    auto = ("flag only" if ACTIONS[cid][1] is None
+                            else str(fix_counts(self.plans.get(wb)).get(cid, 0)))
                     vals = ["GPKG" if wb == "gpkg" else "EARF", cid, CHECK_INFO[cid][1],
-                            "n/a" if n is None else str(n), f"Not checked: {reason}" if reason else ""]
+                            "n/a" if n is None else str(n), auto, ACTIONS[cid][0].replace("\n", " "),
+                            f"Not checked: {reason}" if reason else ""]
                     colour = th["skip"] if n is None else (th["ok"] if n == 0 else th["hit"])
                     for c, v in enumerate(vals):
                         it = QtWidgets.QTableWidgetItem(v)
                         it.setData(Qt.UserRole, (wb, cid))
                         it.setBackground(QBrush(QColor(colour)))
+                        if c == 5:
+                            it.setToolTip(ACTIONS[cid][0] + (f"\n\nAutomatic: {ACTIONS[cid][1]}"
+                                                             if ACTIONS[cid][1] else ""))
                         t.setItem(r, c, it)
             t.resizeColumnsToContents()
+            t.setColumnWidth(5, min(t.columnWidth(5), 320))
+
+        def fill_fix_table(self):
+            names = ["Workbook", "validation_id", "geocode", "action", "field", "old value", "new value", "ref"]
+            rows = [("GPKG" if wb == "gpkg" else "EARF", r.validation_id, r.geocode, r.action, r.field,
+                     r.old, r.new, r.ref)
+                    for wb in ("gpkg", "earf") for r in self.plans[wb].itertuples(index=False)]
+            t = self.fix_table
+            t.setRowCount(0)
+            t.setColumnCount(len(names))
+            t.setHorizontalHeaderLabels(names)
+            t.setRowCount(len(rows))
+            for i, vals in enumerate(rows):
+                for c, v in enumerate(vals):
+                    t.setItem(i, c, QtWidgets.QTableWidgetItem("" if v is None else str(v)))
+            t.resizeColumnsToContents()
+            self.lower_tabs.setTabText(1, f"Planned Fixes ({len(rows)})")
+
+        def apply_fixes(self):
+            gp, ep = self.plans["gpkg"], self.plans["earf"]
+            if gp.empty and ep.empty:
+                return
+            folder = self.out_edit.text().strip()
+            earf_src = ep["_path"].iloc[0] if not ep.empty else None
+            earf_out = fixed_copy_path(earf_src, folder or None) if earf_src else None
+            msg = []
+            if not gp.empty:
+                msg.append(f"GeoPackage: {len(gp)} change(s) ({int((gp['action'] == 'delete').sum())} "
+                           "deletion(s)) go into the layer's edit session. Review them, then Save or "
+                           "Roll Back the edits in QGIS.")
+            if earf_out:
+                msg.append(f"EARF: {len(ep)} change(s) are saved to a copy:\n{earf_out}\n"
+                           "The original EARF is not changed.")
+            if QtWidgets.QMessageBox.question(self, DIALOG_TITLE, "\n\n".join(msg) + "\n\nApply the fixes?") \
+                    != QtWidgets.QMessageBox.Yes:
+                return
+            QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                for lid, part in gp.groupby("_layer_id", sort=False):
+                    layer = QgsProject.instance().mapLayer(lid)
+                    if layer is None:
+                        self.say(f"GeoPackage layer {lid} is no longer loaded; its fixes were skipped.")
+                        continue
+                    cmap = gpkg_colmap(layer.fields().names())
+                    if not layer.isEditable() and not layer.startEditing():
+                        raise RuntimeError(f"'{layer.name()}' cannot be edited.")
+                    layer.beginEditCommand("EARF inconsistency fixes")
+                    try:
+                        failed = 0
+                        for _, r in part[part["action"] == "set"].iterrows():
+                            name = cmap.get(r["field"])
+                            idx = layer.fields().indexOf(name) if name else -1
+                            if idx < 0 or not layer.changeAttributeValue(
+                                    int(r["_fid"]), idx, field_value(layer, name, r["new"])):
+                                failed += 1
+                        dels = [int(f) for f in part.loc[part["action"] == "delete", "_fid"]]
+                        if dels and not layer.deleteFeatures(dels):
+                            failed += len(dels)
+                        layer.endEditCommand()
+                    except Exception:
+                        layer.destroyEditCommand()
+                        raise
+                    layer.triggerRepaint()
+                    self.say(f"'{layer.name()}': {len(part) - failed} fix(es) in the edit session"
+                             + (f", {failed} could not be applied" if failed else "")
+                             + ". Save the layer edits to keep them.")
+                if earf_out:
+                    os.makedirs(os.path.dirname(earf_out), exist_ok=True)
+                    apply_earf_fixes(ep, earf_out)
+                    self.say(f"Saved the fixed EARF: {earf_out}")
+                    sheet = self.earf_list.sheet.currentData()
+                    self.earf_list.path.setText(earf_out)
+                    self.earf_list._load_sheets()
+                    i = self.earf_list.sheet.findData(sheet)
+                    if i >= 0:
+                        self.earf_list.sheet.setCurrentIndex(i)
+            except PermissionError as exc:
+                QtWidgets.QMessageBox.critical(self, DIALOG_TITLE,
+                                               f"Cannot write the fixed EARF (is it open in Excel?)\n{exc}")
+                return
+            except Exception as exc:
+                self.say(f"ERROR: {exc}")
+                self.say(traceback.format_exc())
+                QtWidgets.QMessageBox.critical(self, DIALOG_TITLE, str(exc))
+                return
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+            applied = {k: v for k, v in self.plans.items()}
+            self.say("Re-checking with the fixes applied…")
+            self.run(keep_applied=True)
+            self.applied_plans = applied
 
         def current_df(self):
             items = self.check_table.selectedItems()
@@ -1202,7 +1728,10 @@ def make_dialog_class():
                 for wb, label in (("gpkg", "GPKG"), ("earf", "EARF")):
                     if self.results[wb]:
                         path = os.path.join(folder, f"{prefix}_EA List of Incons ({label}).xlsx")
-                        write_workbook(self.results, wb, path)
+                        if self.applied_plans is not None:
+                            write_workbook(self.results, wb, path, self.applied_plans[wb], applied=True)
+                        else:
+                            write_workbook(self.results, wb, path, self.plans[wb])
                         written.append(path)
                         self.say(f"Saved {path}")
             except PermissionError as exc:

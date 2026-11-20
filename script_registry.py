@@ -22,6 +22,8 @@ PLUGIN_DIR = os.path.dirname(__file__)
 SCRIPTS_DIR = os.path.join(PLUGIN_DIR, "gmd_processing_tools")
 ICONS_DIR = os.path.join(SCRIPTS_DIR, "icons")
 OTHER_GROUP = "Other Tools"
+# Groups always shown in the menu and panel, even before any script uses them
+DECLARED_GROUPS = ("[TEST] EA Post-Processing",)
 
 
 @dataclass
@@ -114,4 +116,6 @@ def grouped_scripts():
     groups = {}
     for script in discover_scripts():
         groups.setdefault(script.group, []).append(script)
+    for group in DECLARED_GROUPS:
+        groups.setdefault(group, [])
     return list(groups.items())
