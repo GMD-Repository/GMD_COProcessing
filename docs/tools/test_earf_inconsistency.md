@@ -36,7 +36,8 @@ also fixes the records. It writes two workbooks in the *EA List of Inconsistenci
    - EARF: the fixes are saved to `<EARF name>_fixed.xlsx` in the output folder. The original is not changed.
 
    The tool then checks again, using the fixed EARF, so only what is left is listed. Export again to record what
-   is left and the fixes made. Each new check must be exported before its fixes are applied.
+   is left and the fixes made. The export is asked for once per **Run Check**: after it, you can fix one
+   validation_id after another without exporting again.
 
 ## How it works
 
