@@ -36,13 +36,14 @@ also fixes the records. It writes two workbooks in the *EA List of Inconsistenci
    - EARF: the fixes are saved to `<EARF name>_fixed.xlsx` in the output folder. The original is not changed.
 
    The tool then checks again, using the fixed EARF, so only what is left is listed. Export again to record what
-   is left and the fixes made. Each new check must be exported before its fixes are applied.
+   is left and the fixes made. The export is asked for once per **Run Check**: after it, you can fix one
+   validation_id after another without exporting again.
 
 ## How it works
 
 ```mermaid
 flowchart LR
-  G[EA GeoPackage layers<br/>attributes only] --> C{14 checks}
+  G[EA GeoPackage layers<br/>attributes + geometry key] --> C{15 checks}
   E[Preliminary EARF sheets<br/>re-read with real header] --> C
   H[Household worksheet] --> C
   C --> P[Planned fixes<br/>Recommended Action]
@@ -53,7 +54,8 @@ flowchart LR
   C --> W2["EARF workbook<br/>Summary + 1 sheet per check + fixes"]
 ```
 
-1. **GeoPackage**: features are read without geometry, which is fast. Unsaved edits are included. `geocode` is
+1. **GeoPackage**: features are read with their attributes and a key of the normalized geometry (for
+   `dup_geom`). Unsaved edits are included. `geocode` is
    the final code, made of the barangay code plus `new_ean`. The 2024 code is the barangay code plus `ean`.
 2. **EARF**: the spreadsheet file is read directly. The tool finds the *Prov / Mun / Brgy / EA* header and skips
    the `(2) (3) …` row. Only rows whose name starts with *EA* are checked. Province, city and barangay names
@@ -67,6 +69,7 @@ flowchart LR
 | validation_id | Rule | Automatic fix |
 |---|---|---|
 | `dup_ea` | Two or more records whose attributes are all identical. Only `fid` and the Excel row number are ignored | The first record is kept; the copies are deleted |
+| `dup_geom` | GPKG workbook only: two or more EAs with the same geometry, even if their attributes differ. Vertex order and start point are ignored | The first EA is kept; the others are deleted (check their attributes before saving) |
 | `dup_new_ean` | The same New EA Code value on two or more records in one barangay. Merged EAs are excepted | The first record keeps the code; the others are renumbered (EADM rule) |
 | `missing_geo` | GPKG workbook only: household geocodes that are not in the GeoPackage (as `geocode` or barangay + `ean`; only the GeoPackage's city/muns). EAs the GeoPackage marks **Merged** are not missing. The remarks name the geocode and whether it is also missing in the other file, e.g. *02011009000000 missing in the GeoPackage (found in the EARF)* | Flag only (list) |
 | `earf_missing_geo` | EARF workbook only: household geocodes that are not in the EARF (only the EARF's city/muns are checked). EAs the GeoPackage marks **Merged** are not missing. The remarks name the geocode and whether it is also missing in the other file, e.g. *02011009000000 missing in the GeoPackage (found in the EARF)* | Flag only (list) |
@@ -78,10 +81,10 @@ flowchart LR
 | `null_ea_type` | EA Type is blank | Flag only |
 | `null_hhcount` | Household count is blank | Same as `inv_hhcount` |
 | `null_new_ean` | A Delineated or Merged EA has no New EA Code | Delineated: renumbered (EADM rule). Merged: flag only |
-| `null_remarks` | Reads the 3 files together: the household worksheet marks the EA for delineation or merging, but it is Retained with no remarks in the GeoPackage **or** the EARF. Listed in both workbooks; the remarks column names the file(s) | Flag only |
+| `null_remarks` | Reads the 3 files together: the household worksheet marks the EA for delineation or merging, but it is Retained with **no** remarks in the GeoPackage, **or** Retained **with** remarks in the EARF (an EARF row with no remarks is not flagged). Listed in both workbooks; the remarks column names the file(s) and the reason | Flag only |
 | `null_sy` | Source Year is blank | Source Year set from the EA Type |
 
-Only the ticked validation_ids are fixed. They run in this order: `dup_ea` → `inv_ea_type` → `inv_sy` /
+Only the ticked validation_ids are fixed. They run in this order: `dup_ea` → `dup_geom` → `inv_ea_type` → `inv_sy` /
 `null_sy` → `inv_hhcount` / `null_hhcount` → `null_new_ean` → `dup_new_ean`. Each fix works on the result of
 the ticked fixes before it. For example, an invalid EA Type fixed to Retained then gets Source Year 2024, but
 only when `inv_ea_type` is ticked too. The **Auto-fix** count assumes the checks above it are also fixed; the

@@ -13,6 +13,7 @@ does not understand the multi-row EARF header).
 
 Checks (same validation_id in both workbooks unless noted):
   dup_ea          two or more records with every attribute identical (feature id / Excel row ignored)
+  dup_geom        GPKG workbook: two or more EAs with the same geometry (normalized)
   dup_new_ean     the same New EA Code is used twice in one barangay (Merged EAs excepted)
   missing_geo     GPKG workbook: household-worksheet geocodes not in the GeoPackage (Merged excepted)
   earf_missing_geo EARF workbook: household-worksheet geocodes not in the EARF (EARF's city/muns only)
@@ -23,11 +24,13 @@ Checks (same validation_id in both workbooks unless noted):
   null_ea_count   EA count blank (EARF: only the first row of each old EA; split rows leave it blank)
   null_ea_type / null_hhcount / null_sy   blank values
   null_new_ean    Delineated or Merged EA without a New EA Code
-  null_remarks    EA flagged for delineation/merging in the household worksheet, kept Retained, no remarks
+  null_remarks    EA flagged for delineation/merging in the household worksheet, kept Retained, with no
+                  remarks in the GeoPackage or WITH remarks in the EARF
 
 Fixes (the template's "Recommended Action"; plan_fixes / apply_earf_fixes), only for the
 validation_ids ticked in the results table:
   dup_ea          extra copies deleted (first record kept)
+  dup_geom        later same-geometry EAs deleted (first kept; GeoPackage only)
   inv_ea_type     set to Retained
   inv_sy/null_sy  Source Year from the EA Type (after inv_ea_type)
   inv_hhcount/null_hhcount  hh_count = sum of est_hhcount of the building points in the EA
@@ -62,6 +65,7 @@ SPREADSHEET_EXT = (".xlsx", ".xlsm", ".xls", ".ods", ".csv")
 # (validation_id, title, description) — order and wording follow the templates
 CHECKS = [
     ("dup_ea", "Duplicate EA Records", "EAs with duplicate attribute"),
+    ("dup_geom", "Duplicate Geometry", "EAs with duplicate geometry"),
     ("dup_new_ean", "Duplicate New EA Code",
      "Multiple records share the same New EA Code where uniqueness is expected"),
     ("missing_geo", "Missing Geocode Match",
@@ -90,6 +94,7 @@ SY_ACTION = "Delineated/Merged = 2026, \nRetained = 2024\n\nFix inv_ea_type firs
 HH_ACTION = "Fill missing hh_count, count est_hhcount from bldg_point layer"
 ACTIONS = {
     "dup_ea": ("De-dup", "deletes the extra copies (the first record is kept)"),
+    "dup_geom": ("De-dup", "deletes the later EAs with the same geometry (the first is kept)"),
     "dup_new_ean": ("De-dup", "renumbers the later records by the EADM rule (the first is kept)"),
     "missing_geo": ("Match geocode, output list", None),
     "earf_missing_geo": ("Match geocode, output list", None),
@@ -108,7 +113,7 @@ ACTIONS = {
     "null_sy": (SY_ACTION, "sets Source Year from the EA Type (after the EA Type fix)"),
 }
 GPKG_IDS = [c[0] for c in CHECKS if c[0] != "earf_missing_geo"]
-EARF_IDS = [c[0] for c in CHECKS if c[0] != "missing_geo"]
+EARF_IDS = [c[0] for c in CHECKS if c[0] not in ("missing_geo", "dup_geom")]
 TABS = {"gpkg": "GeoPackage", "earf": "prelim EARF"}
 CROSS_TABS = {("gpkg", "missing_geo"): "2024 POPCEN and GeoPackage",
               ("earf", "earf_missing_geo"): "2024 POPCEN and Prelim EARF"}
@@ -116,6 +121,7 @@ CROSS_TABS = {("gpkg", "missing_geo"): "2024 POPCEN and GeoPackage",
 # Value column(s) of each sheet: (internal column, GPKG header, EARF header)
 VALUE_COLS = {
     "dup_ea": [],
+    "dup_geom": [("ean", "ean", "EA"), ("new_ean", "new_ean", "New EA Code"), ("ea_type", "ea_type", "EA Type")],
     "dup_new_ean": [("new_ean", "new_ean", "New EA Code")],
     "missing_geo": [],
     "earf_missing_geo": [],
@@ -418,6 +424,7 @@ def _gpkg_rows(df, c, label):
     for k, name in c.items():
         out[k] = col(df, name)
     out["_ea_type_raw"] = out["ea_type"]
+    out["_geomkey"] = clean(df["_geomkey"]) if "_geomkey" in df.columns else ""
     out["geocode"] = out["geocode"].str.replace(r"\D", "", regex=True)
     out["ean"] = out["ean"].where(~out["ean"].str.isdigit(), out["ean"].str.zfill(6))
     out["new_ean"] = out["new_ean"].where(~out["new_ean"].str.isdigit(), out["new_ean"].str.zfill(6))
@@ -480,7 +487,9 @@ def common_checks(df, subject_by_geocode, old_key, first_only_count=False, null_
         else:                            # GeoPackage and EARF read together (see run_checks)
             where = df[old_key].map(null_remarks_where).fillna("")
         add("null_remarks", (subj != "") & (where != ""),
-            "subject for " + subj + " in the household worksheet; Retained with no remarks in " + where)
+            "subject for " + subj + " in the household worksheet; Retained "
+            + where.str.replace("GeoPackage", "with no remarks in the GeoPackage")
+                   .str.replace("EARF", "with remarks in the EARF"))
 
     add("null_sy", sy == "", "Source Year is blank")
     return res
@@ -510,9 +519,11 @@ def run_checks(gpkg=None, earf=None, household=None, step=print):
     where = None
     if subject is not None:
         hits = {}
-        for name, frame, key in (("GeoPackage", gpkg, "old_geocode"), ("EARF", earf, "geocode")):
+        # GeoPackage: Retained with NO remarks; EARF: Retained but WITH remarks (user rule)
+        for name, frame, key, blank in (("GeoPackage", gpkg, "old_geocode", True),
+                                        ("EARF", earf, "geocode", False)):
             if frame is not None and not frame.empty:
-                bad = frame[(frame["ea_type"] == "RETAINED") & (frame["remarks"] == "")
+                bad = frame[(frame["ea_type"] == "RETAINED") & ((frame["remarks"] == "") == blank)
                             & frame[key].isin(subject.index)]
                 for g in bad[key].unique():
                     hits.setdefault(g, []).append(name)
@@ -524,6 +535,13 @@ def run_checks(gpkg=None, earf=None, household=None, step=print):
 
     if gpkg is not None and not gpkg.empty:
         res = common_checks(gpkg, subject, "old_geocode", null_remarks_where=where)
+        # dup_geom: two or more EAs with the same geometry (vertex order / start point ignored)
+        gk = gpkg["_geomkey"]
+        dg = (gk != "") & gk.duplicated(keep=False)
+        grp = gk.map({k: i + 1 for i, k in enumerate(gk[dg].unique())})
+        gnote = ("same geometry as " + (gk.map(gk.value_counts()) - 1).astype(str)
+                 + " other EA(s) (group " + grp.fillna(0).astype(int).astype(str) + ")")
+        res["dup_geom"] = (gpkg[dg], gnote[dg])
         if household is not None and not household.empty:
             # 2024 household-worksheet EAs (GeoPackage's city/muns) with no GeoPackage record, by the
             # final geocode or the 2024 EA code; EAs the GeoPackage marks Merged are not missing.
@@ -703,6 +721,14 @@ def plan_fixes(df, wb, hh_sum=None, only=None):
     for idx in w.index[dup]:
         emit("dup_ea", idx, "", "", "", action="delete")
     w = w[~dup].copy()
+
+    # dup_geom (GeoPackage): keep the first EA of each same-geometry group, delete the others
+    if wb == "gpkg" and "_geomkey" in w.columns and on("dup_geom"):
+        gk = w["_geomkey"]
+        dg = (gk != "") & gk.duplicated(keep="first")
+        for idx in w.index[dg]:
+            emit("dup_geom", idx, "", "", "", action="delete", reason="same geometry as an earlier EA")
+        w = w[~dg].copy()
 
     # inv_ea_type: anything else becomes Retained
     retained = "Retained" if _type_style(w["_ea_type_raw"]) == "title" else "RETAINED"
@@ -1056,7 +1082,8 @@ workbooks keep a record of the records as they were and of the planned fixes. If
 and in the attribute table, then <b>Save</b> (or <b>Roll Back</b>) the layer edits in QGIS. EARF fixes are
 saved to <code>&lt;EARF name&gt;_fixed.xlsx</code> in the output folder; the original is not changed.
 The tool then checks again (using the fixed EARF) so only what is left is listed. Export again to record
-what is left and the fixes made; each new check must be exported before its fixes are applied.</li>
+what is left and the fixes made. The export is asked for once per <b>Run Check</b>: after it, you can fix
+one validation_id after another without exporting again.</li>
 </ol>
 
 <h3>Inputs</h3>
@@ -1080,6 +1107,8 @@ It is required: it gives <code>earf_missing_geo</code> and the subject flags use
 <p>Only the ticked validation_ids are fixed. They run in this order, each on the result of the one before:</p>
 <ol>
 <li><b>dup_ea</b>: the first record of each identical group is kept; the copies are deleted.</li>
+<li><b>dup_geom</b> (GeoPackage): the first EA of each same-geometry group is kept; the others are deleted.
+Check the attributes of the deleted EAs before saving the layer edits.</li>
 <li><b>inv_ea_type</b>: any EA Type other than Retained, Delineated or Merged becomes <b>Retained</b>
 (written the way the file writes its types, <i>RETAINED</i> or <i>Retained</i>).</li>
 <li><b>inv_sy</b> / <b>null_sy</b>: Source Year from the EA Type: Retained = 2024, Delineated / Merged
@@ -1122,6 +1151,8 @@ Prov+Mun+Brgy+EA.</li>
 <li><b>dup_ea</b>: two or more records whose attributes are all the same (every field of the attribute
 table, or every column of the EARF row). Only the feature id (<code>fid</code>) and the Excel row number
 are ignored. The remarks column gives a group number so the copies can be paired.</li>
+<li><b>dup_geom</b> (GeoPackage only): two or more EAs with the same geometry, even if their attributes
+differ. Vertex order and start point are ignored. The remarks column gives a group number.</li>
 <li><b>dup_new_ean</b>: the same New EA Code value on two or more records in one barangay. Merged EAs are not counted, since
 merged parts can share the code they merge into.</li>
 <li><b>missing_geo</b> (GPKG workbook): household-worksheet geocodes not in the GeoPackage (neither as
@@ -1139,8 +1170,9 @@ Prov+Mun+Brgy+New EA Code (or EA when blank).</li>
 <li><b>null_ea_count</b> (EARF): only the first row of each 2024 EA is checked, because split rows leave
 <i>Number of EAs</i> blank.</li>
 <li><b>null_remarks</b>: reads the 3 files together. The household worksheet marks the EA for delineation
-or merging, but the EA is Retained with no remarks in the GeoPackage <i>or</i> in the EARF. It is listed in
-both workbooks, and the remarks column names the file(s) where it is Retained with no remarks.</li>
+or merging, but the EA is Retained with <b>no</b> remarks in the GeoPackage, <i>or</i> Retained <b>with</b>
+remarks in the EARF. An EARF row with no remarks is not flagged. It is listed in both workbooks, and the
+remarks column names the file(s) and the reason.</li>
 </ul>
 
 <h3>Output</h3>
@@ -1557,15 +1589,22 @@ def make_dialog_class():
 
         def _read_gpkg(self, layers):
             frames = []
-            req = QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry)
+            import hashlib
+            from qgis.core import QgsGeometry
             for layer in layers:
                 names = layer.fields().names()
                 rows = []
-                for f in layer.getFeatures(req):
+                for f in layer.getFeatures():
                     d = dict(zip(names, f.attributes()))
                     d["_fid"] = f.id()
+                    gkey = ""
+                    if f.hasGeometry() and not f.geometry().isEmpty():
+                        g = QgsGeometry(f.geometry())
+                        g.normalize()   # same shape, other vertex order / start point -> same key
+                        gkey = hashlib.md5(bytes(g.asWkb())).hexdigest()
+                    d["_geomkey"] = gkey
                     rows.append(d)
-                df = pd.DataFrame(rows, columns=names + ["_fid"])
+                df = pd.DataFrame(rows, columns=names + ["_fid", "_geomkey"])
                 df["_layer_id"] = layer.id()
                 frames.append(gpkg_frame(df, layer.name()))
                 self.say(f"  GeoPackage '{layer.name()}': {len(df)} EAs")
@@ -1625,7 +1664,8 @@ def make_dialog_class():
             return by_fid, by_geo
 
         def run(self, *_, keep_applied=False):
-            self.exported = False       # a new check must be exported before its fixes are applied
+            if not keep_applied:        # a new Run Check must be exported once before fixing; the
+                self.exported = False   # automatic re-check after Apply keeps the earlier export
             if not keep_applied:
                 self.applied_plans = None
                 self.applied_ticked, self.fixed_rows = {}, {}
