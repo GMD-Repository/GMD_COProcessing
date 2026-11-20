@@ -43,7 +43,7 @@ The engine (everything above the "window" section) has no Qt code and can be run
 # Menu / panel entry (read by the GMD CO Processing plugin)
 TOOL_NAME = "[TEST] EARF Inconsistency Checks"
 TOOL_GROUP = "[TEST] EA Post-Processing"
-TOOL_ICON = "icons/earf_post_processing.svg"
+TOOL_ICON = "icons/earf_inconsistency.svg"
 
 import math
 import os
@@ -1188,6 +1188,10 @@ city/municipality code (or the province code, or <i>combined</i>).</p>
 <ul>
 <li><i>no 'Prov / Mun / Brgy / EA' header row found</i>: the wrong sheet is loaded; add the EARF sheet.</li>
 <li><i>the layer has no 'geocode' field</i>: the chosen GeoPackage layer is not an ea2026 layer.</li>
+<li>The EA layer is missing from <b>1. EA GeoPackage</b>: it must be a polygon layer with a
+<code>geocode</code> (or <code>ea_geocode</code> / <code>psgc_ea</code>) field, in any letter case. With
+several polygon layers, a name with <i>ea2026</i> is picked first, then the layer with the most EA fields;
+pick another one from the list if needed, or press <b>Refresh Layers</b>.</li>
 <li>The table counts are per check; one EA can appear in several checks.</li>
 <li>The building-point layer is not in the <b>Building points</b> list: it must be a point layer with an
 <code>est_hhcount</code> field.</li>
@@ -1218,9 +1222,10 @@ def make_dialog_class():
     class LayerPicker(QtWidgets.QGroupBox):
         """One dropdown of the matching layers in the Layers panel."""
 
-        def __init__(self, title, accept, hint, parent=None, optional=None):
+        def __init__(self, title, accept, hint, parent=None, optional=None, score=None):
             super().__init__(title, parent)
             self.accept, self.hint, self.optional = accept, re.compile(hint, re.I), optional
+            self.score = score   # optional ranking for the default choice (highest wins)
             lay = QtWidgets.QVBoxLayout(self)
             self.combo = QtWidgets.QComboBox()
             self.combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
@@ -1244,8 +1249,11 @@ def make_dialog_class():
                 self.combo.addItem("(no matching layer in the Layers panel)", None)
             idx = self.combo.findData(current) if current else -1
             if idx < 0:   # first time / layer removed: pick the likeliest layer by name
-                hit = next((i for i, l in enumerate(layers)
-                            if self.hint.search(l.name() + " " + l.source())), None)
+                if self.score is not None and layers:
+                    hit = max(range(len(layers)), key=lambda i: self.score(layers[i]))
+                else:
+                    hit = next((i for i, l in enumerate(layers)
+                                if self.hint.search(l.name() + " " + l.source())), None)
                 idx = hit + off if hit is not None else 0
             self.combo.setCurrentIndex(idx)
             self.combo.blockSignals(False)
@@ -1345,9 +1353,19 @@ def make_dialog_class():
             return [(p, sheet, label)]
 
     def is_gpkg_layer(layer):
-        return (layer.type() == QgsMapLayer.VectorLayer
-                and layer.geometryType() == QgsWkbTypes.PolygonGeometry
-                and layer.fields().indexOf("geocode") >= 0)
+        """A polygon layer (or a GeoPackage table of generic GEOMETRY type) with a geocode field in any
+        letter case or alias (geocode / ea_geocode / psgc_ea), like the engine's gpkg_colmap."""
+        if layer.type() != QgsMapLayer.VectorLayer:
+            return False
+        if layer.geometryType() not in (QgsWkbTypes.PolygonGeometry, QgsWkbTypes.UnknownGeometry):
+            return False
+        return gpkg_colmap(layer.fields().names())["geocode"] is not None
+
+    def gpkg_score(layer):
+        """Ranks the ea2026 candidates: a name with 'ea2026' first, then layers with more EA fields."""
+        c = gpkg_colmap(layer.fields().names())
+        named = bool(re.search(r"ea_?2026", layer.name() + " " + layer.source(), re.I))
+        return (named, sum(1 for k in ("new_ean", "ea_type", "sy", "hh_count", "ean") if c[k]))
 
     def bldg_field(layer):
         return pick(layer.fields().names(), "est_hhcount", "est_hh_count", "est_hh", contains=["est_hh"])
@@ -1450,7 +1468,8 @@ def make_dialog_class():
             hint.setWordWrap(True)
             hint.setStyleSheet(f"color:{th['hint']}; font-size:11px;")
             lv.addWidget(hint)
-            self.gpkg_list = LayerPicker("1. EA GeoPackage (ea2026)", is_gpkg_layer, r"ea2026")
+            self.gpkg_list = LayerPicker("1. EA GeoPackage (ea2026)", is_gpkg_layer, r"ea_?2026",
+                                        score=gpkg_score)
             self.earf_list = FilePicker("2. Preliminary EARF", r"earf", self._gpkg_folder)
             self.hh_list = FilePicker("3. Est. No. of Households",
                                       r"household|hh|popcen|estimated", self._gpkg_folder)
