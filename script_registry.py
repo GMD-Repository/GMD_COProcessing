@@ -60,6 +60,11 @@ def mbi_coverage_icon():
     return QIcon(svg) if os.path.exists(svg) else plugin_icon()
 
 
+def earf_inconsistency_icon():
+    svg = os.path.join(ICONS_DIR, "earf_inconsistency.svg")
+    return QIcon(svg) if os.path.exists(svg) else plugin_icon()
+
+
 def theme_icon(name):
     return QgsApplication.getThemeIcon(f"/{name}")
 

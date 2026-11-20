@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- [TEST] EA Post-Processing group: folder with a test flask -->
+  <path d="M2 6 a2 2 0 0 1 2-2 H9 L11 6 H20 a2 2 0 0 1 2 2 V18 a2 2 0 0 1-2 2 H4 a2 2 0 0 1-2-2 Z" fill="#b45309"/>
+  <path d="M2 9 H22 V18 a2 2 0 0 1-2 2 H4 a2 2 0 0 1-2-2 Z" fill="#f59e0b"/>
+  <!-- flask -->
+  <path d="M10.5 9.5 H13.5 M11 9.5 V12.5 L8.5 17.2 a0.9 0.9 0 0 0 0.8 1.3 H14.7 a0.9 0.9 0 0 0 0.8-1.3 L13 12.5 V9.5"
+        fill="#ffffff" stroke="#7c2d12" stroke-width="1" stroke-linejoin="round" stroke-linecap="round"/>
+  <path d="M9.6 15.3 H14.4 L15.2 17 a0.6 0.6 0 0 1-0.5 0.9 H9.3 a0.6 0.6 0 0 1-0.5-0.9 Z" fill="#0ea5e9"/>
+</svg>
