@@ -23,15 +23,17 @@ also fixes the records. It writes two workbooks in the *EA List of Inconsistenci
    (for example `bldg_point`). With *(none)*, the household checks are flagged only.
 4. Press **Run Check**. The upper table lists each check with its **Frequency**, **Auto-fix** count and
    **Recommended Action**.
-5. Click a check to see its records. Double-click a GeoPackage record to zoom to that EA. The
-   **Planned Fixes** tab lists every change with its old and new value.
-6. Press **Apply Fixes**:
+5. Click a check to see its records. Double-click a GeoPackage record to zoom to that EA.
+6. Nothing is fixed until you choose. Tick the **Auto-fix** box of each validation_id you want fixed; GPKG
+   and EARF rows are ticked separately. The **Planned Fixes** tab lists the changes of the ticked checks only,
+   with the old and new value.
+7. Press **Apply Selected Fixes**:
    - GeoPackage: the fixes go into the layer's edit session. Review them, then **Save** (or **Roll Back**)
      the layer edits in QGIS.
    - EARF: the fixes are saved to `<EARF name>_fixed.xlsx` in the output folder. The original is not changed.
 
    The tool then checks again, using the fixed EARF, so only what is left is listed.
-7. Set **5. Output folder**, then press **Export Excel**.
+8. Set **5. Output folder**, then press **Export Excel**.
 
 ## How it works
 
@@ -42,8 +44,8 @@ flowchart LR
   H[Household worksheet] --> C
   C --> P[Planned fixes<br/>Recommended Action]
   B[Building points<br/>est_hhcount, optional] --> P
-  P -->|Apply Fixes| GE[GeoPackage edit session]
-  P -->|Apply Fixes| EF["EARF _fixed.xlsx copy"]
+  P -->|Apply Selected Fixes| GE[GeoPackage edit session]
+  P -->|Apply Selected Fixes| EF["EARF _fixed.xlsx copy"]
   C --> W1["GPKG workbook<br/>Summary + 1 sheet per check + fixes"]
   C --> W2["EARF workbook<br/>Summary + 1 sheet per check + fixes"]
 ```
@@ -57,7 +59,7 @@ flowchart LR
 3. **Household worksheet**: the header row with `province_code … barangay_code` is found. Rows above EA level
    are dropped, and the *EA Subject for Delineation / Merging* flags are kept.
 4. All checks run as whole-column pandas operations.
-5. **Fixes** are planned on a copy of the data (nothing is changed until **Apply Fixes**), in the order below.
+5. **Fixes** are planned on a copy of the data (nothing is changed until **Apply Selected Fixes**), in the order below.
 
 | validation_id | Rule | Automatic fix |
 |---|---|---|
@@ -76,9 +78,11 @@ flowchart LR
 | `null_remarks` | Reads the 3 files together: the household worksheet marks the EA for delineation or merging, but it is Retained with no remarks in the GeoPackage **or** the EARF. Listed in both workbooks; the remarks column names the file(s) | Flag only |
 | `null_sy` | Source Year is blank | Source Year set from the EA Type |
 
-Fix order: `dup_ea` → `inv_ea_type` → `inv_sy` / `null_sy` → `inv_hhcount` / `null_hhcount` → `null_new_ean` →
-`dup_new_ean`. Each fix works on the result of the one before. For example, an EA Type fixed to Retained then
-gets Source Year 2024.
+Only the ticked validation_ids are fixed. They run in this order: `dup_ea` → `inv_ea_type` → `inv_sy` /
+`null_sy` → `inv_hhcount` / `null_hhcount` → `null_new_ean` → `dup_new_ean`. Each fix works on the result of
+the ticked fixes before it. For example, an invalid EA Type fixed to Retained then gets Source Year 2024, but
+only when `inv_ea_type` is ticked too. The **Auto-fix** count assumes the checks above it are also fixed; the
+**Planned Fixes** tab shows what will really change.
 
 ### Rules used by the fixes
 
@@ -98,11 +102,11 @@ gets Source Year 2024.
 Each workbook has:
 
 - A **Summary** sheet with each check's frequency and Recommended Action, with links to the check sheets. Its
-  remarks column says how many records were (or will be) fixed automatically, or *flag only*.
+  remarks column says how many records were (or will be) fixed automatically, *not fixed automatically* when the check was not ticked, or *flag only*.
 - One sheet per check that found something.
 - A **fixes** sheet listing every automatic change, with the old and new value.
 
-If you export after **Apply Fixes**, the frequencies show what is left and the fixes are listed as *fixed*.
+If you export after **Apply Selected Fixes**, the frequencies show what is left and the fixes are listed as *fixed*.
 
 Checks that find no inconsistency are left out of the results table and of the exported workbooks. A check
 that could not run (for example, no household worksheet) is still listed on the Summary as *Not checked*.
