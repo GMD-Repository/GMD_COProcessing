@@ -27,13 +27,16 @@ also fixes the records. It writes two workbooks in the *EA List of Inconsistenci
 6. Nothing is fixed until you choose. Tick the **Auto-fix** box of each validation_id you want fixed; GPKG
    and EARF rows are ticked separately. The **Planned Fixes** tab lists the changes of the ticked checks only,
    with the old and new value.
-7. Press **Apply Selected Fixes**:
+7. Set **5. Output folder**, then press **Export Excel**. This is required before fixing, so the workbooks keep
+   a record of the records as they were and of the planned fixes. If you press **Apply Selected Fixes** without
+   exporting, a popup asks you to export first (**Export Excel Now**).
+8. Press **Apply Selected Fixes**:
    - GeoPackage: the fixes go into the layer's edit session. Review them, then **Save** (or **Roll Back**)
      the layer edits in QGIS.
    - EARF: the fixes are saved to `<EARF name>_fixed.xlsx` in the output folder. The original is not changed.
 
-   The tool then checks again, using the fixed EARF, so only what is left is listed.
-8. Set **5. Output folder**, then press **Export Excel**.
+   The tool then checks again, using the fixed EARF, so only what is left is listed. Export again to record what
+   is left and the fixes made. Each new check must be exported before its fixes are applied.
 
 ## How it works
 
@@ -65,8 +68,8 @@ flowchart LR
 |---|---|---|
 | `dup_ea` | Two or more records whose attributes are all identical. Only `fid` and the Excel row number are ignored | The first record is kept; the copies are deleted |
 | `dup_new_ean` | The same New EA Code value on two or more records in one barangay. Merged EAs are excepted | The first record keeps the code; the others are renumbered (EADM rule) |
-| `missing_geo` | GPKG workbook only: household geocodes that are not in the GeoPackage (as `geocode` or barangay + `ean`; only the GeoPackage's city/muns). EAs the GeoPackage marks **Merged** are not missing | Flag only (list) |
-| `earf_missing_geo` | EARF workbook only: household geocodes that are not in the EARF (only the EARF's city/muns are checked). EAs the GeoPackage marks **Merged** are not missing | Flag only (list) |
+| `missing_geo` | GPKG workbook only: household geocodes that are not in the GeoPackage (as `geocode` or barangay + `ean`; only the GeoPackage's city/muns). EAs the GeoPackage marks **Merged** are not missing. The remarks name the geocode and whether it is also missing in the other file, e.g. *02011009000000 missing in the GeoPackage (found in the EARF)* | Flag only (list) |
+| `earf_missing_geo` | EARF workbook only: household geocodes that are not in the EARF (only the EARF's city/muns are checked). EAs the GeoPackage marks **Merged** are not missing. The remarks name the geocode and whether it is also missing in the other file, e.g. *02011009000000 missing in the GeoPackage (found in the EARF)* | Flag only (list) |
 | `inv_ea_type` | EA Type is something other than Retained, Delineated or Merged | Set to **Retained** |
 | `inv_hhcount` | Household count equals building count. In the EARF workbook the Geocode is the Prelim EARF geocode (Prov+Mun+Brgy+New EA Code, or EA when blank) | `hh_count` = sum of `est_hhcount` of the building points in the EA |
 | `inv_new_ean` | New EA Code is not 6 digits | Flag only |
@@ -88,13 +91,15 @@ only when `inv_ea_type` is ticked too. The **Auto-fix** count assumes the checks
 
 - **EA Type** is written the way the file writes its types (`RETAINED` or `Retained`).
 - **Source Year**: Retained = 2024, Delineated / Merged = 2026. A blank EA Type is left flagged.
-- **Household recount**: each building point is counted once, in the first EA polygon it falls in, even if it
+- **Household recount**: the sum is rounded up to a whole number (168.963 → 169). Each building point is counted once, in the first EA polygon it falls in, even if it
   sits on a shared boundary. An EARF row takes the sum of the GeoPackage EA with the same final geocode. An EA
   with no building point is left flagged.
 - **EADM renumbering**: an EA keeps its own (mother) code when that code is free in the barangay. Otherwise it
   gets the next EA number after the highest one in the barangay, followed by the mother's 3 digits. For
   example, mother `005000` with last EA `009000` gives `010005`. A barangay's single EA `000000` splits into
-  `001000`, `002000`, and so on. In the GeoPackage, `geocode` is updated to barangay + New EA Code.
+  `001000`, `002000`, and so on. In the GeoPackage, `geocode` is updated to barangay + New EA Code. A repeated
+  code on an identical copy of another record is not renumbered: it is a `dup_ea` case, so tick `dup_ea` to
+  delete the copy.
 - The GeoPackage and the EARF are fixed separately. Check that renumbered codes agree in both.
 
 ## Output
@@ -104,9 +109,23 @@ Each workbook has:
 - A **Summary** sheet with each check's frequency and Recommended Action, with links to the check sheets. Its
   remarks column says how many records were (or will be) fixed automatically, *not fixed automatically* when the check was not ticked, or *flag only*.
 - One sheet per check that found something.
-- A **fixes** sheet listing every automatic change, with the old and new value.
+- A **fixes** sheet listing every automatic change, with the old value, the new value and an explanation.
 
 If you export after **Apply Selected Fixes**, the frequencies show what is left and the fixes are listed as *fixed*.
+
+### New EA Code remarks
+
+On the `null_new_ean`, `dup_new_ean` and `inv_new_ean` sheets (and in the results table), each record's remarks
+say what happened to it:
+
+- *TO BE FIXED* (before applying) or *FIXED* (after), with the old and the new New EA Code and the EADM
+  explanation. For example: *FIXED: new_ean (blank) -> 008007 (EADM: next EA number after the barangay's last
+  EA (007) is 008, followed by the mother EA 007 = 008007)*.
+- Or why it is not fixed: the check was not ticked; it is a Merged EA (no numbering rule); `inv_new_ean` is flag
+  only (renumber manually); it is an identical copy (`dup_ea`); or *kept*, for the first record of a repeated code.
+
+Exported after **Apply Selected Fixes**, these sheets still list the fixed records (marked *FIXED*) above the
+ones that are left.
 
 Checks that find no inconsistency are left out of the results table and of the exported workbooks. A check
 that could not run (for example, no household worksheet) is still listed on the Summary as *Not checked*.
