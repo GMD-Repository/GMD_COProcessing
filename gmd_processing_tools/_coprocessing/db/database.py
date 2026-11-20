@@ -4143,33 +4143,6 @@ class POPCENDatabase:
             }
             all_records.append(rec)
 
-        # Check map_uuid for duplicates: if there are duplicates, check ea_type for Delineated values
-        # and update with a new UUID to prevent duplicate map_uuid
-        seen_map_uuids = collections.defaultdict(list)
-        for idx, rec in enumerate(all_records):
-            u = rec.get("map_uuid", "")
-            if u:
-                seen_map_uuids[u].append(idx)
-
-        import uuid
-        for u, indices in seen_map_uuids.items():
-            if len(indices) > 1:
-                delin_indices = []
-                other_indices = []
-                for idx in indices:
-                    rec = all_records[idx]
-                    ea_t = str(rec.get("ea_type") or "").strip().upper()
-                    rem = str(rec.get("remarks") or "").strip().lower()
-                    if "DELIN" in ea_t or "delineat" in rem or "split" in ea_t or "split" in rem:
-                        delin_indices.append(idx)
-                    else:
-                        other_indices.append(idx)
-
-                # Delineated duplicates receive new UUIDs to prevent duplication
-                target_indices = delin_indices if other_indices else delin_indices[1:]
-                for idx in target_indices:
-                    all_records[idx]["map_uuid"] = str(uuid.uuid4())
-
         placeholders = ", ".join(["?"] * len(cols))
         insert_sql = f"INSERT INTO gpkg_records ({', '.join(cols)}) VALUES ({placeholders})"
 
@@ -4349,14 +4322,20 @@ class POPCENDatabase:
             results["summary"] = val_out.get("summary", [])
             results["issues_by_rule"] = val_out.get("issues_by_rule", {})
 
-            # 2. Count geocodes and files
+            # 2. Count geocodes, map_uuids, and files
             import collections
             gc_map = collections.defaultdict(list)
+            uuid_map = collections.defaultdict(list)
             for r in rows:
                 gc = str(r.get("geocode") or "").strip()
                 gc_map[gc].append(r)
+                u = str(r.get("map_uuid") or r.get("uuid") or "").strip()
+                if u and u.lower() not in ("nan", "none", "null"):
+                    uuid_map[u].append(r)
 
             results["unique_geocodes"] = len([gc for gc in gc_map if gc])
+            dup_uuid_count = len([u for u, rlist in uuid_map.items() if len(rlist) > 1])
+            results["duplicate_map_uuids"] = dup_uuid_count
 
             # Attribute conflict detection
             conflict_geocodes = set()
@@ -4407,6 +4386,9 @@ class POPCENDatabase:
                 if r_nt:
                     details.append(r_nt)
 
+                m_uuid = str(r.get("map_uuid") or r.get("uuid") or "").strip()
+                is_dup_uuid = bool(m_uuid and m_uuid.lower() not in ("nan", "none", "null") and len(uuid_map.get(m_uuid, [])) > 1)
+
                 if is_invalid_gc:
                     st = "INVALID_GEOCODE"
                     details.append("Geocode is empty or malformed (<9 chars)")
@@ -4415,6 +4397,11 @@ class POPCENDatabase:
                     st = "NO_GEOMETRY"
                     details.append("Feature lacks valid geometry or has empty polygon")
                     missing_geom_cnt += 1
+                elif is_dup_uuid:
+                    st = "DUPLICATE_MAP_UUID"
+                    u_cnt = len(uuid_map[m_uuid])
+                    if "dup_map_uuid" not in r_nt:
+                        details.append(f"[dup_map_uuid] map_uuid '{m_uuid}' duplicated across {u_cnt} features")
                 elif gc in conflict_geocodes:
                     st = "CONFLICTING_DATA"
                     details.append(f"Attribute mismatch across duplicates ({conflict_notes.get(gc, '')})")
@@ -4441,7 +4428,7 @@ class POPCENDatabase:
             results["missing_geometry"] = missing_geom_cnt
             results["invalid_geocodes"] = invalid_gc_cnt
 
-            if results["cross_file_overlaps"] > 0 or results["attribute_conflicts"] > 0:
+            if results["cross_file_overlaps"] > 0 or results["attribute_conflicts"] > 0 or dup_uuid_count > 0:
                 results["status_level"] = "OVERLAPS_FOUND"
             elif results["multipart_geocodes"] > 0 or missing_geom_cnt > 0 or invalid_gc_cnt > 0 or results["errors"] > 0 or results["warnings"] > 0:
                 results["status_level"] = "WARNING"
@@ -4643,6 +4630,8 @@ class POPCENDatabase:
                 conditions.append("(consistency_status NOT IN ('UNIQUE', 'PASS') OR consistency_detail LIKE '%[%]%')")
             elif issue_filter == "Cross-File Overlaps Only":
                 conditions.append("consistency_status IN ('CROSS_FILE_DUP', 'CONFLICTING_DATA') AND file_count > 1")
+            elif "duplicate map_uuid" in issue_filter.lower() or "dup_map_uuid" in issue_filter.lower() or issue_filter == "Duplicate map_uuid Only":
+                conditions.append("(consistency_status = 'DUPLICATE_MAP_UUID' OR consistency_detail LIKE '%dup_map_uuid%' OR consistency_detail LIKE '%map_uuid%')")
             elif issue_filter == "Intra-File Multipart Only":
                 conditions.append("consistency_status = 'MULTIPART_PARTS'")
             elif issue_filter == "Conflicting Data Only":

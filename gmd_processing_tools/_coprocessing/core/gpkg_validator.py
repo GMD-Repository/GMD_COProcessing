@@ -19,6 +19,15 @@ except ImportError:
 # 13 Official GeoPackage Validation Rules (From Google Spreadsheet)
 GPKG_VALIDATION_SPECS = [
     {
+        "id": "dup_map_uuid",
+        "tabs": "GeoPackage",
+        "title": "Duplicate Map UUID",
+        "description": "Multiple records share the same map_uuid in the GeoPackage",
+        "remarks": "create new sheet named values under validation_id",
+        "headers": ["map_uuid", "geocode", "region", "province", "city_mun", "barangay", "ean", "remarks"],
+        "severity": "ERROR",
+    },
+    {
         "id": "dup_ea",
         "tabs": "GeoPackage",
         "title": "Duplicate EA Records",
@@ -210,6 +219,7 @@ def run_gpkg_validations(
 
     # 1. Uniqueness pre-scans
     geocode_counts: Dict[str, int] = {}
+    map_uuid_counts: Dict[str, int] = {}
     brgy_new_ean_counts: Dict[Tuple[str, str, str, str], int] = {}
     gpkg_geocodes_found: Set[str] = set()
 
@@ -220,11 +230,15 @@ def run_gpkg_validations(
         row_status[rec_id] = "PASS"
 
         gc = _clean_str(r.get("geocode"))
+        m_uuid = _clean_str(r.get("map_uuid") or r.get("uuid"))
         prov = _clean_str(r.get("province"))
         mun = _clean_str(r.get("city_mun"))
         brgy = _clean_str(r.get("barangay"))
         ean = _clean_str(r.get("ean"))
         new_ean = _clean_str(r.get("new_ean") or r.get("code"))
+
+        if m_uuid and m_uuid.lower() not in ("nan", "none", "null"):
+            map_uuid_counts[m_uuid] = map_uuid_counts.get(m_uuid, 0) + 1
 
         is_brgy_header = (ean == "000000") or (not ean and _clean_str(r.get("name")).upper().startswith("BARANGAY"))
 
@@ -240,6 +254,7 @@ def run_gpkg_validations(
     for idx, r in enumerate(gpkg_records):
         rec_id = r.get("id")
         gc = _clean_str(r.get("geocode"))
+        m_uuid = _clean_str(r.get("map_uuid") or r.get("uuid"))
         reg = _clean_str(r.get("region"))
         prov = _clean_str(r.get("province"))
         mun = _clean_str(r.get("city_mun"))
@@ -278,6 +293,10 @@ def run_gpkg_validations(
             issues_by_rule[rule_id].append(row_copy)
 
         if not is_brgy_header:
+            # Rule 0: dup_map_uuid (Duplicate Map UUID)
+            if m_uuid and m_uuid.lower() not in ("nan", "none", "null") and map_uuid_counts.get(m_uuid, 0) > 1:
+                _flag("dup_map_uuid", f"map_uuid '{m_uuid}' duplicated across {map_uuid_counts[m_uuid]} features in GeoPackage")
+
             # Rule 1: dup_ea (Duplicate EA Records in GeoPackage)
             if gc and geocode_counts.get(gc, 0) > 1:
                 _flag("dup_ea", f"Geocode '{gc}' duplicated {geocode_counts[gc]} times in GeoPackage")
