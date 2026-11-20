@@ -561,6 +561,8 @@ def export_matched_records_to_gpkg(
 
     # 2. Metadata cache from gpkg_database.db
     gpkg_meta: Dict[str, Dict[str, Any]] = {}
+    gpkg_meta_by_uuid: Dict[str, Dict[str, Any]] = {}
+    gpkg_meta_by_bgy_ean: Dict[Tuple[str, str], Dict[str, Any]] = {}
     gpkg_path = gpkg_db_path
     if not gpkg_path or not os.path.exists(gpkg_path):
         from .database import get_default_gpkg_db_path
@@ -570,24 +572,38 @@ def export_matched_records_to_gpkg(
         try:
             with sqlite3.connect(gpkg_path) as conn:
                 cur = conn.cursor()
-                cur.execute("SELECT geocode, map_uuid, region, province, city_mun, barangay, name, code, remarks, COALESCE(NULLIF(hh_count, ''), hhcount, ''), COALESCE(NULLIF(bldg_count, ''), bldgcount, ''), sy, ea_type FROM gpkg_records")
+                cur.execute("PRAGMA table_info(gpkg_records)")
+                g_cols = {row[1] for row in cur.fetchall()}
+
+                fean_col = "final_ean" if "final_ean" in g_cols else ("recoded_ean" if "recoded_ean" in g_cols else "''")
+                cur.execute(f"SELECT geocode, map_uuid, region, province, city_mun, barangay, name, code, remarks, COALESCE(NULLIF(hh_count, ''), hhcount, ''), COALESCE(NULLIF(bldg_count, ''), bldgcount, ''), sy, ea_type, ean, {fean_col} FROM gpkg_records")
                 for row in cur.fetchall():
                     gc = str(row[0] or "").strip()
+                    m_uuid = str(row[1] or "").strip()
+                    ean_val = str(row[13] or "").strip()
+                    fean_val = str(row[14] or "").strip()
+                    meta_item = {
+                        "map_uuid": m_uuid,
+                        "region": row[2],
+                        "province": row[3],
+                        "city_mun": row[4],
+                        "barangay": row[5],
+                        "name": row[6],
+                        "code": row[7],
+                        "remarks": row[8],
+                        "hh_count": row[9],
+                        "bldg_count": row[10],
+                        "sy": row[11],
+                        "ea_type": row[12],
+                        "ean": ean_val,
+                        "final_ean": fean_val,
+                    }
                     if gc:
-                        gpkg_meta[gc] = {
-                            "map_uuid": row[1],
-                            "region": row[2],
-                            "province": row[3],
-                            "city_mun": row[4],
-                            "barangay": row[5],
-                            "name": row[6],
-                            "code": row[7],
-                            "remarks": row[8],
-                            "hh_count": row[9],
-                            "bldg_count": row[10],
-                            "sy": row[11],
-                            "ea_type": row[12],
-                        }
+                        gpkg_meta[gc] = meta_item
+                    if m_uuid:
+                        gpkg_meta_by_uuid[m_uuid] = meta_item
+                    if len(gc) >= 8 and ean_val:
+                        gpkg_meta_by_bgy_ean[(gc[:8], ean_val.zfill(6))] = meta_item
         except Exception:
             pass
 
@@ -769,6 +785,38 @@ def export_matched_records_to_gpkg(
         # PRIMARY GEOMETRY PRESERVATION PATH:
         # Export every single polygon directly from the input GeoPackage!
         # Guaranteed: ZERO geometry changes, ZERO polygon deletions.
+
+        # Ensure Final EAN / Recoded EAN is computed across reconciled records
+        if records:
+            try:
+                from .database import compute_recoded_enumeration_areas
+                compute_recoded_enumeration_areas(records)
+            except Exception:
+                pass
+
+        # Prepare fallback Final EAN for all input polygons adhering to Sub-tab 3 GeoPackage recoding rules
+        poly_proxies = []
+        for poly in raw_polygons:
+            a = poly["attrs"]
+            poly_proxies.append({
+                "map_uuid": poly["m_uuid"],
+                "geocode": poly["gc"],
+                "ean": poly["ean"],
+                "new_ean": to_whole_number_str(a.get("new_ean") or a.get("code") or "").replace(".0", "").strip(),
+                "ea_type": a.get("ea_type") or "",
+                "remarks": a.get("remarks") or "",
+                "province_code": poly["bgy_gc"][:3] if len(poly["bgy_gc"]) >= 3 else "",
+                "city_mun_code": poly["bgy_gc"][3:5] if len(poly["bgy_gc"]) >= 5 else "",
+                "barangay_code": poly["bgy_gc"][5:8] if len(poly["bgy_gc"]) >= 8 else "",
+            })
+        try:
+            from .database import compute_recoded_enumeration_areas
+            compute_recoded_enumeration_areas(poly_proxies)
+            for poly, px in zip(raw_polygons, poly_proxies):
+                poly["computed_final_ean"] = px.get("final_ean") or px.get("recoded_ean") or ""
+        except Exception:
+            pass
+
         records_by_uuid: Dict[str, Dict[str, Any]] = {}
         records_by_bgy_ean: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
         records_by_gc: Dict[str, List[Dict[str, Any]]] = {}
@@ -783,20 +831,30 @@ def export_matched_records_to_gpkg(
                 if gc_r not in records_by_gc:
                     records_by_gc[gc_r] = []
                 records_by_gc[gc_r].append(r)
-            ean_r = to_whole_number_str(r.get("final_ean") or r.get("recoded_ean") or r.get("ean") or r.get("new_ean") or "").replace(".0", "").strip()
-            ean_norm_r = ean_r.zfill(6) if ean_r.isdigit() and len(ean_r) < 6 else ean_r
-            if ean_norm_r:
-                if ean_norm_r not in records_by_ean:
-                    records_by_ean[ean_norm_r] = []
-                records_by_ean[ean_norm_r].append(r)
+
             bgy_r = to_whole_number_str(r.get("barangay_code") or "").replace(".0", "").strip()
             prov_r = to_whole_number_str(r.get("province_code") or "").replace(".0", "").strip()
             mun_r = to_whole_number_str(r.get("city_mun_code") or "").replace(".0", "").strip()
-            if prov_r and mun_r and bgy_r and ean_norm_r:
-                k = (f"{prov_r.zfill(3)}{mun_r.zfill(2)}{bgy_r.zfill(3)}", ean_norm_r)
-                if k not in records_by_bgy_ean:
-                    records_by_bgy_ean[k] = []
-                records_by_bgy_ean[k].append(r)
+            bgy_key = f"{prov_r.zfill(3)}{mun_r.zfill(2)}{bgy_r.zfill(3)}" if (prov_r and mun_r and bgy_r) else (gc_r[:8] if len(gc_r) >= 8 else "")
+
+            cand_eans = set()
+            for k_ean in ("ean", "new_ean", "new_enumeration_area_code", "final_ean", "recoded_ean"):
+                v_ean = to_whole_number_str(r.get(k_ean) or "").replace(".0", "").strip()
+                if v_ean:
+                    cand_eans.add(v_ean)
+                    cand_eans.add(v_ean.zfill(6))
+
+            for e_cand in cand_eans:
+                if e_cand not in records_by_ean:
+                    records_by_ean[e_cand] = []
+                if r not in records_by_ean[e_cand]:
+                    records_by_ean[e_cand].append(r)
+                if bgy_key:
+                    bk = (bgy_key, e_cand)
+                    if bk not in records_by_bgy_ean:
+                        records_by_bgy_ean[bk] = []
+                    if r not in records_by_bgy_ean[bk]:
+                        records_by_bgy_ean[bk].append(r)
 
         total_polygons = len(raw_polygons)
         for idx, poly in enumerate(raw_polygons):
@@ -816,24 +874,31 @@ def export_matched_records_to_gpkg(
             if p_uuid and p_uuid in records_by_uuid:
                 r = records_by_uuid[p_uuid]
             elif p_bgy and p_ean and (p_bgy, p_ean) in records_by_bgy_ean and records_by_bgy_ean[(p_bgy, p_ean)]:
-                r = records_by_bgy_ean[(p_bgy, p_ean)].pop(0)
+                r = records_by_bgy_ean[(p_bgy, p_ean)][0]
             elif p_gc and p_gc in records_by_gc and records_by_gc[p_gc]:
-                r = records_by_gc[p_gc].pop(0)
+                r = records_by_gc[p_gc][0]
             elif p_ean and p_ean in records_by_ean and records_by_ean[p_ean]:
-                r = records_by_ean[p_ean].pop(0)
+                r = records_by_ean[p_ean][0]
 
             if r is None:
                 r = {}
 
-            meta = gpkg_meta.get(p_gc, {}) if p_gc else {}
+            meta = gpkg_meta_by_uuid.get(p_uuid) or gpkg_meta.get(p_gc, {}) or (gpkg_meta_by_bgy_ean.get((p_bgy, p_ean)) if p_bgy and p_ean else {})
 
             m_uuid = p_uuid or str(meta.get("map_uuid") or r.get("map_uuid") or "").strip()
             if not m_uuid:
                 m_uuid = str(uuid.uuid4())
 
-            # Final EAN
+            # Final EAN: strictly reflects the Final EAN from subtab 3 GeoPackage
             final_ean = to_whole_number_str(
-                r.get("final_ean") or r.get("recoded_ean") or attrs.get("final_ean") or ""
+                r.get("final_ean")
+                or r.get("recoded_ean")
+                or attrs.get("final_ean")
+                or attrs.get("recoded_ean")
+                or meta.get("final_ean")
+                or meta.get("recoded_ean")
+                or poly.get("computed_final_ean")
+                or ""
             ).replace(".0", "").strip()
             if final_ean:
                 final_ean = final_ean.zfill(6) if final_ean.isdigit() and len(final_ean) < 6 else final_ean
@@ -974,11 +1039,10 @@ def export_matched_records_to_gpkg(
 
             # Determine Final EAN (from subtab 3 GeoPackage / recoded_ean / final_ean)
             final_ean = to_whole_number_str(
-                r.get("final_ean") or r.get("recoded_ean") or ""
+                r.get("final_ean") or r.get("recoded_ean") or meta.get("final_ean") or meta.get("recoded_ean") or ""
             ).replace(".0", "").strip()
             if final_ean:
-                if final_ean.isdigit() and len(final_ean) < 6:
-                    final_ean = f"{int(final_ean):03d}000" if len(final_ean) <= 3 else f"{int(final_ean):06d}"
+                final_ean = final_ean.zfill(6) if final_ean.isdigit() and len(final_ean) < 6 else final_ean
 
             orig_ean = to_whole_number_str(r.get("ean") or r.get("new_ean") or r.get("new_enumeration_area_code") or "").replace(".0", "").strip()
             if orig_ean.isdigit() and len(orig_ean) < 6:

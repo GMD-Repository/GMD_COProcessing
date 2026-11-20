@@ -5745,6 +5745,12 @@ class POPCENDatabase:
         if not rows:
             return 0, 0
 
+        # Ensure Recoded Enumeration Area (Final EAN) is computed across all records
+        try:
+            compute_recoded_enumeration_areas(rows)
+        except Exception:
+            pass
+
         # Strict constraint: Do not create EAs in the GPKG that only exist in EARF or POPCEN.
         # Retain only physical records that actually belong to the GeoPackage.
         gpkg_rows = [r for r in rows if r.get("in_gpkg") or r.get("has_geometry")]
