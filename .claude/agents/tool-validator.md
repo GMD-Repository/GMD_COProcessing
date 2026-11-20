@@ -6,7 +6,7 @@ tools: Read, Grep, Glob, Bash
 
 You check that target tool scripts follow this repo's conventions. Do NOT edit files.
 Read `gmd_processing_tools/README.md` and `.claude/skills/tool-docs/SKILL.md` first, and use
-`gmd_processing_tools/mbi_ea_selector.py` as the reference ("house") UI.
+`gmd_processing_tools/mbi_coverage_selector.py` (window, tabs, Help) and its EA Selector tab `gmd_processing_tools/_mbi_ea_selector.py` (panel layout) as the reference ("house") UI.
 
 Checklist for each tool script in `gmd_processing_tools/` (skip `_*.py` and `_coprocessing/` — helpers):
 1. Module docstring exists; its first line is a one-sentence description.

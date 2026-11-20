@@ -8,7 +8,7 @@
 
 | | MBI Barangay Selector (Run Check & Counter-Check) | National-Level MBI Checker |
 |---|---|---|
-| Cut-off | `CHECKER_MIN_M2 = 0.10` m² ([mbi_bgy_selector.py](../../gmd_processing_tools/mbi_bgy_selector.py)) | `0 <= area <= 0.1` m² |
+| Cut-off | `CHECKER_MIN_M2 = 0.10` m² ([_mbi_bgy_selector.py](../../gmd_processing_tools/_mbi_bgy_selector.py)) | `0 <= area <= 0.1` m² |
 | Rule | Drops every finding of 0.10 m² or less, even with buildings inside | Drops it only if it is 0.1 m² or less **and** has 0 buildings |
 | When it drops | Each overlap or gap piece as it is found | After the pieces are measured and their buildings counted |
 | How area is measured | Planar in EPSG:3857 | QGIS `$area`, which uses the project's ellipsoid |
@@ -22,7 +22,7 @@
 |---------|--------|------|
 | National-Level MBI Checker | [`national_mbi_checker.py`](../../gmd_processing_tools/national_mbi_checker.py) | Already correct: `0 <= area <= 0.1 and bldg == 0` |
 | EA MBI Checker | [`EA_topochecker.py`](../../gmd_processing_tools/EA_topochecker.py) | Already correct: same condition |
-| MBI Barangay Selector (built-in checker) | [`mbi_bgy_selector.py`](../../gmd_processing_tools/mbi_bgy_selector.py) | **Changed**: `is_sliver()` = area ≤ `CHECKER_MIN_M2` (0.10 m²) **and** no building point inside. Used for overlap pieces and gaps. Area measured as `$area` (below). |
+| MBI Barangay Selector (built-in checker) | [`_mbi_bgy_selector.py`](../../gmd_processing_tools/_mbi_bgy_selector.py) | **Changed**: `is_sliver()` = area ≤ `CHECKER_MIN_M2` (0.10 m²) **and** no building point inside. Used for overlap pieces and gaps. Area measured as `$area` (below). |
 
 Without a building layer, every count is 0, so all findings of 0.10 m² or less are still dropped.
 

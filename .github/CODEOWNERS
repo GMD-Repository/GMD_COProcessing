@@ -1,0 +1,3 @@
+# Every change needs the maintainer's review before it can be merged into beta or main.
+# Enforced by the branch rules: Settings > Rules > "Require review from Code Owners".
+* @psacjperez

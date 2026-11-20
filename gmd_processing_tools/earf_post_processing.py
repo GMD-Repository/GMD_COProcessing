@@ -91,19 +91,6 @@ def show_dialog():
     dialog = COProcessingDialog(qgis_iface, parent=main_win)
     dialog.setObjectName(DIALOG_OBJECT_NAME)
 
-    # Optional: Pre-fill layer if an EA layer was selected in the GMD panel
-    ea_layer = globals().get("ea_layer")
-    if ea_layer is not None and hasattr(ea_layer, "source"):
-        src = ea_layer.source()
-        if src and (".gpkg" in src.lower() or os.path.exists(src)):
-            # If layer has GPKG file path, populate preview line edit
-            clean_path = src.split("|")[0].strip('"')
-            if os.path.exists(clean_path):
-                if hasattr(dialog, "txt_gpkg_preview_layers"):
-                    dialog.txt_gpkg_preview_layers.setText(clean_path)
-                if hasattr(dialog, "txt_gpkg_layers"):
-                    dialog.txt_gpkg_layers.setText(clean_path)
-
     if dialog.isMinimized():
         dialog.showNormal()
     else:

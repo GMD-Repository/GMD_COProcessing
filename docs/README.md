@@ -2,6 +2,7 @@
 
 One page per tool in [`gmd_processing_tools/`](../gmd_processing_tools/). Every tool opens from the
 **GMD CO Processing** menu (**EA Tools** submenu) or from the plugin panel (pick it, then **Run**).
+**MBI Coverage Selector**, **National-Level MBI Checker** and **[TEST] EARF Inconsistency Checks** are listed at the top level of the menu.
 Each tool window also has a **Help and Information** tab with the same guidance (the two MBI checkers open
 as Processing dialogs, with their help in the dialog's side panel).
 
@@ -10,27 +11,29 @@ to your data (the rules, thresholds and matching keys it uses).
 
 | Tool | Script | What it does |
 |------|--------|--------------|
-| [EA MBI Checker](tools/EA_topochecker.md) | `EA_topochecker.py` | Finds gaps and overlaps between EA polygons and counts the buildings inside each |
+| [EA MBI Checker](tools/EA_topochecker.md) | `deprecated/EA_topochecker.py` | **Deprecated (hidden from menu).** Finds gaps and overlaps between EA polygons and counts the buildings inside each |
 | [National-Level MBI Checker](tools/national_mbi_checker.md) | `national_mbi_checker.py` | Finds gaps, overlaps and disputed areas between barangay polygons (up to national scale), with the MBI level of each pair |
 | [EA vs Barangay Check](tools/ea_versus_bgy.md) | `ea_versus_bgy.py` | Compares EAs with their barangay (or barangays / EAs with each other) and snaps the mismatches |
-| [MBI Barangay Selector](tools/mbi_bgy_selector.md) | `mbi_bgy_selector.py` | Counter-checks the remaining MBIs and chooses the barangay that covers each one |
-| [MBI EA Selector](tools/mbi_ea_selector.md) | `mbi_ea_selector.py` | Chooses the EA that covers each MBI inside its covering barangay, and writes the coverage status |
+| [MBI Coverage Selector](tools/mbi_coverage_selector.md) | `mbi_coverage_selector.py` | Counter-checks the remaining MBIs, chooses the covering barangay, then the covering EA, and writes the coverage status |
 | [EARF Post-Processing](tools/earf_post_processing.md) | `earf_post_processing.py` | Matches POPCEN, Preliminary EARF and EA GeoPackages on geocode and exports the final deliverables |
+| [\[TEST\] EARF Inconsistency Checks](tools/test_earf_inconsistency.md) | `test_earf_inconsistency.py` | **Test.** Checks the EA GeoPackage and Preliminary EARF (against the 2024 household worksheet) and writes the two List of Inconsistencies workbooks |
 
 ## Recommended order for MBIs
 
+Both steps are tabs of one window, the **MBI Coverage Selector**.
+
 ```
-MBI Barangay Selector                        MBI EA Selector
+Barangay Selector tab                        EA Selector tab
 ─────────────────────                        ───────────────
-Remaining MBIs ──► Run Check & Counter-Check  ppp_mbi layer ──► Load MBI Cases
-                   ► tick covering barangay                      ► tick covering EA(s)
-                   ► Apply (writes assigned_bgy)                 ► Apply (writes assigned_ea,
-                   ► "Choose EAs in MBI EA Selector…" ─────────►          coverage_status)
-                                                                 ► Export GPKG + CSV
+Remaining MBIs ──► Load MBI Cases            ppp_mbi layer ──► Load MBI Cases
+                   (counter-check)                             ► tick covering EA(s)
+                   ► tick covering barangay                    ► Apply (writes assigned_ea,
+                   ► Apply (writes assigned_bgy)                        coverage_status)
+                   ► "Choose EAs in the EA Selector Tab →" ──► ► Export GPKG + CSV
 ```
 
-1. **MBI Barangay Selector** decides *which barangay* covers each MBI (`assigned_bgy`).
-2. **MBI EA Selector** decides *which EA of that barangay* covers it and writes the final
+1. The **Barangay Selector** tab decides *which barangay* covers each MBI (`assigned_bgy`).
+2. The **EA Selector** tab decides *which EA of that barangay* covers it and writes the final
    `coverage_status` (1_Covered / 2_Not Covered / 3_Partially Covered).
 
 ## Geocodes
