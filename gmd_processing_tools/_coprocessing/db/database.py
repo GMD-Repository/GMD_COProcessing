@@ -865,6 +865,21 @@ def export_matched_to_excel(
         deduped_records.append(r)
     records = deduped_records
 
+    # Strictly sort records by geocode
+    def _extract_sort_geocode(r_item: Dict[str, Any]) -> str:
+        gc_val = str(r_item.get("ea_geocode") or r_item.get("geocode") or "").strip()
+        if not gc_val or len(gc_val) < 8:
+            p = str(r_item.get("province_code") or "").strip().zfill(3)
+            m = str(r_item.get("city_mun_code") or "").strip().zfill(2)
+            b = str(r_item.get("barangay_code") or "").strip().zfill(3)
+            e = str(r_item.get("final_ean") or r_item.get("recoded_ean") or r_item.get("ean") or "").strip()
+            if e.isdigit() and len(e) < 6:
+                e = e.zfill(6)
+            gc_val = f"{p}{m}{b}{e}"
+        return gc_val
+
+    records = sorted(records, key=_extract_sort_geocode)
+
     # Ensure recoded_ean is populated across records
     if any(not r.get("recoded_ean") for r in records):
         records = compute_recoded_enumeration_areas(records)
@@ -1147,7 +1162,7 @@ def export_matched_to_excel(
 
         # Iterate Barangays
         for b_code in sorted(brgys_map.keys()):
-            b_recs = brgys_map[b_code]
+            b_recs = sorted(brgys_map[b_code], key=_extract_sort_geocode)
             b_name = str(b_recs[0].get("geographic_name") or b_recs[0].get("areaname") or b_recs[0].get("barangay") or "").strip().upper()
             if " - EA" in b_name:
                 b_name = b_name.split(" - EA")[0].strip()
@@ -5875,6 +5890,7 @@ class POPCENDatabase:
             }
             output_records.append(rec)
 
+        output_records.sort(key=lambda r: str(r.get("ea_geocode") or r.get("geocode") or "").strip())
         return output_records
 
     def export_filtered_matched_to_pcd_excel(
@@ -5954,6 +5970,9 @@ class POPCENDatabase:
             m_c = pcd_rows[0].get("city_mun_code")
             if p_c and m_c:
                 meta = self.get_citymun_hierarchy(f"{p_c}{m_c}")
+
+        # Strictly sort by geocode before generating PCD Excel
+        pcd_rows.sort(key=lambda r: str(r.get("ea_geocode") or r.get("geocode") or "").strip())
 
         export_matched_to_excel(pcd_rows, out_excel, metadata=meta)
 
