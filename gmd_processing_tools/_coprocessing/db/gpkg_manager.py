@@ -592,6 +592,7 @@ def export_matched_records_to_gpkg(
             pass
 
     # 3. Geometry and attribute collection from provided sources
+    raw_polygons: List[Dict[str, Any]] = []
     geom_by_uuid: Dict[str, QgsGeometry] = {}
     geom_by_gc: Dict[str, QgsGeometry] = {}
     geom_by_bgy_ean: Dict[Tuple[str, str], QgsGeometry] = {}
@@ -700,6 +701,18 @@ def export_matched_records_to_gpkg(
 
                     ean_norm = ean.zfill(6) if ean.isdigit() and len(ean) < 6 else ean
 
+                    raw_polygons.append({
+                        "geom": QgsGeometry(geom),
+                        "attrs": attrs,
+                        "gc": gc,
+                        "m_uuid": m_uuid,
+                        "ean": ean,
+                        "ean_norm": ean_norm,
+                        "bgy_gc": bgy,
+                        "hh": f_hh,
+                        "bldg": f_bldg,
+                    })
+
                     if m_uuid and m_uuid not in geom_by_uuid:
                         geom_by_uuid[m_uuid] = QgsGeometry(geom)
                         orig_attrs_by_uuid[m_uuid] = attrs
@@ -750,214 +763,386 @@ def export_matched_records_to_gpkg(
         raise RuntimeError(f"Could not create GeoPackage at {out_gpkg_path}: {err_msg}")
 
     # 6. Populate features
-    total_records = len(records)
     features_with_geom = 0
-    seen_map_uuids = set()
 
-    for idx, r in enumerate(records):
-        if progress_callback and idx % 200 == 0:
-            pct = 30 + int((idx / max(total_records, 1)) * 65)
-            progress_callback(pct, f"Exporting feature {idx + 1:,} of {total_records:,}...")
+    if raw_polygons:
+        # PRIMARY GEOMETRY PRESERVATION PATH:
+        # Export every single polygon directly from the input GeoPackage!
+        # Guaranteed: ZERO geometry changes, ZERO polygon deletions.
+        records_by_uuid: Dict[str, Dict[str, Any]] = {}
+        records_by_bgy_ean: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+        records_by_gc: Dict[str, List[Dict[str, Any]]] = {}
+        records_by_ean: Dict[str, List[Dict[str, Any]]] = {}
 
-        # Strict requirement: Do not create EAs in the GeoPackage that do not belong to GPKG
-        # or do not have valid geometry. Retain only physical GeoPackage EAs as they are.
-        if r.get("in_gpkg") == 0 or r.get("has_geometry") == 0:
-            continue
+        for r in records:
+            u = str(r.get("map_uuid") or "").strip()
+            if u:
+                records_by_uuid[u] = r
+            gc_r = str(r.get("geocode") or "").strip()
+            if gc_r:
+                if gc_r not in records_by_gc:
+                    records_by_gc[gc_r] = []
+                records_by_gc[gc_r].append(r)
+            ean_r = to_whole_number_str(r.get("final_ean") or r.get("recoded_ean") or r.get("ean") or r.get("new_ean") or "").replace(".0", "").strip()
+            ean_norm_r = ean_r.zfill(6) if ean_r.isdigit() and len(ean_r) < 6 else ean_r
+            if ean_norm_r:
+                if ean_norm_r not in records_by_ean:
+                    records_by_ean[ean_norm_r] = []
+                records_by_ean[ean_norm_r].append(r)
+            bgy_r = to_whole_number_str(r.get("barangay_code") or "").replace(".0", "").strip()
+            prov_r = to_whole_number_str(r.get("province_code") or "").replace(".0", "").strip()
+            mun_r = to_whole_number_str(r.get("city_mun_code") or "").replace(".0", "").strip()
+            if prov_r and mun_r and bgy_r and ean_norm_r:
+                k = (f"{prov_r.zfill(3)}{mun_r.zfill(2)}{bgy_r.zfill(3)}", ean_norm_r)
+                if k not in records_by_bgy_ean:
+                    records_by_bgy_ean[k] = []
+                records_by_bgy_ean[k].append(r)
 
-        gc = str(r.get("geocode") or "").strip()
-        meta = gpkg_meta.get(gc, {})
+        total_polygons = len(raw_polygons)
+        for idx, poly in enumerate(raw_polygons):
+            if progress_callback and idx % 50 == 0:
+                pct = 30 + int((idx / max(total_polygons, 1)) * 65)
+                progress_callback(pct, f"Exporting input polygon feature {idx + 1:,} of {total_polygons:,}...")
 
-        p_code = to_whole_number_str(r.get("province_code") or "").replace(".0", "").strip()
-        m_code = to_whole_number_str(r.get("city_mun_code") or "").replace(".0", "").strip()
-        b_code = to_whole_number_str(r.get("barangay_code") or "").replace(".0", "").strip()
-        if not (p_code and m_code and b_code):
-            gc_clean = to_whole_number_str(gc).replace(".0", "").strip()
-            if len(gc_clean) == 14:
-                p_code = gc_clean[:3]
-                m_code = gc_clean[3:5]
-                b_code = gc_clean[5:8]
-            elif len(gc_clean) == 16:
-                p_code = gc_clean[2:5]
-                m_code = gc_clean[5:7]
-                b_code = gc_clean[7:10]
+            geom = poly["geom"]
+            attrs = poly["attrs"]
+            p_uuid = poly["m_uuid"]
+            p_gc = poly["gc"]
+            p_ean = poly["ean_norm"]
+            p_bgy = poly["bgy_gc"]
 
-        bgy_gc = f"{p_code.zfill(3)}{m_code.zfill(2)}{b_code.zfill(3)}" if p_code else (gc[:8] if len(gc) >= 8 else "")
-        bgy_gc = to_whole_number_str(bgy_gc).replace(".0", "").strip()
+            # Match reconciled record
+            r = None
+            if p_uuid and p_uuid in records_by_uuid:
+                r = records_by_uuid[p_uuid]
+            elif p_bgy and p_ean and (p_bgy, p_ean) in records_by_bgy_ean and records_by_bgy_ean[(p_bgy, p_ean)]:
+                r = records_by_bgy_ean[(p_bgy, p_ean)].pop(0)
+            elif p_gc and p_gc in records_by_gc and records_by_gc[p_gc]:
+                r = records_by_gc[p_gc].pop(0)
+            elif p_ean and p_ean in records_by_ean and records_by_ean[p_ean]:
+                r = records_by_ean[p_ean].pop(0)
 
-        # Determine Final EAN (from subtab 3 GeoPackage / recoded_ean / final_ean)
-        final_ean = to_whole_number_str(
-            r.get("final_ean") or r.get("recoded_ean") or ""
-        ).replace(".0", "").strip()
-        if final_ean:
-            if final_ean.isdigit() and len(final_ean) < 6:
-                final_ean = f"{int(final_ean):03d}000" if len(final_ean) <= 3 else f"{int(final_ean):06d}"
+            if r is None:
+                r = {}
 
-        orig_ean = to_whole_number_str(r.get("ean") or r.get("new_ean") or r.get("new_enumeration_area_code") or "").replace(".0", "").strip()
-        if orig_ean.isdigit() and len(orig_ean) < 6:
-            orig_ean = f"{int(orig_ean):03d}000" if len(orig_ean) <= 3 else f"{int(orig_ean):06d}"
+            meta = gpkg_meta.get(p_gc, {}) if p_gc else {}
 
-        fallback_ean = to_whole_number_str(r.get("new_enumeration_area_code") or r.get("new_ean") or r.get("ean") or "").replace(".0", "").strip()
-        if fallback_ean.isdigit() and len(fallback_ean) < 6:
-            fallback_ean = f"{int(fallback_ean):03d}000" if len(fallback_ean) <= 3 else f"{int(fallback_ean):06d}"
+            m_uuid = p_uuid or str(meta.get("map_uuid") or r.get("map_uuid") or "").strip()
+            if not m_uuid:
+                m_uuid = str(uuid.uuid4())
 
-        # ean takes the Final EAN if available; otherwise falls back to orig_ean or fallback_ean
-        gpkg_ean = final_ean or orig_ean or fallback_ean
-        gpkg_ean = to_whole_number_str(gpkg_ean).replace(".0", "").strip()
-        ea_gc = f"{bgy_gc}{gpkg_ean}" if (bgy_gc and gpkg_ean) else gc
-        ea_gc = to_whole_number_str(ea_gc).replace(".0", "").strip()
-        corr_gc = gc or ea_gc
+            # Final EAN
+            final_ean = to_whole_number_str(
+                r.get("final_ean") or r.get("recoded_ean") or attrs.get("final_ean") or ""
+            ).replace(".0", "").strip()
+            if final_ean:
+                final_ean = final_ean.zfill(6) if final_ean.isdigit() and len(final_ean) < 6 else final_ean
 
-        m_uuid = str(meta.get("map_uuid") or r.get("map_uuid") or "").strip()
+            gpkg_ean = final_ean or p_ean or to_whole_number_str(r.get("ean") or attrs.get("ean") or "").replace(".0", "").strip()
+            if gpkg_ean.isdigit() and len(gpkg_ean) < 6:
+                gpkg_ean = gpkg_ean.zfill(6)
 
-        # Geometry resolution & original GPKG attribute lookup
-        matched_geom = None
-        orig_attrs: Dict[str, Any] = {}
+            p_code = to_whole_number_str(r.get("province_code") or attrs.get("province_code") or "").replace(".0", "").strip()
+            m_code = to_whole_number_str(r.get("city_mun_code") or attrs.get("city_mun_code") or "").replace(".0", "").strip()
+            b_code = to_whole_number_str(r.get("barangay_code") or attrs.get("barangay_code") or "").replace(".0", "").strip()
 
-        if m_uuid and m_uuid in geom_by_uuid:
-            matched_geom = geom_by_uuid[m_uuid]
-            orig_attrs = orig_attrs_by_uuid.get(m_uuid, {})
-        elif gc and gc in geom_by_gc:
-            matched_geom = geom_by_gc[gc]
-            orig_attrs = orig_attrs_by_gc.get(gc, {})
-        elif ea_gc and ea_gc in geom_by_gc:
-            matched_geom = geom_by_gc[ea_gc]
-            orig_attrs = orig_attrs_by_gc.get(ea_gc, {})
-        elif (bgy_gc, orig_ean) in geom_by_bgy_ean:
-            matched_geom = geom_by_bgy_ean[(bgy_gc, orig_ean)]
-            orig_attrs = orig_attrs_by_bgy_ean.get((bgy_gc, orig_ean), {})
-        elif (bgy_gc, fallback_ean) in geom_by_bgy_ean:
-            matched_geom = geom_by_bgy_ean[(bgy_gc, fallback_ean)]
-            orig_attrs = orig_attrs_by_bgy_ean.get((bgy_gc, fallback_ean), {})
-        elif final_ean and (bgy_gc, final_ean) in geom_by_bgy_ean:
-            matched_geom = geom_by_bgy_ean[(bgy_gc, final_ean)]
-            orig_attrs = orig_attrs_by_bgy_ean.get((bgy_gc, final_ean), {})
+            if not (p_code and m_code and b_code):
+                gc_clean = to_whole_number_str(p_gc or r.get("geocode") or "").replace(".0", "").strip()
+                if len(gc_clean) == 14:
+                    p_code = gc_clean[:3]
+                    m_code = gc_clean[3:5]
+                    b_code = gc_clean[5:8]
+                elif len(gc_clean) == 16:
+                    p_code = gc_clean[2:5]
+                    m_code = gc_clean[5:7]
+                    b_code = gc_clean[7:10]
 
-        # Do NOT create EAs in the GPKG if no geometry exists
-        if matched_geom is None or matched_geom.isEmpty():
-            continue
+            bgy_gc = f"{p_code.zfill(3)}{m_code.zfill(2)}{b_code.zfill(3)}" if p_code else p_bgy
+            ea_gc = f"{bgy_gc}{gpkg_ean}" if (bgy_gc and gpkg_ean) else p_gc
 
-        # Retain original values from input GPKG feature if available
-        if orig_attrs:
-            orig_u = str(orig_attrs.get("map_uuid") or orig_attrs.get("uuid") or "").strip()
-            if orig_u:
-                m_uuid = orig_u
+            r_code = to_whole_number_str(attrs.get("region_code") or r.get("region_code") or "").replace(".0", "").strip()
+            if not r_code:
+                r_code = to_whole_number_str(prov_lookup.get(p_code, ("", ""))[1]).replace(".0", "").strip()
 
-            # If final_ean was not in r, check if orig_attrs has final_ean
-            if not final_ean and orig_attrs.get("final_ean"):
-                fean_attr = to_whole_number_str(orig_attrs.get("final_ean")).replace(".0", "").strip()
-                if fean_attr:
-                    if fean_attr.isdigit() and len(fean_attr) < 6:
-                        fean_attr = f"{int(fean_attr):03d}000" if len(fean_attr) <= 3 else f"{int(fean_attr):06d}"
-                    final_ean = fean_attr
-                    gpkg_ean = final_ean
-                    ea_gc = f"{bgy_gc}{gpkg_ean}" if (bgy_gc and gpkg_ean) else gc
-                    ea_gc = to_whole_number_str(ea_gc).replace(".0", "").strip()
+            reg_name = attrs.get("region") or r.get("region") or meta.get("region") or reg_lookup.get(r_code, "")
+            prov_name = attrs.get("province") or r.get("province") or meta.get("province") or prov_lookup.get(p_code, ("", ""))[0]
+            mun_name = attrs.get("city_mun") or r.get("city_mun") or meta.get("city_mun") or mun_lookup.get(p_code + m_code, "")
+            brgy_name = attrs.get("barangay") or r.get("barangay") or meta.get("barangay") or r.get("geographic_name") or brgy_lookup.get(p_code + m_code + b_code, "")
 
-            # Only fallback to input GPKG original ean if Final EAN was not provided
-            if not final_ean:
-                orig_g_ean = to_whole_number_str(orig_attrs.get("ean") or orig_attrs.get("new_ean") or orig_attrs.get("code") or "").replace(".0", "").strip()
-                if orig_g_ean:
-                    if orig_g_ean.isdigit() and len(orig_g_ean) < 6:
-                        orig_g_ean = f"{int(orig_g_ean):03d}000" if len(orig_g_ean) <= 3 else f"{int(orig_g_ean):06d}"
-                    gpkg_ean = orig_g_ean
-                orig_ea_gc = to_whole_number_str(orig_attrs.get("ea_geocode") or orig_attrs.get("geocode") or "").replace(".0", "").strip()
-                if orig_ea_gc:
-                    ea_gc = orig_ea_gc
+            feat = QgsFeature(fields)
+            feat.setAttribute("map_uuid", m_uuid)
+            feat.setAttribute("ea_geocode", ea_gc)
+            feat.setAttribute("bgy_geocode", bgy_gc)
+            feat.setAttribute("province_code", p_code.zfill(3) if p_code else "")
+            feat.setAttribute("city_mun_code", m_code.zfill(2) if m_code else "")
+            feat.setAttribute("barangay_code", b_code.zfill(3) if b_code else "")
+            feat.setAttribute("ean", gpkg_ean)
+            feat.setAttribute("region_code", r_code.zfill(2) if r_code else "")
+            feat.setAttribute("region", reg_name)
+            feat.setAttribute("province", prov_name)
+            feat.setAttribute("city_mun", mun_name)
+            feat.setAttribute("barangay", brgy_name)
 
-        if not m_uuid:
-            m_uuid = str(uuid.uuid4())
+            # Name: strictly EA + " " + ean matching the Final EAN
+            ea_name = f"EA {gpkg_ean}" if gpkg_ean else "EA"
+            feat.setAttribute("name", ea_name)
 
-        seen_map_uuids.add(m_uuid)
+            code_val = to_whole_number_str(attrs.get("code") or meta.get("code") or r.get("code") or "1004").replace(".0", "").strip()
+            feat.setAttribute("code", code_val)
 
-        r_code = to_whole_number_str(orig_attrs.get("region_code") or r.get("region_code") or "").replace(".0", "").strip()
-        if not r_code:
-            r_code = to_whole_number_str(prov_lookup.get(p_code, ("", ""))[1]).replace(".0", "").strip()
+            # EA Type & Source Year:
+            raw_ea_type = str(
+                attrs.get("ea_type")
+                or r.get("ea_type")
+                or meta.get("ea_type")
+                or r.get("ea_lifecycle")
+                or ""
+            ).strip().upper()
 
-        reg_name = orig_attrs.get("region") or r.get("region") or meta.get("region") or reg_lookup.get(r_code, "")
-        prov_name = orig_attrs.get("province") or r.get("province") or meta.get("province") or prov_lookup.get(p_code, ("", ""))[0]
-        mun_name = orig_attrs.get("city_mun") or r.get("city_mun") or meta.get("city_mun") or mun_lookup.get(p_code + m_code, "")
-        brgy_name = orig_attrs.get("barangay") or r.get("barangay") or meta.get("barangay") or r.get("geographic_name") or brgy_lookup.get(p_code + m_code + b_code, "")
+            if "DELIN" in raw_ea_type or "SPLIT" in raw_ea_type:
+                ea_type_val = "DELINEATED"
+                sy_val = "2026"
+            elif "MERG" in raw_ea_type:
+                ea_type_val = "MERGED"
+                sy_val = "2026"
+            else:
+                ea_type_val = "RETAINED"
+                sy_val = "2024"
 
-        feat = QgsFeature(fields)
-        feat.setAttribute("map_uuid", m_uuid)
-        feat.setAttribute("ea_geocode", ea_gc)
-        bgy_gc_val = to_whole_number_str(orig_attrs.get("bgy_geocode") or bgy_gc).replace(".0", "").strip()
-        feat.setAttribute("bgy_geocode", bgy_gc_val)
-        feat.setAttribute("province_code", p_code.zfill(3) if p_code else "")
-        feat.setAttribute("city_mun_code", m_code.zfill(2) if m_code else "")
-        feat.setAttribute("barangay_code", b_code.zfill(3) if b_code else "")
-        feat.setAttribute("ean", gpkg_ean)
-        feat.setAttribute("region_code", r_code.zfill(2) if r_code else "")
-        feat.setAttribute("region", reg_name)
-        feat.setAttribute("province", prov_name)
-        feat.setAttribute("city_mun", mun_name)
-        feat.setAttribute("barangay", brgy_name)
+            corr_code = f"{ea_gc}:{m_uuid}:{sy_val}".replace(".0", "")
+            feat.setAttribute("correspondence_geocode", corr_code)
 
-        # Name: Retain original from GPKG without decimals
-        ea_name = str(orig_attrs.get("name") or meta.get("name") or r.get("name") or "").replace(".0", "").strip()
-        if not ea_name or ea_name.upper().startswith("BARANGAY"):
-            effective_ean = gpkg_ean or (ea_gc[-6:] if len(ea_gc) >= 6 else "")
-            ea_name = f"EA {effective_ean}" if effective_ean else "EA"
-        feat.setAttribute("name", ea_name)
+            feat.setAttribute("remarks", str(attrs.get("remarks") or meta.get("remarks") or r.get("remarks") or r.get("earf_remarks") or ""))
 
-        # Code: Retain original from GPKG strictly as whole number string
-        code_val = to_whole_number_str(orig_attrs.get("code") or meta.get("code") or r.get("code") or "1004").replace(".0", "").strip()
-        feat.setAttribute("code", code_val)
-
-        # EA Type resolution & Source Year alignment:
-        # Rule: If EA Type is not DELINEATED or MERGED, it defaults to RETAINED.
-        #       If RETAINED -> sy = 2024; if DELINEATED or MERGED -> sy = 2026.
-        raw_ea_type = str(
-            orig_attrs.get("ea_type")
-            or r.get("ea_type")
-            or meta.get("ea_type")
-            or r.get("ea_lifecycle")
-            or ""
-        ).strip().upper()
-
-        if "DELIN" in raw_ea_type or "SPLIT" in raw_ea_type:
-            ea_type_val = "DELINEATED"
-            sy_val = "2026"
-        elif "MERG" in raw_ea_type:
-            ea_type_val = "MERGED"
-            sy_val = "2026"
-        else:
-            ea_type_val = "RETAINED"
-            sy_val = "2024"
-
-        # Correspondence code: ea_geocode + ":" + map_uuid + ":" + sy (strictly no decimals)
-        corr_code = f"{ea_gc}:{m_uuid}:{sy_val}".replace(".0", "")
-        feat.setAttribute("correspondence_geocode", corr_code)
-
-        # Remarks: Retain original GPKG remarks
-        feat.setAttribute("remarks", str(orig_attrs.get("remarks") or meta.get("remarks") or r.get("remarks") or r.get("earf_remarks") or ""))
-
-        # Household and building counts: Integer counts without decimals
-        f_hh = orig_attrs.get("hhcount") or orig_attrs.get("hh_count")
-        f_bldg = orig_attrs.get("bldgcount") or orig_attrs.get("bldg_count")
-
-        hh = 0
-        try:
-            hh_src = f_hh if (f_hh is not None and str(f_hh).strip() != "") else (meta.get("hh_count") or meta.get("hhcount") or r.get("gpkg_hh_count") or r.get("hhcount") or 0)
-            hh = int(round(float(hh_src)))
-        except Exception:
             hh = 0
-        feat.setAttribute("hhcount", hh)
+            try:
+                hh_src = poly.get("hh") or attrs.get("hhcount") or meta.get("hh_count") or r.get("household_count") or 0
+                hh = int(round(float(hh_src)))
+            except Exception:
+                hh = 0
+            feat.setAttribute("hhcount", hh)
 
-        bldg = 0
-        try:
-            bldg_src = f_bldg if (f_bldg is not None and str(f_bldg).strip() != "") else (meta.get("bldg_count") or r.get("gpkg_bldg_count") or r.get("bldgcount") or 0)
-            bldg = int(round(float(bldg_src)))
-        except Exception:
             bldg = 0
-        feat.setAttribute("bldgcount", bldg)
+            try:
+                bldg_src = poly.get("bldg") or attrs.get("bldgcount") or meta.get("bldg_count") or r.get("building_count") or 0
+                bldg = int(round(float(bldg_src)))
+            except Exception:
+                bldg = 0
+            feat.setAttribute("bldgcount", bldg)
 
-        feat.setAttribute("ea_type", ea_type_val)
-        feat.setAttribute("sy", sy_val)
+            feat.setAttribute("ea_type", ea_type_val)
+            feat.setAttribute("sy", sy_val)
 
-        feat.setGeometry(QgsGeometry(matched_geom))
-        features_with_geom += 1
-        writer.addFeature(feat)
+            feat.setGeometry(QgsGeometry(geom))
+            features_with_geom += 1
+            writer.addFeature(feat)
+
+    else:
+        # Fallback path if no raw_polygons available from geometry_sources (database-only mode)
+        total_records = len(records)
+        seen_map_uuids = set()
+
+        for idx, r in enumerate(records):
+            if progress_callback and idx % 200 == 0:
+                pct = 30 + int((idx / max(total_records, 1)) * 65)
+                progress_callback(pct, f"Exporting feature {idx + 1:,} of {total_records:,}...")
+
+            # Strict requirement: Do not create EAs in the GeoPackage that do not belong to GPKG
+            # or do not have valid geometry. Retain only physical GeoPackage EAs as they are.
+            if r.get("in_gpkg") == 0 or r.get("has_geometry") == 0:
+                continue
+
+            gc = str(r.get("geocode") or "").strip()
+            meta = gpkg_meta.get(gc, {})
+
+            p_code = to_whole_number_str(r.get("province_code") or "").replace(".0", "").strip()
+            m_code = to_whole_number_str(r.get("city_mun_code") or "").replace(".0", "").strip()
+            b_code = to_whole_number_str(r.get("barangay_code") or "").replace(".0", "").strip()
+            if not (p_code and m_code and b_code):
+                gc_clean = to_whole_number_str(gc).replace(".0", "").strip()
+                if len(gc_clean) == 14:
+                    p_code = gc_clean[:3]
+                    m_code = gc_clean[3:5]
+                    b_code = gc_clean[5:8]
+                elif len(gc_clean) == 16:
+                    p_code = gc_clean[2:5]
+                    m_code = gc_clean[5:7]
+                    b_code = gc_clean[7:10]
+
+            bgy_gc = f"{p_code.zfill(3)}{m_code.zfill(2)}{b_code.zfill(3)}" if p_code else (gc[:8] if len(gc) >= 8 else "")
+            bgy_gc = to_whole_number_str(bgy_gc).replace(".0", "").strip()
+
+            # Determine Final EAN (from subtab 3 GeoPackage / recoded_ean / final_ean)
+            final_ean = to_whole_number_str(
+                r.get("final_ean") or r.get("recoded_ean") or ""
+            ).replace(".0", "").strip()
+            if final_ean:
+                if final_ean.isdigit() and len(final_ean) < 6:
+                    final_ean = f"{int(final_ean):03d}000" if len(final_ean) <= 3 else f"{int(final_ean):06d}"
+
+            orig_ean = to_whole_number_str(r.get("ean") or r.get("new_ean") or r.get("new_enumeration_area_code") or "").replace(".0", "").strip()
+            if orig_ean.isdigit() and len(orig_ean) < 6:
+                orig_ean = f"{int(orig_ean):03d}000" if len(orig_ean) <= 3 else f"{int(orig_ean):06d}"
+
+            fallback_ean = to_whole_number_str(r.get("new_enumeration_area_code") or r.get("new_ean") or r.get("ean") or "").replace(".0", "").strip()
+            if fallback_ean.isdigit() and len(fallback_ean) < 6:
+                fallback_ean = f"{int(fallback_ean):03d}000" if len(fallback_ean) <= 3 else f"{int(fallback_ean):06d}"
+
+            # ean takes the Final EAN if available; otherwise falls back to orig_ean or fallback_ean
+            gpkg_ean = final_ean or orig_ean or fallback_ean
+            gpkg_ean = to_whole_number_str(gpkg_ean).replace(".0", "").strip()
+            ea_gc = f"{bgy_gc}{gpkg_ean}" if (bgy_gc and gpkg_ean) else gc
+            ea_gc = to_whole_number_str(ea_gc).replace(".0", "").strip()
+            corr_gc = gc or ea_gc
+
+            m_uuid = str(meta.get("map_uuid") or r.get("map_uuid") or "").strip()
+
+            # Geometry resolution & original GPKG attribute lookup
+            matched_geom = None
+            orig_attrs: Dict[str, Any] = {}
+
+            if m_uuid and m_uuid in geom_by_uuid:
+                matched_geom = geom_by_uuid[m_uuid]
+                orig_attrs = orig_attrs_by_uuid.get(m_uuid, {})
+            elif gc and gc in geom_by_gc:
+                matched_geom = geom_by_gc[gc]
+                orig_attrs = orig_attrs_by_gc.get(gc, {})
+            elif ea_gc and ea_gc in geom_by_gc:
+                matched_geom = geom_by_gc[ea_gc]
+                orig_attrs = orig_attrs_by_gc.get(ea_gc, {})
+            elif (bgy_gc, orig_ean) in geom_by_bgy_ean:
+                matched_geom = geom_by_bgy_ean[(bgy_gc, orig_ean)]
+                orig_attrs = orig_attrs_by_bgy_ean.get((bgy_gc, orig_ean), {})
+            elif (bgy_gc, fallback_ean) in geom_by_bgy_ean:
+                matched_geom = geom_by_bgy_ean[(bgy_gc, fallback_ean)]
+                orig_attrs = orig_attrs_by_bgy_ean.get((bgy_gc, fallback_ean), {})
+            elif final_ean and (bgy_gc, final_ean) in geom_by_bgy_ean:
+                matched_geom = geom_by_bgy_ean[(bgy_gc, final_ean)]
+                orig_attrs = orig_attrs_by_bgy_ean.get((bgy_gc, final_ean), {})
+
+            # Do NOT create EAs in the GPKG if no geometry exists
+            if matched_geom is None or matched_geom.isEmpty():
+                continue
+
+            # Retain original values from input GPKG feature if available
+            if orig_attrs:
+                orig_u = str(orig_attrs.get("map_uuid") or orig_attrs.get("uuid") or "").strip()
+                if orig_u:
+                    m_uuid = orig_u
+
+                # If final_ean was not in r, check if orig_attrs has final_ean
+                if not final_ean and orig_attrs.get("final_ean"):
+                    fean_attr = to_whole_number_str(orig_attrs.get("final_ean")).replace(".0", "").strip()
+                    if fean_attr:
+                        if fean_attr.isdigit() and len(fean_attr) < 6:
+                            fean_attr = f"{int(fean_attr):03d}000" if len(fean_attr) <= 3 else f"{int(fean_attr):06d}"
+                        final_ean = fean_attr
+                        gpkg_ean = final_ean
+                        ea_gc = f"{bgy_gc}{gpkg_ean}" if (bgy_gc and gpkg_ean) else gc
+                        ea_gc = to_whole_number_str(ea_gc).replace(".0", "").strip()
+
+                # Only fallback to input GPKG original ean if Final EAN was not provided
+                if not final_ean:
+                    orig_g_ean = to_whole_number_str(orig_attrs.get("ean") or orig_attrs.get("new_ean") or orig_attrs.get("code") or "").replace(".0", "").strip()
+                    if orig_g_ean:
+                        if orig_g_ean.isdigit() and len(orig_g_ean) < 6:
+                            orig_g_ean = f"{int(orig_g_ean):03d}000" if len(orig_g_ean) <= 3 else f"{int(orig_g_ean):06d}"
+                        gpkg_ean = orig_g_ean
+                    orig_ea_gc = to_whole_number_str(orig_attrs.get("ea_geocode") or orig_attrs.get("geocode") or "").replace(".0", "").strip()
+                    if orig_ea_gc:
+                        ea_gc = orig_ea_gc
+
+            if not m_uuid:
+                m_uuid = str(uuid.uuid4())
+
+            seen_map_uuids.add(m_uuid)
+
+            r_code = to_whole_number_str(orig_attrs.get("region_code") or r.get("region_code") or "").replace(".0", "").strip()
+            if not r_code:
+                r_code = to_whole_number_str(prov_lookup.get(p_code, ("", ""))[1]).replace(".0", "").strip()
+
+            reg_name = orig_attrs.get("region") or r.get("region") or meta.get("region") or reg_lookup.get(r_code, "")
+            prov_name = orig_attrs.get("province") or r.get("province") or meta.get("province") or prov_lookup.get(p_code, ("", ""))[0]
+            mun_name = orig_attrs.get("city_mun") or r.get("city_mun") or meta.get("city_mun") or mun_lookup.get(p_code + m_code, "")
+            brgy_name = orig_attrs.get("barangay") or r.get("barangay") or meta.get("barangay") or r.get("geographic_name") or brgy_lookup.get(p_code + m_code + b_code, "")
+
+            feat = QgsFeature(fields)
+            feat.setAttribute("map_uuid", m_uuid)
+            feat.setAttribute("ea_geocode", ea_gc)
+            bgy_gc_val = to_whole_number_str(orig_attrs.get("bgy_geocode") or bgy_gc).replace(".0", "").strip()
+            feat.setAttribute("bgy_geocode", bgy_gc_val)
+            feat.setAttribute("province_code", p_code.zfill(3) if p_code else "")
+            feat.setAttribute("city_mun_code", m_code.zfill(2) if m_code else "")
+            feat.setAttribute("barangay_code", b_code.zfill(3) if b_code else "")
+            feat.setAttribute("ean", gpkg_ean)
+            feat.setAttribute("region_code", r_code.zfill(2) if r_code else "")
+            feat.setAttribute("region", reg_name)
+            feat.setAttribute("province", prov_name)
+            feat.setAttribute("city_mun", mun_name)
+            feat.setAttribute("barangay", brgy_name)
+
+            # Name: strictly EA + " " + ean matching the Final EAN
+            ea_name = f"EA {gpkg_ean}" if gpkg_ean else "EA"
+            feat.setAttribute("name", ea_name)
+
+            # Code: Retain original from GPKG strictly as whole number string
+            code_val = to_whole_number_str(orig_attrs.get("code") or meta.get("code") or r.get("code") or "1004").replace(".0", "").strip()
+            feat.setAttribute("code", code_val)
+
+            # EA Type resolution & Source Year alignment:
+            # Rule: If EA Type is not DELINEATED or MERGED, it defaults to RETAINED.
+            #       If RETAINED -> sy = 2024; if DELINEATED or MERGED -> sy = 2026.
+            raw_ea_type = str(
+                orig_attrs.get("ea_type")
+                or r.get("ea_type")
+                or meta.get("ea_type")
+                or r.get("ea_lifecycle")
+                or ""
+            ).strip().upper()
+
+            if "DELIN" in raw_ea_type or "SPLIT" in raw_ea_type:
+                ea_type_val = "DELINEATED"
+                sy_val = "2026"
+            elif "MERG" in raw_ea_type:
+                ea_type_val = "MERGED"
+                sy_val = "2026"
+            else:
+                ea_type_val = "RETAINED"
+                sy_val = "2024"
+
+            # Correspondence code: ea_geocode + ":" + map_uuid + ":" + sy (strictly no decimals)
+            corr_code = f"{ea_gc}:{m_uuid}:{sy_val}".replace(".0", "")
+            feat.setAttribute("correspondence_geocode", corr_code)
+
+            # Remarks: Retain original GPKG remarks
+            feat.setAttribute("remarks", str(orig_attrs.get("remarks") or meta.get("remarks") or r.get("remarks") or r.get("earf_remarks") or ""))
+
+            # Household and building counts: Integer counts without decimals
+            f_hh = orig_attrs.get("hhcount") or orig_attrs.get("hh_count")
+            f_bldg = orig_attrs.get("bldgcount") or orig_attrs.get("bldg_count")
+
+            hh = 0
+            try:
+                hh_src = f_hh if (f_hh is not None and str(f_hh).strip() != "") else (meta.get("hh_count") or meta.get("hhcount") or r.get("gpkg_hh_count") or r.get("hhcount") or 0)
+                hh = int(round(float(hh_src)))
+            except Exception:
+                hh = 0
+            feat.setAttribute("hhcount", hh)
+
+            bldg = 0
+            try:
+                bldg_src = f_bldg if (f_bldg is not None and str(f_bldg).strip() != "") else (meta.get("bldg_count") or r.get("gpkg_bldg_count") or r.get("bldgcount") or 0)
+                bldg = int(round(float(bldg_src)))
+            except Exception:
+                bldg = 0
+            feat.setAttribute("bldgcount", bldg)
+
+            feat.setAttribute("ea_type", ea_type_val)
+            feat.setAttribute("sy", sy_val)
+
+            feat.setGeometry(QgsGeometry(matched_geom))
+            features_with_geom += 1
+            writer.addFeature(feat)
 
     del writer
 
