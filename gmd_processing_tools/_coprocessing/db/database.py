@@ -4143,15 +4143,47 @@ class POPCENDatabase:
             }
             all_records.append(rec)
 
-        placeholders = ", ".join(["?"] * len(cols))
-        insert_sql = f"INSERT INTO gpkg_records ({', '.join(cols)}) VALUES ({placeholders})"
-
+        # Deduplicate map_uuid: 1st occurrence keeps its map_uuid.
+        # The 2nd (and subsequent) duplicate value is changed using a unique UUID for QGIS.
+        import uuid
+        seen_uuids = set()
         with self._get_gpkg_connection() as conn:
             cur = conn.cursor()
             if replace:
                 cur.execute("DELETE FROM gpkg_records")
                 conn.commit()
+            else:
+                cur.execute("SELECT DISTINCT map_uuid FROM gpkg_records WHERE map_uuid IS NOT NULL AND map_uuid != ''")
+                for row in cur.fetchall():
+                    u_db = str(row[0]).strip()
+                    if u_db:
+                        seen_uuids.add(u_db)
 
+        for rec in all_records:
+            u = str(rec.get("map_uuid") or "").strip()
+            if not u or u.lower() in ("nan", "none", "null"):
+                while True:
+                    new_u = str(uuid.uuid4())
+                    if new_u not in seen_uuids:
+                        rec["map_uuid"] = new_u
+                        seen_uuids.add(new_u)
+                        break
+            elif u in seen_uuids:
+                # 2nd or subsequent duplicate value: change using unique UUID for QGIS
+                while True:
+                    new_u = str(uuid.uuid4())
+                    if new_u not in seen_uuids:
+                        rec["map_uuid"] = new_u
+                        seen_uuids.add(new_u)
+                        break
+            else:
+                seen_uuids.add(u)
+
+        placeholders = ", ".join(["?"] * len(cols))
+        insert_sql = f"INSERT INTO gpkg_records ({', '.join(cols)}) VALUES ({placeholders})"
+
+        with self._get_gpkg_connection() as conn:
+            cur = conn.cursor()
             batch_size = 5000
             total_recs = len(all_records)
             for i in range(0, total_recs, batch_size):
@@ -4169,8 +4201,8 @@ class POPCENDatabase:
     def deduplicate_gpkg_map_uuids(self) -> int:
         """
         Scans gpkg_records for duplicate map_uuid values.
-        When duplicates are found, checks the ea_type for Delineated values
-        and updates them with a new UUID to prevent duplicates.
+        The 1st occurrence keeps its original map_uuid.
+        The 2nd (and subsequent) duplicate occurrences are updated with a new unique uuid.uuid4() for QGIS.
         Returns the number of records updated.
         """
         import uuid
@@ -4179,7 +4211,7 @@ class POPCENDatabase:
             cur.execute("""
                 SELECT map_uuid, COUNT(*) as cnt
                 FROM gpkg_records
-                WHERE map_uuid IS NOT NULL AND map_uuid != ''
+                WHERE map_uuid IS NOT NULL AND map_uuid != '' AND LOWER(map_uuid) NOT IN ('nan', 'none', 'null')
                 GROUP BY map_uuid
                 HAVING cnt > 1
             """)
@@ -4187,24 +4219,23 @@ class POPCENDatabase:
             if not dup_uuids:
                 return 0
 
+            # Gather all existing map_uuid values to guarantee newly generated UUIDs are 100% unique
+            cur.execute("SELECT DISTINCT map_uuid FROM gpkg_records WHERE map_uuid IS NOT NULL AND map_uuid != ''")
+            all_existing_uuids = {str(r[0]).strip() for r in cur.fetchall()}
+
             updates = []
             for u in dup_uuids:
-                cur.execute("SELECT id, geocode, ean, ea_type, remarks FROM gpkg_records WHERE map_uuid = ? ORDER BY id", (u,))
-                rows = [dict(r) for r in cur.fetchall()]
-
-                delin_rows = []
-                other_rows = []
-                for r in rows:
-                    ea_t = str(r.get("ea_type") or "").strip().upper()
-                    rem = str(r.get("remarks") or "").strip().lower()
-                    if "DELIN" in ea_t or "delineat" in rem or "split" in ea_t or "split" in rem:
-                        delin_rows.append(r)
-                    else:
-                        other_rows.append(r)
-
-                target_rows = delin_rows if other_rows else delin_rows[1:]
-                for r in target_rows:
-                    updates.append((str(uuid.uuid4()), r["id"]))
+                cur.execute("SELECT id FROM gpkg_records WHERE map_uuid = ? ORDER BY id ASC", (u,))
+                rows = cur.fetchall()
+                # rows[0] is the 1st occurrence -> keep original
+                # rows[1:] are the 2nd and subsequent duplicates -> change to new unique UUID
+                for r in rows[1:]:
+                    while True:
+                        new_uuid = str(uuid.uuid4())
+                        if new_uuid not in all_existing_uuids:
+                            all_existing_uuids.add(new_uuid)
+                            updates.append((new_uuid, r[0]))
+                            break
 
             if updates:
                 cur.executemany("UPDATE gpkg_records SET map_uuid = ? WHERE id = ?", updates)

@@ -857,6 +857,7 @@ def export_matched_records_to_gpkg(
                         records_by_bgy_ean[bk].append(r)
 
         total_polygons = len(raw_polygons)
+        seen_output_uuids: Set[str] = set()
         for idx, poly in enumerate(raw_polygons):
             if progress_callback and idx % 50 == 0:
                 pct = 30 + int((idx / max(total_polygons, 1)) * 65)
@@ -886,8 +887,14 @@ def export_matched_records_to_gpkg(
             meta = gpkg_meta_by_uuid.get(p_uuid) or gpkg_meta.get(p_gc, {}) or (gpkg_meta_by_bgy_ean.get((p_bgy, p_ean)) if p_bgy and p_ean else {})
 
             m_uuid = p_uuid or str(meta.get("map_uuid") or r.get("map_uuid") or "").strip()
-            if not m_uuid:
-                m_uuid = str(uuid.uuid4())
+            # If map_uuid is empty or a duplicate: preserve 1st occurrence, change 2nd+ duplicates with unique QGIS UUID
+            if not m_uuid or m_uuid.lower() in ("nan", "none", "null") or m_uuid in seen_output_uuids:
+                while True:
+                    new_u = str(uuid.uuid4())
+                    if new_u not in seen_output_uuids:
+                        m_uuid = new_u
+                        break
+            seen_output_uuids.add(m_uuid)
 
             # Final EAN: strictly reflects the Final EAN from subtab 3 GeoPackage
             final_ean = to_whole_number_str(
@@ -1116,8 +1123,13 @@ def export_matched_records_to_gpkg(
                     if orig_ea_gc:
                         ea_gc = orig_ea_gc
 
-            if not m_uuid:
-                m_uuid = str(uuid.uuid4())
+            # If map_uuid is empty or a duplicate: preserve 1st occurrence, change 2nd+ duplicates with unique QGIS UUID
+            if not m_uuid or m_uuid.lower() in ("nan", "none", "null") or m_uuid in seen_map_uuids:
+                while True:
+                    new_u = str(uuid.uuid4())
+                    if new_u not in seen_map_uuids:
+                        m_uuid = new_u
+                        break
 
             seen_map_uuids.add(m_uuid)
 

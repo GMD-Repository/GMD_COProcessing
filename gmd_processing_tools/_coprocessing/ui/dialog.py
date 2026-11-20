@@ -4634,6 +4634,12 @@ class COProcessingDialog(QDialog):
         btn_run_consistency.clicked.connect(self._run_gpkg_consistency_dispatcher)
         filter_bar.addWidget(btn_run_consistency)
 
+        self.btn_resolve_duplicate_uuids = QPushButton("Resolve Duplicate UUIDs")
+        self.btn_resolve_duplicate_uuids.setToolTip("Change the 2nd (and subsequent) duplicate value of map_uuid using a unique UUID for QGIS, preserving the 1st occurrence")
+        self.btn_resolve_duplicate_uuids.setStyleSheet("font-weight: 600; color: #b45309; background-color: #fef3c7; border: 1px solid #fde68a; border-radius: 4px; padding: 4px 8px;")
+        self.btn_resolve_duplicate_uuids.clicked.connect(self._resolve_duplicate_gpkg_uuids)
+        filter_bar.addWidget(self.btn_resolve_duplicate_uuids)
+
         filter_bar.addWidget(QLabel("Page Size:"))
         self.cmb_gpkg_page_size = QComboBox()
         self.cmb_gpkg_page_size.addItems(["200", "500", "1000", "2000", "5000"])
@@ -7322,6 +7328,83 @@ class COProcessingDialog(QDialog):
         else:
             self._run_gpkg_consistency_check()
 
+    def _resolve_duplicate_gpkg_uuids(self):
+        """
+        Deduplicates map_uuid across GeoPackage records.
+        The 1st occurrence retains its original map_uuid.
+        The 2nd (and subsequent) duplicate occurrences are replaced with a newly generated,
+        guaranteed unique UUID for QGIS (uuid.uuid4()).
+        Works across both SQLite DB mode and in-memory DataFrame mode.
+        """
+        import uuid
+        is_db_mode = getattr(self, "cmb_gpkg_source_mode", None) is not None and self.cmb_gpkg_source_mode.currentIndex() == 0
+
+        updated_count = 0
+        if is_db_mode:
+            updated_count = self.db.deduplicate_gpkg_map_uuids()
+            if updated_count > 0:
+                self._fetch_and_render_gpkg_db_page()
+                self._load_gpkg_db_kpis()
+        else:
+            if not hasattr(self, "gpkg_df") or self.gpkg_df.empty:
+                QMessageBox.information(self, "No Records", "No GeoPackage records are currently loaded.")
+                return
+
+            uuid_col = next((c for c in self.gpkg_df.columns if c.strip().lower() in ("map_uuid", "uuid")), None)
+            if not uuid_col:
+                QMessageBox.information(self, "No UUID Column", "No 'map_uuid' column found in the loaded GeoPackage dataset.")
+                return
+
+            seen_uuids = set()
+            for val in self.gpkg_df[uuid_col].dropna():
+                u_str = str(val).strip()
+                if u_str and u_str.lower() not in ("nan", "none", "null"):
+                    seen_uuids.add(u_str)
+
+            processed_seen = set()
+            for idx in self.gpkg_df.index:
+                val = str(self.gpkg_df.at[idx, uuid_col] or "").strip()
+                if not val or val.lower() in ("nan", "none", "null"):
+                    while True:
+                        new_u = str(uuid.uuid4())
+                        if new_u not in seen_uuids:
+                            self.gpkg_df.at[idx, uuid_col] = new_u
+                            seen_uuids.add(new_u)
+                            updated_count += 1
+                            break
+                elif val in processed_seen:
+                    # 2nd or subsequent duplicate value: change using unique UUID for QGIS
+                    while True:
+                        new_u = str(uuid.uuid4())
+                        if new_u not in seen_uuids:
+                            self.gpkg_df.at[idx, uuid_col] = new_u
+                            seen_uuids.add(new_u)
+                            updated_count += 1
+                            break
+                else:
+                    processed_seen.add(val)
+
+            if updated_count > 0:
+                self.gpkg_df, summary = analyze_gpkg_consistency(self.gpkg_df)
+                self.gpkg_df._consistency_summary = summary
+                self._update_gpkg_kpis()
+                self._apply_gpkg_filters()
+
+        if updated_count > 0:
+            QMessageBox.information(
+                self,
+                "Duplicate UUIDs Resolved",
+                f"Successfully updated {updated_count:,} duplicate map_uuid value(s) using unique QGIS UUIDs.\n\n"
+                "The 1st occurrence of each map_uuid was preserved, while the 2nd and subsequent "
+                "duplicates were assigned newly generated unique UUIDs."
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "No Duplicate UUIDs",
+                "All map_uuid values in the dataset are already unique. No records needed modification."
+            )
+
     def _fetch_and_render_gpkg_db_page(self):
         search_txt = self.search_gpkg.text().strip()
         issue_filter = self.cmb_gpkg_issue_filter.currentText()
@@ -8296,6 +8379,8 @@ class COProcessingDialog(QDialog):
             act_remove = menu.addAction(f"🗑 Remove {checked_count:,} Checked Feature(s)")
         else:
             act_remove = menu.addAction("🗑 Remove This Feature")
+        menu.addSeparator()
+        act_fix_uuids = menu.addAction("🔑 Resolve Duplicate map_uuid Values")
 
         action = menu.exec_(self.table_gpkg.viewport().mapToGlobal(pos))
         if action == act_toggle:
@@ -8313,6 +8398,8 @@ class COProcessingDialog(QDialog):
                 if chk:
                     chk.setCheckState(Qt.Checked)
                 self._remove_selected_gpkg_records()
+        elif action == act_fix_uuids:
+            self._resolve_duplicate_gpkg_uuids()
 
     def _remove_selected_gpkg_records(self):
         """Permanently removes all checked GeoPackage features and cascades removal across POPCEN, EARF, and matching workspaces."""
