@@ -1082,7 +1082,8 @@ workbooks keep a record of the records as they were and of the planned fixes. If
 and in the attribute table, then <b>Save</b> (or <b>Roll Back</b>) the layer edits in QGIS. EARF fixes are
 saved to <code>&lt;EARF name&gt;_fixed.xlsx</code> in the output folder; the original is not changed.
 The tool then checks again (using the fixed EARF) so only what is left is listed. Export again to record
-what is left and the fixes made; each new check must be exported before its fixes are applied.</li>
+what is left and the fixes made. The export is asked for once per <b>Run Check</b>: after it, you can fix
+one validation_id after another without exporting again.</li>
 </ol>
 
 <h3>Inputs</h3>
@@ -1663,7 +1664,8 @@ def make_dialog_class():
             return by_fid, by_geo
 
         def run(self, *_, keep_applied=False):
-            self.exported = False       # a new check must be exported before its fixes are applied
+            if not keep_applied:        # a new Run Check must be exported once before fixing; the
+                self.exported = False   # automatic re-check after Apply keeps the earlier export
             if not keep_applied:
                 self.applied_plans = None
                 self.applied_ticked, self.fixed_rows = {}, {}
