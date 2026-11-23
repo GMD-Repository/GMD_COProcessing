@@ -971,6 +971,38 @@ def audit_matched_flags(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return records
 
 
+def extract_sort_geocode(r_item: Dict[str, Any]) -> str:
+    """Extracts or computes the 14-digit geocode for sorting records."""
+    p = str(r_item.get("province_code") or "").strip()
+    m = str(r_item.get("city_mun_code") or "").strip()
+    b = str(r_item.get("barangay_code") or "").strip()
+    gc = str(r_item.get("geocode") or "").strip()
+    if not (p and m and b) and len(gc) >= 8:
+        if not p: p = gc[:3]
+        if not m: m = gc[3:5]
+        if not b: b = gc[5:8]
+    p = p.zfill(3)
+    m = m.zfill(2)
+    b = b.zfill(3)
+
+    final_ea = str(r_item.get("recoded_ean") or r_item.get("final_ean") or "").strip()
+    if final_ea.isdigit() and len(final_ea) < 6:
+        final_ea = f"{int(final_ea):03d}000" if len(final_ea) <= 3 else f"{int(final_ea):06d}"
+    if not final_ea:
+        prelim_ea = str(r_item.get("new_enumeration_area_code") or r_item.get("new_ean") or "").strip()
+        if prelim_ea.isdigit() and len(prelim_ea) < 6:
+            prelim_ea = f"{int(prelim_ea):03d}000" if len(prelim_ea) <= 3 else f"{int(prelim_ea):06d}"
+        ean_raw = str(r_item.get("ean") or "000000").strip()
+        if ean_raw.isdigit() and len(ean_raw) < 6:
+            ean_raw = f"{int(ean_raw):03d}000" if len(ean_raw) <= 3 else f"{int(ean_raw):06d}"
+        final_ea = prelim_ea or ean_raw
+
+    ea_gc = str(r_item.get("ea_geocode") or "").strip()
+    if not ea_gc or len(ea_gc) != 14:
+        ea_gc = f"{p}{m}{b}{final_ea}"
+    return ea_gc
+
+
 def export_matched_to_excel(
     records: List[Dict[str, Any]], 
     out_path: str,
@@ -1051,18 +1083,7 @@ def export_matched_to_excel(
     records = deduped_records
 
     # Strictly sort records by geocode
-    def _extract_sort_geocode(r_item: Dict[str, Any]) -> str:
-        gc_val = str(r_item.get("ea_geocode") or r_item.get("geocode") or "").strip()
-        if not gc_val or len(gc_val) < 8:
-            p = str(r_item.get("province_code") or "").strip().zfill(3)
-            m = str(r_item.get("city_mun_code") or "").strip().zfill(2)
-            b = str(r_item.get("barangay_code") or "").strip().zfill(3)
-            e = str(r_item.get("final_ean") or r_item.get("recoded_ean") or r_item.get("ean") or "").strip()
-            if e.isdigit() and len(e) < 6:
-                e = e.zfill(6)
-            gc_val = f"{p}{m}{b}{e}"
-        return gc_val
-
+    _extract_sort_geocode = extract_sort_geocode
     records = sorted(records, key=_extract_sort_geocode)
 
     # Ensure recoded_ean is populated across records
@@ -1135,24 +1156,24 @@ def export_matched_to_excel(
     cell_a3.border = thin_border
 
     if is_pcd:
-        # PCD: 2024 EARF covers Prov to Name (Cols B to G, cols 2 to 7)
-        ws1.merge_cells("B3:G3")
+        # PCD: 2024 EARF covers Old Geocode to Name (Cols B to H, cols 2 to 8)
+        ws1.merge_cells("B3:H3")
         ws1["B3"] = "2024 EARF"
         ws1["B3"].font = font_group_header
         ws1["B3"].alignment = center_align
 
-        for c in range(2, 8):
+        for c in range(2, 9):
             cell = ws1.cell(row=3, column=c)
             cell.fill = fill_green_grp
             cell.border = thin_border
 
-        # PCD: 2026 Preliminary EA covers Final EA Code to Remarks (Cols H to I, cols 8 to 9)
-        ws1.merge_cells("H3:I3")
-        ws1["H3"] = "2026 Preliminary EA"
-        ws1["H3"].font = font_group_header
-        ws1["H3"].alignment = center_align
+        # PCD: 2026 Preliminary EA covers Final EA Code to Remarks (Cols I to J, cols 9 to 10)
+        ws1.merge_cells("I3:J3")
+        ws1["I3"] = "2026 Preliminary EA"
+        ws1["I3"].font = font_group_header
+        ws1["I3"].alignment = center_align
 
-        for c in range(8, 10):
+        for c in range(9, 11):
             cell = ws1.cell(row=3, column=c)
             cell.fill = fill_blue_grp
             cell.border = thin_border
@@ -1179,11 +1200,13 @@ def export_matched_to_excel(
             cell.fill = fill_blue_grp
             cell.border = thin_border
 
-    # Row 4: Column Headers (16 Columns for Final EARF, 9 Columns for PCD)
+    # Row 4: Column Headers (16 Columns for Final EARF, 10 Columns for PCD)
     if is_pcd:
         # Removed columns H (HH Count), I (Bldg Count), J (Prelim EA), L (HH Count), M (Bldg Count), N (EA Type), O (Source Year)
+        # Added Old Geocode at left side of Prov column
         col_names = [
             "Geocode",
+            "Old Geocode",
             "Prov", "Mun", "Brgy", "EA", "Number of\nEAs",
             "Province, City, Municipality,\nBarangay, and EA",
             "Final Enumeration\nArea Code", "Remarks"
@@ -1205,7 +1228,7 @@ def export_matched_to_excel(
         cell.alignment = wrap_center_align
         if idx == 1:
             cell.fill = fill_neutral_gray
-        elif (is_pcd and idx <= 7) or (not is_pcd and idx <= 9):
+        elif (is_pcd and idx <= 8) or (not is_pcd and idx <= 9):
             cell.fill = fill_green_grp
         else:
             cell.fill = fill_blue_grp
@@ -1215,6 +1238,7 @@ def export_matched_to_excel(
     if is_pcd:
         col_nums = [
             "(1)",
+            "",
             "(2)", "(3)", "(4)", "(5)", "(6)",
             "(7)",
             "(8)", ""
@@ -1234,7 +1258,7 @@ def export_matched_to_excel(
         cell.alignment = center_align
         if idx == 1:
             cell.fill = fill_neutral_gray
-        elif (is_pcd and idx <= 7) or (not is_pcd and idx <= 9):
+        elif (is_pcd and idx <= 8) or (not is_pcd and idx <= 9):
             cell.fill = fill_green_grp
         else:
             cell.fill = fill_blue_grp
@@ -1342,7 +1366,7 @@ def export_matched_to_excel(
     prov_gc = f"{resolved_prov_code}00000000000"
     if is_pcd:
         prov_row_vals = [
-            prov_gc, resolved_prov_code, "00", "000", "000000", tot_eas,
+            prov_gc, prov_gc, resolved_prov_code, "00", "000", "000000", tot_eas,
             resolved_prov_name,
             "", ""
         ]
@@ -1357,19 +1381,30 @@ def export_matched_to_excel(
         cell.font = font_bold
         cell.fill = fill_neutral_gray if c_idx == 1 else fill_green_grp
         cell.border = thin_border
-        if c_idx in (1, 2, 3, 4, 5):
-            cell.alignment = center_align
-            cell.number_format = "@"
-        elif c_idx == 6:
-            cell.alignment = right_align
-            if isinstance(val, int):
-                cell.number_format = "#,##0"
-        elif c_idx == 7:
-            cell.alignment = left_align
-        elif not is_pcd and c_idx in (8, 9):
-            cell.alignment = right_align
-            if isinstance(val, int):
-                cell.number_format = "#,##0"
+        if is_pcd:
+            if c_idx in (1, 2, 3, 4, 5, 6):
+                cell.alignment = center_align
+                cell.number_format = "@"
+            elif c_idx == 7:
+                cell.alignment = right_align
+                if isinstance(val, int):
+                    cell.number_format = "#,##0"
+            elif c_idx == 8:
+                cell.alignment = left_align
+        else:
+            if c_idx in (1, 2, 3, 4, 5):
+                cell.alignment = center_align
+                cell.number_format = "@"
+            elif c_idx == 6:
+                cell.alignment = right_align
+                if isinstance(val, int):
+                    cell.number_format = "#,##0"
+            elif c_idx == 7:
+                cell.alignment = left_align
+            elif c_idx in (8, 9):
+                cell.alignment = right_align
+                if isinstance(val, int):
+                    cell.number_format = "#,##0"
     ws1.row_dimensions[current_row].height = 20
     current_row += 1
 
@@ -1380,7 +1415,7 @@ def export_matched_to_excel(
         mun_gc = f"{p_c}{m_c}000000000"
         if is_pcd:
             mun_row_vals = [
-                mun_gc, p_c, m_c, "000", "000000", "",
+                mun_gc, mun_gc, p_c, m_c, "000", "000000", "",
                 m_name_disp,
                 "", ""
             ]
@@ -1394,11 +1429,18 @@ def export_matched_to_excel(
             cell = ws1.cell(row=current_row, column=c_idx, value=val)
             cell.font = font_bold
             cell.border = thin_border
-            if c_idx in (1, 2, 3, 4, 5):
-                cell.alignment = center_align
-                cell.number_format = "@"
-            elif c_idx == 7:
-                cell.alignment = left_align
+            if is_pcd:
+                if c_idx in (1, 2, 3, 4, 5, 6):
+                    cell.alignment = center_align
+                    cell.number_format = "@"
+                elif c_idx == 8:
+                    cell.alignment = left_align
+            else:
+                if c_idx in (1, 2, 3, 4, 5):
+                    cell.alignment = center_align
+                    cell.number_format = "@"
+                elif c_idx == 7:
+                    cell.alignment = left_align
         ws1.row_dimensions[current_row].height = 20
         current_row += 1
 
@@ -1413,7 +1455,7 @@ def export_matched_to_excel(
             brgy_gc = f"{p_c}{m_c}{b_code}000000"
             if is_pcd:
                 brgy_row_vals = [
-                    brgy_gc, p_c, m_c, b_code, "000000", "",
+                    brgy_gc, brgy_gc, p_c, m_c, b_code, "000000", "",
                     b_name,
                     "", ""
                 ]
@@ -1427,11 +1469,18 @@ def export_matched_to_excel(
                 cell = ws1.cell(row=current_row, column=c_idx, value=val)
                 cell.font = font_bold
                 cell.border = thin_border
-                if c_idx in (1, 2, 3, 4, 5):
-                    cell.alignment = center_align
-                    cell.number_format = "@"
-                elif c_idx == 7:
-                    cell.alignment = left_align
+                if is_pcd:
+                    if c_idx in (1, 2, 3, 4, 5, 6):
+                        cell.alignment = center_align
+                        cell.number_format = "@"
+                    elif c_idx == 8:
+                        cell.alignment = left_align
+                else:
+                    if c_idx in (1, 2, 3, 4, 5):
+                        cell.alignment = center_align
+                        cell.number_format = "@"
+                    elif c_idx == 7:
+                        cell.alignment = left_align
             ws1.row_dimensions[current_row].height = 20
             current_row += 1
 
@@ -1451,7 +1500,7 @@ def export_matched_to_excel(
                 if not final_ea:
                     final_ea = prelim_ea or ean_raw
 
-                # Exact ea_geocode matching the exported GPKG (bgy_geocode + final_ea / gpkg_ean)
+                # Exact ea_geocode matching the exported GPKG (bgy_gc + final_ea / gpkg_ean)
                 bgy_gc = f"{p_c.zfill(3)}{m_c.zfill(2)}{b_code.zfill(3)}"
                 gpkg_ean = final_ea or prelim_ea or ean_raw
                 ea_gc = str(r.get("ea_geocode") or "").strip()
@@ -1482,10 +1531,11 @@ def export_matched_to_excel(
                     if is_absorbed:
                         continue
                     effective_name_ean = final_ea or prelim_ea or ean_raw
+                    old_ea_gc = f"{p_c.zfill(3)}{m_c.zfill(2)}{b_code.zfill(3)}{ean_raw.zfill(6)}"
                     # PCD: Columns H (HH Count), I (Bldg Count), J (Prelim EA), L (HH Count), M (Bldg Count), N (EA Type), O (Source Year) removed.
-                    # Column Remarks has values cleared.
+                    # Column Remarks has values cleared. Added Old Geocode at left side of Prov column.
                     ea_row_vals = [
-                        ea_gc, p_c, m_c, b_code, ean_raw, 1,
+                        ea_gc, old_ea_gc, p_c, m_c, b_code, ean_raw, 1,
                         f"EA {effective_name_ean}",
                         final_ea,
                         ""
@@ -1521,20 +1571,20 @@ def export_matched_to_excel(
                         cell.fill = fill_peach_merged
 
                     if is_pcd:
-                        if c_idx == 8:  # Final EA Code (from recoded_ean)
+                        if c_idx == 9:  # Final EA Code (from recoded_ean)
                             cell.font = font_final_ea
                             cell.alignment = center_align
                             cell.number_format = "@"
-                        elif c_idx in (1, 2, 3, 4, 5):
+                        elif c_idx in (1, 2, 3, 4, 5, 6):  # Geocode, Old Geocode, Prov, Mun, Brgy, EA
                             cell.font = font_data
                             cell.alignment = center_align
                             cell.number_format = "@"
-                        elif c_idx == 6:
+                        elif c_idx == 7:  # Number of EAs
                             cell.font = font_data
                             cell.alignment = right_align
                             if isinstance(val, int):
                                 cell.number_format = "#,##0"
-                        else:  # c_idx 7 (Name) and c_idx 9 (Remarks)
+                        else:  # c_idx 8 (Name) and c_idx 10 (Remarks)
                             cell.font = font_data
                             cell.alignment = left_align
                     else:
@@ -1562,8 +1612,8 @@ def export_matched_to_excel(
     # Format Column Widths for Sheet 1
     if is_pcd:
         col_w_map = {
-            "A": 18, "B": 8, "C": 8, "D": 8, "E": 10,
-            "F": 14, "G": 36, "H": 16, "I": 30
+            "A": 18, "B": 18, "C": 8, "D": 8, "E": 8,
+            "F": 10, "G": 14, "H": 36, "I": 16, "J": 30
         }
     else:
         col_w_map = {
@@ -6386,7 +6436,7 @@ class POPCENDatabase:
                 meta = self.get_citymun_hierarchy(f"{p_c}{m_c}")
 
         # Strictly sort by geocode before generating PCD Excel
-        pcd_rows.sort(key=lambda r: str(r.get("ea_geocode") or r.get("geocode") or "").strip())
+        pcd_rows.sort(key=extract_sort_geocode)
 
         export_matched_to_excel(pcd_rows, out_excel, metadata=meta, is_pcd=True)
 
