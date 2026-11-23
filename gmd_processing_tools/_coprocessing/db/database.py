@@ -289,6 +289,26 @@ REQUIRED_GPKG_COLUMNS = [
     "remarks",
 ]
 
+GPKG_COLUMN_ALIASES: Dict[str, List[str]] = {
+    "map_uuid": ["map_uuid", "uuid", "mapuuid", "id"],
+    "geocode": ["geocode", "psgc_ea", "ea_geocode", "ean_code"],
+    "region": ["region", "reg", "region_code", "reg_code", "reg_name"],
+    "province": ["province", "prov", "province_code", "prov_code", "prov_name"],
+    "city_mun": ["city_mun", "mun", "city", "city_mun_code", "mun_code", "city_code", "municipality"],
+    "barangay": ["barangay", "brgy", "bgy", "barangay_code", "brgy_code", "bgy_code", "brgy_name"],
+    "ean": ["ean", "ea", "ea_code", "ean_code"],
+    "name": ["name", "brgy_name", "barangay_name", "eaname", "ea_name"],
+    "code": ["code", "bgy_code", "psgc", "brgy_code"],
+    "hhcount": ["hhcount", "hh_count", "hh count", "household_count"],
+    "bldgcount": ["bldgcount", "bldg_count", "bldg count", "building_count"],
+    "sy": ["sy", "source_year", "source year", "year"],
+    "new_ean": ["new_ean", "new ean", "new_ea", "new ea", "new_ea_code"],
+    "hh_count": ["hh_count", "hhcount", "hh count", "household_count"],
+    "bldg_count": ["bldg_count", "bldgcount", "bldg count", "building_count"],
+    "ea_type": ["ea_type", "eatype", "ea type", "type"],
+    "remarks": ["remarks", "remark", "notes", "status"],
+}
+
 
 def get_gpkg_layer_columns(source: Union[str, Any], table_name: Optional[str] = None) -> List[str]:
     """Extracts column/attribute names from a GeoPackage file or QgsVectorLayer."""
@@ -298,7 +318,28 @@ def get_gpkg_layer_columns(source: Union[str, Any], table_name: Optional[str] = 
         except Exception:
             pass
 
-    fpath = str(source).strip()
+    src_str = str(source).strip() if source is not None else ""
+    if not src_str:
+        return []
+
+    # Check if source is a QGIS layer in the active project
+    try:
+        from qgis.core import QgsProject, QgsVectorLayer
+        for lyr in QgsProject.instance().mapLayers().values():
+            if (lyr.name() == src_str or lyr.id() == src_str) and isinstance(lyr, QgsVectorLayer):
+                return [f.name() for f in lyr.fields()]
+    except Exception:
+        pass
+
+    # Handle sublayer syntax: path.gpkg|layername=table
+    if "|layername=" in src_str:
+        parts = src_str.split("|layername=", 1)
+        fpath = parts[0].strip()
+        if not table_name:
+            table_name = parts[1].strip()
+    else:
+        fpath = src_str
+
     if not fpath or not os.path.exists(fpath):
         return []
 
@@ -333,21 +374,124 @@ def get_gpkg_layer_columns(source: Union[str, Any], table_name: Optional[str] = 
     return []
 
 
-def validate_gpkg_columns(source: Union[str, Any], table_name: Optional[str] = None) -> Tuple[bool, List[str], List[str]]:
+def validate_gpkg_columns(
+    source: Union[str, Any], 
+    table_name: Optional[str] = None,
+    allow_aliases: bool = True
+) -> Tuple[bool, List[str], List[str]]:
     """
     Validates that a GeoPackage layer or file has all required column headers before upload.
     Returns (is_valid, missing_columns, existing_columns).
-    Matching is case-insensitive.
+    Matching is case-insensitive, with support for standard column aliases.
     """
     cols = get_gpkg_layer_columns(source, table_name=table_name)
     existing_lower = {str(c).strip().lower(): str(c) for c in cols if c}
     
     missing = []
     for req in REQUIRED_GPKG_COLUMNS:
-        if req.lower() not in existing_lower:
-            missing.append(req)
+        req_l = req.lower()
+        if req_l in existing_lower:
+            continue
+        if allow_aliases:
+            aliases = GPKG_COLUMN_ALIASES.get(req_l, [])
+            if any(a.lower() in existing_lower for a in aliases):
+                continue
+        missing.append(req)
 
     return (len(missing) == 0), missing, cols
+
+
+def validate_gpkg_attribute_table_detailed(
+    source: Union[str, Any], 
+    table_name: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Performs comprehensive schema and attribute validation of a GeoPackage file or layer.
+    Returns a dictionary detailing status, missing columns, existing columns, geometry type, etc.
+    """
+    src_str = str(source).strip() if source is not None else ""
+    src_name = getattr(source, "name", lambda: os.path.basename(src_str))() if hasattr(source, "name") else os.path.basename(src_str)
+    
+    cols = get_gpkg_layer_columns(source, table_name=table_name)
+    existing_lower = {str(c).strip().lower(): str(c) for c in cols if c}
+    
+    missing = []
+    matched = {}
+    for req in REQUIRED_GPKG_COLUMNS:
+        req_l = req.lower()
+        if req_l in existing_lower:
+            matched[req] = existing_lower[req_l]
+            continue
+        aliases = GPKG_COLUMN_ALIASES.get(req_l, [])
+        found_alias = None
+        for a in aliases:
+            if a.lower() in existing_lower:
+                found_alias = existing_lower[a.lower()]
+                break
+        if found_alias:
+            matched[req] = found_alias
+        else:
+            missing.append(req)
+
+    is_valid = (len(missing) == 0)
+
+    # Geometry check
+    has_poly = True
+    poly_tables = []
+    geom_desc = "Polygon"
+    if isinstance(source, str) and os.path.exists(source) and os.path.isfile(source):
+        has_poly, poly_tables, geom_desc = get_gpkg_polygon_layer_info(source)
+    elif hasattr(source, "geometryType") or hasattr(source, "wkbType"):
+        try:
+            from ..core.algorithm import is_polygon_layer
+            has_poly = is_polygon_layer(source)
+        except Exception:
+            try:
+                from core.algorithm import is_polygon_layer
+                has_poly = is_polygon_layer(source)
+            except Exception:
+                has_poly = True
+        geom_desc = "Polygon" if has_poly else "Non-Polygon"
+
+    return {
+        "source": src_str,
+        "source_name": src_name,
+        "is_valid": is_valid and has_poly,
+        "is_valid_cols": is_valid,
+        "missing_columns": missing,
+        "existing_columns": cols,
+        "matched_columns": matched,
+        "has_poly": has_poly,
+        "poly_tables": poly_tables,
+        "geometry_desc": geom_desc,
+        "total_required": len(REQUIRED_GPKG_COLUMNS),
+        "total_found": len(matched),
+    }
+
+
+def validate_all_gpkg_sources(sources_input: Union[str, List[Any]]) -> List[Dict[str, Any]]:
+    """
+    Validates a collection of GeoPackage sources (file paths, layer names, or layer objects).
+    """
+    if isinstance(sources_input, str):
+        sources = [s.strip() for s in sources_input.replace("\r", "\n").replace(";", "\n").split("\n") if s.strip()]
+    elif isinstance(sources_input, (list, tuple)):
+        sources = list(sources_input)
+    else:
+        sources = [sources_input]
+
+    reports = []
+    for s in sources:
+        if not s:
+            continue
+        if isinstance(s, str) and os.path.isdir(s):
+            found_files = find_gpkg_files_in_folder(s, recursive=True)
+            for f in found_files:
+                reports.append(validate_gpkg_attribute_table_detailed(f))
+        else:
+            reports.append(validate_gpkg_attribute_table_detailed(s))
+
+    return reports
 
 
 def get_gpkg_polygon_layer_info(fpath: str) -> Tuple[bool, List[str], str]:

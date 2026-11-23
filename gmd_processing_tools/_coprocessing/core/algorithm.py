@@ -732,6 +732,31 @@ class CoProcessingEarfMatch(QgsProcessingAlgorithm):
             lyr_name = layer.name() or f"Layer_{lyr_idx + 1}"
             feedback.pushInfo(f"  Processing layer ({lyr_idx + 1}/{len(gpkg_layers)}): {lyr_name}...")
 
+            # Validate input GeoPackage layer attribute table against required schema
+            try:
+                from ..db.database import validate_gpkg_columns, REQUIRED_GPKG_COLUMNS
+            except Exception:
+                try:
+                    from COProcessing.db.database import validate_gpkg_columns, REQUIRED_GPKG_COLUMNS
+                except Exception:
+                    try:
+                        from database import validate_gpkg_columns, REQUIRED_GPKG_COLUMNS
+                    except Exception:
+                        validate_gpkg_columns = None
+                        REQUIRED_GPKG_COLUMNS = []
+
+            if validate_gpkg_columns is not None:
+                is_valid_cols, missing_cols, _ = validate_gpkg_columns(layer)
+                if not is_valid_cols:
+                    missing_str = ", ".join(missing_cols)
+                    err_msg = (
+                        f"Layer '{lyr_name}' has an invalid attribute table.\n"
+                        f"Missing {len(missing_cols)} required column(s): {missing_str}.\n"
+                        f"Required columns: {', '.join(REQUIRED_GPKG_COLUMNS)}"
+                    )
+                    feedback.reportError(err_msg, fatalError=True)
+                    raise QgsProcessingException(err_msg)
+
             if target_crs is None and layer.crs().isValid():
                 target_crs = layer.crs()
                 base_wkb = layer.wkbType()
