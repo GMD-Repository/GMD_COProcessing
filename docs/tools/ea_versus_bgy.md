@@ -26,8 +26,8 @@ Requires `geopandas`, `pandas`, `pyogrio` and `shapely` in the QGIS Python.
    on it (right-click › Filter).
 2. Open **EA vs Barangay Check** and choose the **Check Mode**.
 3. Tick the layers to check and (optionally, except for EA vs BGY) the reference layers. **Select All**
-   ticks every layer of the list's kind; **Clear** unticks the list. Set **Ignore slivers below**
-   (default 5 m²).
+   ticks every layer of the list's kind; **Clear** unticks the list. Slivers below 0.1 m² are automatically
+   filtered out.
 4. Press **Scan**. Progress, warnings and the summary appear in the Log.
 5. The **Discrepancies** list shows every issue, largest first. Click a row to flash it on the map,
    double-click to zoom. The zoom blinks a **dotted outline with a circle marker** on the discrepancy
@@ -114,7 +114,7 @@ flowchart LR
    - **Overlap:** the shared area of two features, cut from the larger one.
    - **Gap:** land enclosed by the features but in none, added to the feature with the longest border along
      it.
-4. **Filter.** Pieces smaller than *Ignore slivers below* are dropped, and the rest are sorted by area.
+4. **Filter.** Pieces smaller than 0.1 m² (slivers) are dropped, and the rest are sorted by area.
 5. **Snap.** For each selected row the fix feature's new geometry is built:
    - a cut (difference) or an add (union);
    - then holes and specks below the sliver size are removed.
@@ -163,6 +163,26 @@ The reference layers are never edited. No layer is added to the project; each sc
 Barangay layers: `geocode`/`bgy_geocode`, `region`, `province`, `city_mun`, `barangay`.
 EA layers: `bgy_geocode`/`BGY_GEO`, `ea_geocode`/`geocode`, `name`/`ean`, plus the admin fields.
 A barangay is the first 8 digits of the 14-digit geocode.
+
+---
+
+## Duplicate Geometry Fixer Tab
+
+The dialog includes a dedicated **Duplicate Geometry Fixer** tab to scan and fix polygon layers containing duplicate geometries:
+
+- **Duplicate parts inside a MultiPolygon:** When an individual feature contains repeated, identical polygon rings (commonly flagged as *"duplicate geometry"* in QGIS Geometry Checker). Deduplication preserves the feature attributes while retaining only one instance of each distinct part.
+- **Duplicate features across the layer:** When two or more features in the same layer have identical geometries. The tool flags the duplicate feature and allows deleting it.
+
+### How to use:
+1. Switch to the **Duplicate Geometry Fixer** tab.
+2. Tick the polygon layer(s) to scan in the left panel (use **Select All** or **Clear** as needed).
+3. Click **Scan**.
+4. The table lists every detected feature with its issue type and details:
+   - Double-click any row to automatically zoom and flash that feature on the map canvas.
+5. Select rows and click **Fix Selected**, or click **Fix All**.
+6. The layers are put into edit mode with changes recorded in the undo stack (**Edit › Undo**). Inspect on the map, then use **Save Layer Edits** to save.
+
+---
 
 ## Troubleshooting
 
