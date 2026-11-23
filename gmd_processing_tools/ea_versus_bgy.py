@@ -52,7 +52,10 @@ Each scan also removes any "Discrepancies ..." scratch layers left in the projec
 Usage:
   1. Load the layers into the project. To check only part of a layer, set a filter on it (right-click > Filter).
   2. GMD CO Processing > EA Tools > EA vs Barangay Check. This opens the "EA vs Barangay Check" window
-     (same layout as the MBI EA Selector, plus a Help and Information tab).
+     with tabs:
+     - EA vs Barangay Check: boundary comparisons and snapping (slivers < 0.1 sqm automatically ignored).
+     - Duplicate Geometry Fixer: scan and fix duplicate geometry parts inside features or duplicate features.
+     - Help and Information: quick reference and documentation.
   3. Choose the Check Mode, tick the layers to check and (optionally, except for EA vs BGY) the reference
      layers, or press Select All, then press Scan. Progress, warnings and the summary appear in the Log.
   4. The Discrepancies list shows every issue: click a row to flash it on the map, double-click to zoom to it.
@@ -82,7 +85,7 @@ from shapely.geometry import MultiPolygon
 warnings.filterwarnings("ignore")
 
 # ================= CONFIG =================
-MIN_AREA_SQM = 5.0  # default for the dialog: differences smaller than this are slivers and ignored
+MIN_AREA_SQM = 0.1  # fixed: differences smaller than this are slivers and ignored (0.1 sqm)
 TOUCH_TOL_M = 1.0   # a gap within this distance of an EA counts as bordering that EA
 MIN_OWNER_SHARE = 0.3  # a gap is added to one EA only if that EA has at least this share of its EA border
 GRID_DEG = 1e-9     # fallback precision grid (~0.1 mm) when an exact snap gives an invalid geometry
@@ -389,8 +392,14 @@ def uncovered_land(inside, bgy, min_area):
     scope = bgy[bgy["key"].isin(inside["key"])]
     cover = inside[["key", "geometry"]].dissolve(by="key").geometry
     cover = gpd.GeoSeries(cover.reindex(scope["key"]).values, index=scope.index, crs=DATA_CRS)
+    # Use grid_size so both the gap polygon and the snap union use the same precision grid.
+    # Without it, floating-point rounding can make bgy.difference(cover) return a polygon that
+    # is already a subset of cover, so union(EA, gap) leaves the EA area unchanged and the
+    # same gap is detected again after every snap.
+    diffs = [shapely.difference(b, c, grid_size=GRID_DEG) if c is not None else b
+             for b, c in zip(scope.geometry.values, cover.values)]
     return explode_pieces(gpd.GeoDataFrame(
-        {"key": scope["key"].values}, geometry=scope.geometry.difference(cover).values, crs=DATA_CRS), min_area)
+        {"key": scope["key"].values}, geometry=diffs, crs=DATA_CRS), min_area)
 
 
 def link_gaps_to_eas(gap, inside):
@@ -447,8 +456,11 @@ def find_discrepancies(ea, bgy, min_area, mode="ea_bgy"):
 
     # ===== OUTSIDE: parts of each target feature beyond its reference =====
     own_bgy = gpd.GeoSeries(bgy_by_key.geometry.reindex(inside["key"]).values, index=inside.index, crs=DATA_CRS)
+    # Use grid_size for the same precision consistency as uncovered_land (see note there).
+    outside_geoms = [shapely.difference(a, b, grid_size=GRID_DEG) if b is not None else a
+                     for a, b in zip(inside.geometry.values, own_bgy.values)]
     outside = explode_pieces(gpd.GeoDataFrame(
-        {"ea_idx": inside.index}, geometry=inside.geometry.difference(own_bgy).values, crs=DATA_CRS), min_area)
+        {"ea_idx": inside.index}, geometry=outside_geoms, crs=DATA_CRS), min_area)
 
     into = pd.Series("", index=outside.index, dtype=object)
     if len(outside):
@@ -1253,7 +1265,7 @@ LEFT_WIDTH = 315
 # Map highlight on double-click / Zoom to Selected: dotted outline + circle on the discrepancy (by what a
 # snap does) and a dotted green outline of the Fix feature as it will be after Snap Selected.
 HIGHLIGHT_COLOURS = {"cut": "#ff6d00", "add": "#d50000", "none": "#616161", "after": "#00c853"}
-BLINKS = 12          # on/off steps of 300 ms, then the outlines stay drawn
+BLINKS = 6           # on/off steps of 300 ms, then the outlines stay drawn
 MAX_PREVIEWS = 50    # most "after snap" outlines drawn at once
 MIN_ZOOM_DEG = 0.0005  # ~55 m: zooming to a tiny piece (e.g. 1 sqm) still shows its surroundings
 
@@ -1345,6 +1357,44 @@ def _help_table(rows):
     return f'<table cellspacing="0" cellpadding="4" style="border-collapse:collapse; width:100%;">{body}</table>'
 
 
+DUPGEOM_HELP_HTML = """
+<div style="font-family:'Segoe UI',Arial,sans-serif; color:#1f2937; font-size:12px; line-height:1.5;">
+  <div style="border-bottom:2px solid #374151; padding-bottom:8px; margin-bottom:14px;">
+    <h2 style="margin:0 0 4px 0; color:#111827; font-size:17px;">Duplicate Geometry Fixer</h2>
+    <div style="color:#4b5563;">Scan one or more polygon layers for duplicate geometry parts and remove them</div>
+  </div>
+
+  <h3 style="color:#111827; margin:12px 0 4px 0;">What it fixes</h3>
+  <p style="margin:0 0 8px 0;">
+    A <b>MultiPolygon</b> feature can carry two or more identical polygon rings — the same outline
+    drawn twice and merged into one feature. QGIS Geometry Checker reports these as
+    <i>"duplicate geometry"</i> errors. This tool removes the extra copies so each feature
+    keeps only one instance of each distinct ring.
+  </p>
+
+  <h3 style="color:#111827; margin:12px 0 4px 0;">Quick Start</h3>
+  <ol style="margin-top:0;">
+    <li>Tick one or more polygon layers in the list on the left.</li>
+    <li>Click <b>Scan</b> to find features with duplicate parts. The table lists every affected feature
+        with a count of parts before and after deduplication.</li>
+    <li>Review the list. Click a row to flash the feature on the map; double-click to zoom to it.</li>
+    <li>Click <b>Fix All</b> to remove the duplicate parts from every listed feature, or select rows
+        and click <b>Fix Selected</b> to fix only those.</li>
+    <li>The layers are left in <b>edit mode</b>. Save with <b>Save Layer Edits</b> or
+        <b>Layer &gt; Current Edits &gt; Save for All Layers</b>.</li>
+  </ol>
+
+  <h3 style="color:#111827; margin:12px 0 4px 0;">Notes</h3>
+  <ul style="margin-top:0;">
+    <li>Only <b>exact duplicates</b> (identical WKT) within the same feature are removed. Near-duplicate
+        or overlapping-but-different parts are not touched.</li>
+    <li>Single-part Polygon features are always skipped (they cannot have duplicate parts).</li>
+    <li>The fix writes only geometry, never attributes.</li>
+    <li>Each fix is one undoable edit step per layer (<b>Edit &gt; Undo</b>).</li>
+  </ul>
+</div>
+"""
+
 HELP_HTML = f"""
 <div style="font-family:'Segoe UI',Arial,sans-serif; color:#1f2937; font-size:12px; line-height:1.5;">
   <div style="border-bottom:2px solid #374151; padding-bottom:8px; margin-bottom:14px;">
@@ -1387,8 +1437,7 @@ HELP_HTML = f"""
                    "<b>Without a reference</b> (leave it empty): the EAs are checked against each other for "
                    "overlaps and gaps."),
   ])}
-  <p style="margin:6px 0 0 0;"><b>Ignore slivers below</b>: differences smaller than this area (sqm) are treated
-     as slivers and not listed.</p>
+  <p style="margin:6px 0 0 0;">Differences smaller than 0.1 sqm are treated as slivers and ignored.</p>
 
   <h3 style="color:#111827; margin:12px 0 4px 0;">Ticking layers</h3>
   <ul style="margin-top:0;">
@@ -1734,6 +1783,7 @@ def make_dialog_class():
 
             self.tabs = QtWidgets.QTabWidget()
             self.tabs.addTab(self._build_main_tab(), "EA vs Barangay Check")
+            self.tabs.addTab(self._build_dupgeom_tab(), "Duplicate Geometry Fixer")
             self.tabs.addTab(self._build_help_tab(), "Help and Information")
             root.addWidget(self.tabs, 1)
 
@@ -1802,19 +1852,6 @@ def make_dialog_class():
             self.ref_hint = self._hint()
             lay.addWidget(self.ref_hint)
             ll.addWidget(self.ref_box, 1)
-
-            box, lay = group("Settings")
-            srow = QtWidgets.QHBoxLayout()
-            srow.addWidget(QtWidgets.QLabel("Ignore slivers below:"))
-            self.min_area = QtWidgets.QDoubleSpinBox()
-            self.min_area.setRange(0, 1e7)
-            self.min_area.setDecimals(2)
-            self.min_area.setValue(MIN_AREA_SQM)
-            self.min_area.setSuffix(" sqm")
-            self.min_area.setToolTip("Differences smaller than this area are treated as slivers and not listed.")
-            srow.addWidget(self.min_area, 1)
-            lay.addLayout(srow)
-            ll.addWidget(box)
 
             box, lay = group("Run Check")
             self.scan_button = button("Scan", 32, "/mActionStart.svg")
@@ -1945,6 +1982,508 @@ def make_dialog_class():
             root.addWidget(right, 1)
             return tab
 
+        def _build_dupgeom_tab(self):
+            """Build the Duplicate Geometry Fixer tab."""
+            tab = QtWidgets.QWidget()
+            root = QtWidgets.QHBoxLayout(tab)
+            root.setContentsMargins(6, 6, 6, 6)
+            root.setSpacing(8)
+
+            # ── LEFT column: layer list + controls ──────────────────────────────
+            left = QtWidgets.QWidget()
+            left.setFixedWidth(LEFT_WIDTH)
+            ll = QtWidgets.QVBoxLayout(left)
+            ll.setContentsMargins(0, 0, 0, 0)
+            ll.setSpacing(6)
+
+            # Layer list ----------------------------------------------------------
+            lbox, llay = group("Polygon Layers to Scan")
+            self.dupgeom_layer_list = CompactList()
+            self.dupgeom_layer_list.setSelectionMode(
+                QtWidgets.QAbstractItemView.NoSelection)
+            self.dupgeom_layer_list.setAlternatingRowColors(True)
+            self.dupgeom_layer_list.setItemDelegate(
+                LayerCheckDelegate(self.dupgeom_layer_list))
+            self.dupgeom_layer_list.setMinimumHeight(200)
+            self.dupgeom_layer_list.setToolTip(
+                "Tick the layers to scan for duplicate geometries or duplicate parts.")
+            self.dupgeom_layer_list.itemChanged.connect(
+                lambda _item: self._dupgeom_update_buttons())
+            self.dupgeom_layer_list.itemClicked.connect(
+                lambda _item: self._dupgeom_update_buttons())
+            lbtn_row = QtWidgets.QHBoxLayout()
+            self.dupgeom_all_btn = button("Select All", 24)
+            self.dupgeom_all_btn.clicked.connect(
+                lambda: self._dupgeom_tick_all(True))
+            self.dupgeom_none_btn = button("Clear", 24)
+            self.dupgeom_none_btn.clicked.connect(
+                lambda: self._dupgeom_tick_all(False))
+            lbtn_row.addWidget(self.dupgeom_all_btn)
+            lbtn_row.addWidget(self.dupgeom_none_btn)
+            llay.addLayout(lbtn_row)
+            llay.addWidget(self.dupgeom_layer_list, 1)
+            ll.addWidget(lbox, 1)
+
+            # Run controls --------------------------------------------------------
+            rbox, rlay = group("Run")
+            self.dupgeom_scan_btn = button("Scan", 32, "/mActionStart.svg")
+            self.dupgeom_scan_btn.setToolTip(
+                "Scan the ticked layers for features with duplicate geometry parts or duplicate features.\n"
+                "Nothing is changed until you press Fix.")
+            self.dupgeom_scan_btn.clicked.connect(self._dupgeom_scan)
+            rlay.addWidget(self.dupgeom_scan_btn)
+
+            fix_row = QtWidgets.QHBoxLayout()
+            self.dupgeom_fix_sel_btn = button("Fix Selected", 32,
+                                               "/mIconSnapping.svg")
+            self.dupgeom_fix_sel_btn.setToolTip(
+                "Fix duplicate geometries for the selected rows only.")
+            self.dupgeom_fix_sel_btn.clicked.connect(
+                lambda: self._dupgeom_fix(selected_only=True))
+            self.dupgeom_fix_all_btn = button("Fix All", 32,
+                                               "/mIconSnapping.svg")
+            self.dupgeom_fix_all_btn.setToolTip(
+                "Fix duplicate geometries for every listed row.")
+            self.dupgeom_fix_all_btn.clicked.connect(
+                lambda: self._dupgeom_fix(selected_only=False))
+            fix_row.addWidget(self.dupgeom_fix_sel_btn, 1)
+            fix_row.addWidget(self.dupgeom_fix_all_btn, 1)
+            rlay.addLayout(fix_row)
+
+            self.dupgeom_run_hint = self._hint(
+                "Tick at least one layer, then click Scan.")
+            rlay.addWidget(self.dupgeom_run_hint)
+            self.dupgeom_progress = QtWidgets.QProgressBar()
+            self.dupgeom_progress.setTextVisible(False)
+            self.dupgeom_progress.setRange(0, 1)
+            self.dupgeom_progress.setValue(0)
+            self.dupgeom_progress.setFixedHeight(18)
+            rlay.addWidget(self.dupgeom_progress)
+            ll.addWidget(rbox)
+
+            left_scroll = QtWidgets.QScrollArea()
+            left_scroll.setWidget(left)
+            left_scroll.setWidgetResizable(True)
+            left_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+            left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            left_scroll.setFixedWidth(LEFT_WIDTH + 18)
+
+            # ── RIGHT column: results table + log ───────────────────────────────
+            right = QtWidgets.QWidget()
+            rl = QtWidgets.QVBoxLayout(right)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(6)
+
+            self.dupgeom_summary = QtWidgets.QLabel(
+                "No scan yet. Tick layers on the left and click Scan.")
+            self.dupgeom_summary.setWordWrap(True)
+            rl.addWidget(self.dupgeom_summary)
+
+            # Results table -------------------------------------------------------
+            DG_COLS = ["Layer", "Feature ID", "Issue", "Details", "Status"]
+            self.dupgeom_table = QtWidgets.QTableWidget(0, len(DG_COLS))
+            self.dupgeom_table.setHorizontalHeaderLabels(DG_COLS)
+            self.dupgeom_table.setEditTriggers(
+                QtWidgets.QAbstractItemView.NoEditTriggers)
+            self.dupgeom_table.setSelectionBehavior(
+                QtWidgets.QAbstractItemView.SelectRows)
+            self.dupgeom_table.setSelectionMode(
+                QtWidgets.QAbstractItemView.ExtendedSelection)
+            self.dupgeom_table.setAlternatingRowColors(True)
+            self.dupgeom_table.setSortingEnabled(True)
+            self.dupgeom_table.verticalHeader().setVisible(False)
+            self.dupgeom_table.horizontalHeader().setStretchLastSection(True)
+            self.dupgeom_table.itemSelectionChanged.connect(
+                self._dupgeom_on_select)
+            self.dupgeom_table.cellDoubleClicked.connect(
+                self._dupgeom_zoom_row)
+            rl.addWidget(self.dupgeom_table, 1)
+
+            # Log -----------------------------------------------------------------
+            rl.addWidget(QtWidgets.QLabel("Log"))
+            self.dupgeom_log = QtWidgets.QPlainTextEdit()
+            self.dupgeom_log.setReadOnly(True)
+            self.dupgeom_log.setFixedHeight(150)
+            rl.addWidget(self.dupgeom_log)
+
+            root.addWidget(left_scroll)
+            root.addWidget(right, 1)
+
+            # Internal state: list of scan rows as dicts
+            self._dupgeom_rows = []          # {layer_id, fid, layer_name, before, after, geom_new}
+            self._dupgeom_fix_applied = set()  # row indices already fixed
+
+            # Wire layer list refresh to project changes
+            QgsProject.instance().layersAdded.connect(
+                self._dupgeom_refresh_layers)
+            QgsProject.instance().layersRemoved.connect(
+                self._dupgeom_refresh_layers)
+            self._dupgeom_refresh_layers()
+            self._dupgeom_update_buttons()
+
+            return tab
+
+        # ──────────────── Duplicate Geometry Fixer helpers ────────────────────
+
+        _DG_LAYER_ID = Qt.UserRole       # on a list row: layer id
+        _DG_LAYER_ROW = Qt.UserRole      # on a table cell: row index in _dupgeom_rows
+        _DG_STATUS_PENDING = "Pending"
+        _DG_STATUS_FIXED   = "Fixed"
+        _DG_STATUS_FAILED  = "Failed"
+
+        def _dupgeom_refresh_layers(self, *_):
+            """Rebuild the layer checklist from the current project."""
+            from qgis.core import QgsVectorLayer, QgsWkbTypes
+            prj = QgsProject.instance()
+            checked = {
+                self.dupgeom_layer_list.item(i).data(self._DG_LAYER_ID)
+                for i in range(self.dupgeom_layer_list.count())
+                if self.dupgeom_layer_list.item(i).checkState() == Qt.Checked
+            }
+            self.dupgeom_layer_list.blockSignals(True)
+            self.dupgeom_layer_list.clear()
+            polygon_layers = [
+                lyr for lyr in prj.mapLayers().values()
+                if isinstance(lyr, QgsVectorLayer) and lyr.geometryType() == QgsWkbTypes.PolygonGeometry
+            ]
+            for lyr in polygon_layers:
+                item = QtWidgets.QListWidgetItem(lyr.name())
+                item.setData(self._DG_LAYER_ID, lyr.id())
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                # Auto-check if previously checked, or if there's only 1 layer
+                is_checked = (lyr.id() in checked) or (len(polygon_layers) == 1 and not checked)
+                item.setCheckState(Qt.Checked if is_checked else Qt.Unchecked)
+                self.dupgeom_layer_list.addItem(item)
+            self.dupgeom_layer_list.blockSignals(False)
+            self._dupgeom_update_buttons()
+
+        def _dupgeom_tick_all(self, on):
+            self.dupgeom_layer_list.blockSignals(True)
+            for i in range(self.dupgeom_layer_list.count()):
+                item = self.dupgeom_layer_list.item(i)
+                item.setCheckState(Qt.Checked if on else Qt.Unchecked)
+            self.dupgeom_layer_list.blockSignals(False)
+            self._dupgeom_update_buttons()
+
+        def _dupgeom_checked_layers(self):
+            """Return the ticked QgsVectorLayer objects."""
+            prj = QgsProject.instance()
+            ids = [
+                self.dupgeom_layer_list.item(i).data(self._DG_LAYER_ID)
+                for i in range(self.dupgeom_layer_list.count())
+                if self.dupgeom_layer_list.item(i).checkState() == Qt.Checked
+            ]
+            return [lyr for lid in ids for lyr in [prj.mapLayer(lid)] if lyr]
+
+        def _dupgeom_update_buttons(self):
+            checked_count = sum(
+                1 for i in range(self.dupgeom_layer_list.count())
+                if self.dupgeom_layer_list.item(i).checkState() == Qt.Checked
+            )
+            has_layers = checked_count > 0
+            has_rows = self.dupgeom_table.rowCount() > 0
+            sel_rows = bool(self.dupgeom_table.selectedItems())
+            self.dupgeom_scan_btn.setEnabled(has_layers)
+            self.dupgeom_fix_all_btn.setEnabled(has_rows)
+            self.dupgeom_fix_sel_btn.setEnabled(sel_rows)
+            if not has_layers:
+                self.set_hint(self.dupgeom_run_hint,
+                              "Tick at least one layer, then click Scan.",
+                              "error")
+            else:
+                self.set_hint(self.dupgeom_run_hint,
+                              f"{checked_count} layer(s) ticked. Ready to scan.",
+                              "ok")
+
+        def _dupgeom_log(self, text):
+            from datetime import datetime
+            stamp = datetime.now().strftime("%H:%M:%S")
+            self.dupgeom_log.appendPlainText(f"[{stamp}] {text}")
+            QgsApplication.processEvents()
+
+        def _dupgeom_scan(self):
+            """Scan ticked layers; populate the results table with duplicate parts and duplicate features."""
+            from qgis.core import QgsApplication, QgsGeometry
+            layers = self._dupgeom_checked_layers()
+            if not layers:
+                self._dupgeom_log("No layers ticked.")
+                return
+
+            self.dupgeom_table.setSortingEnabled(False)
+            self.dupgeom_table.setRowCount(0)
+            self._dupgeom_rows = []
+            self._dupgeom_fix_applied = set()
+
+            self.dupgeom_progress.setRange(0, 0)
+            self.dupgeom_scan_btn.setEnabled(False)
+            self.dupgeom_fix_all_btn.setEnabled(False)
+            self.dupgeom_fix_sel_btn.setEnabled(False)
+            self._dupgeom_log("Scan started…")
+
+            total_found = 0
+            for lyr in layers:
+                lname = lyr.name()
+                self._dupgeom_log(f"  Scanning '{lname}'…")
+                count = lyr.featureCount()
+                self.dupgeom_progress.setRange(0, max(count, 1))
+                self.dupgeom_progress.setValue(0)
+                found = 0
+                seen_geoms = {}  # wkb_2d_bytes -> first_fid
+
+                for i, feat in enumerate(lyr.getFeatures()):
+                    self.dupgeom_progress.setValue(i + 1)
+                    if i % 200 == 0:
+                        QgsApplication.processEvents()
+
+                    geom = feat.geometry()
+                    if not geom or geom.isNull() or geom.isEmpty():
+                        continue
+
+                    # 1. Check duplicate parts inside multi-part feature
+                    has_dup_parts = False
+                    new_geom = None
+                    n_parts_before = 0
+                    n_parts_after = 0
+
+                    if geom.isMultipart():
+                        try:
+                            sg = shapely.from_wkb(bytes(geom.asWkb()))
+                            if hasattr(sg, "geoms") and len(sg.geoms) > 1:
+                                n_parts_before = len(sg.geoms)
+                                seen_pwkb = set()
+                                unique_geoms = []
+                                for p in sg.geoms:
+                                    pwkb = shapely.to_wkb(shapely.force_2d(p))
+                                    if pwkb not in seen_pwkb:
+                                        seen_pwkb.add(pwkb)
+                                        unique_geoms.append(p)
+                                n_parts_after = len(unique_geoms)
+                                if n_parts_after < n_parts_before:
+                                    has_dup_parts = True
+                                    clean_sg = unique_geoms[0] if len(unique_geoms) == 1 else shapely.MultiPolygon(unique_geoms)
+                                    new_geom = QgsGeometry()
+                                    new_geom.fromWkb(shapely.to_wkb(shapely.force_2d(clean_sg)))
+                        except Exception:
+                            pass
+
+                    if has_dup_parts and new_geom is not None:
+                        row_idx = len(self._dupgeom_rows)
+                        self._dupgeom_rows.append({
+                            "type":       "part",
+                            "layer_id":   lyr.id(),
+                            "layer_name": lname,
+                            "fid":        feat.id(),
+                            "geom_new":   new_geom,
+                            "extent":     geom.boundingBox(),
+                        })
+                        r = self.dupgeom_table.rowCount()
+                        self.dupgeom_table.insertRow(r)
+                        cells = [
+                            lname,
+                            str(feat.id()),
+                            f"Duplicate part(s) ({n_parts_before} → {n_parts_after})",
+                            f"{n_parts_before - n_parts_after} identical part(s) removed",
+                            self._DG_STATUS_PENDING,
+                        ]
+                        for c, val in enumerate(cells):
+                            item = QtWidgets.QTableWidgetItem(val)
+                            item.setData(self._DG_LAYER_ROW, row_idx)
+                            self.dupgeom_table.setItem(r, c, item)
+                        self._dupgeom_paint_status(r, self._DG_STATUS_PENDING)
+                        found += 1
+
+                    # 2. Check if this feature is a duplicate of another feature
+                    effective_geom = new_geom if (has_dup_parts and new_geom) else geom
+                    try:
+                        feat_wkb = bytes(effective_geom.asWkb())
+                        if feat_wkb in seen_geoms:
+                            first_fid = seen_geoms[feat_wkb]
+                            row_idx = len(self._dupgeom_rows)
+                            self._dupgeom_rows.append({
+                                "type":       "feature",
+                                "layer_id":   lyr.id(),
+                                "layer_name": lname,
+                                "fid":        feat.id(),
+                                "geom_new":   None,
+                                "extent":     geom.boundingBox(),
+                            })
+                            r = self.dupgeom_table.rowCount()
+                            self.dupgeom_table.insertRow(r)
+                            cells = [
+                                lname,
+                                str(feat.id()),
+                                "Duplicate feature",
+                                f"Identical geometry to FID {first_fid}",
+                                self._DG_STATUS_PENDING,
+                            ]
+                            for c, val in enumerate(cells):
+                                item = QtWidgets.QTableWidgetItem(val)
+                                item.setData(self._DG_LAYER_ROW, row_idx)
+                                self.dupgeom_table.setItem(r, c, item)
+                            self._dupgeom_paint_status(r, self._DG_STATUS_PENDING)
+                            found += 1
+                        else:
+                            seen_geoms[feat_wkb] = feat.id()
+                    except Exception:
+                        pass
+
+                total_found += found
+                self._dupgeom_log(
+                    f"  '{lname}': {found} duplicate issue(s) found.")
+
+            self.dupgeom_progress.setRange(0, 1)
+            self.dupgeom_progress.setValue(1)
+            self.dupgeom_table.setSortingEnabled(True)
+            self.dupgeom_table.resizeColumnsToContents()
+
+            if total_found:
+                summary = (f"{total_found} duplicate issue(s) found "
+                           f"across {len(layers)} layer(s). Select rows and click Fix Selected, "
+                           "or click Fix All.")
+                self.set_hint(self.dupgeom_run_hint,
+                              f"Found {total_found} issue(s). Click Fix All or Fix Selected.",
+                              "error")
+            else:
+                summary = "No duplicate geometry parts or duplicate features found."
+                self.set_hint(self.dupgeom_run_hint,
+                              "No duplicates found.", "ok")
+            self.dupgeom_summary.setText(summary)
+            self._dupgeom_log(f"Scan complete: {summary}")
+            self._dupgeom_update_buttons()
+            self.dupgeom_scan_btn.setEnabled(True)
+
+        def _dupgeom_paint_status(self, row, status):
+            STATUS_COL = 4
+            item = self.dupgeom_table.item(row, STATUS_COL)
+            if item is None:
+                return
+            colours = {
+                self._DG_STATUS_PENDING: None,
+                self._DG_STATUS_FIXED:   "#2e7d32",
+                self._DG_STATUS_FAILED:  "#c62828",
+            }
+            col = colours.get(status)
+            if col:
+                item.setForeground(QBrush(QColor(col)))
+            item.setText(status)
+
+        def _dupgeom_row_index(self, table_row):
+            """Return the _dupgeom_rows index stored in the first cell of a table row."""
+            item = self.dupgeom_table.item(table_row, 0)
+            return item.data(self._DG_LAYER_ROW) if item else None
+
+        def _dupgeom_on_select(self):
+            self.dupgeom_fix_sel_btn.setEnabled(
+                bool(self.dupgeom_table.selectedItems()))
+
+        def _dupgeom_zoom_row(self, table_row, _col=None):
+            """Flash + zoom the map to the feature in a double-clicked row."""
+            if self.iface is None:
+                return
+            row_idx = self._dupgeom_row_index(table_row)
+            if row_idx is None:
+                return
+            info = self._dupgeom_rows[row_idx]
+            lyr = QgsProject.instance().mapLayer(info["layer_id"])
+            if lyr is None:
+                return
+            canvas = self.iface.mapCanvas()
+            extent = info["extent"]
+            if extent is not None and not extent.isEmpty():
+                try:
+                    from qgis.core import QgsCoordinateTransform
+                    to_canvas = QgsCoordinateTransform(
+                        lyr.crs(), canvas.mapSettings().destinationCrs(), QgsProject.instance())
+                    extent = to_canvas.transformBoundingBox(extent)
+                    extent.scale(1.5)
+                    canvas.setExtent(extent)
+                    canvas.refresh()
+                except Exception:
+                    canvas.setExtent(info["extent"])
+                    canvas.refresh()
+            try:
+                canvas.flashFeatureIds(lyr, [info["fid"]])
+            except Exception:
+                pass
+
+        def _dupgeom_fix(self, selected_only=False):
+            """Apply fixes to listed (or selected) rows."""
+            from qgis.core import QgsApplication
+
+            if selected_only:
+                table_rows = sorted({
+                    i.row() for i in self.dupgeom_table.selectedItems()
+                })
+            else:
+                table_rows = list(range(self.dupgeom_table.rowCount()))
+
+            by_layer = {}
+            for tr in table_rows:
+                ri = self._dupgeom_row_index(tr)
+                if ri is None or ri in self._dupgeom_fix_applied:
+                    continue
+                info = self._dupgeom_rows[ri]
+                by_layer.setdefault(info["layer_id"], []).append((tr, ri))
+
+            if not by_layer:
+                self._dupgeom_log("Nothing to fix (all selected rows already fixed or none selected).")
+                return
+
+            self.dupgeom_progress.setRange(0, len(by_layer))
+            self.dupgeom_progress.setValue(0)
+            fixed_total = 0
+
+            for li, (layer_id, pairs) in enumerate(by_layer.items()):
+                lyr = QgsProject.instance().mapLayer(layer_id)
+                if lyr is None:
+                    for tr, ri in pairs:
+                        self._dupgeom_paint_status(tr, self._DG_STATUS_FAILED)
+                    self._dupgeom_log(
+                        f"Layer '{layer_id}' no longer in project — skipped.")
+                    continue
+
+                if not lyr.isEditable() and not lyr.startEditing():
+                    for tr, ri in pairs:
+                        self._dupgeom_paint_status(tr, self._DG_STATUS_FAILED)
+                    self._dupgeom_log(
+                        f"'{lyr.name()}' cannot be put into edit mode — skipped.")
+                    continue
+
+                lyr.beginEditCommand(
+                    f"Fix duplicate geometries ({len(pairs)} issue(s))")
+                ok, fail = 0, 0
+                for tr, ri in pairs:
+                    info = self._dupgeom_rows[ri]
+                    success = False
+                    if info["type"] == "part":
+                        success = lyr.changeGeometry(info["fid"], info["geom_new"])
+                    elif info["type"] == "feature":
+                        success = lyr.deleteFeature(info["fid"])
+
+                    if success:
+                        self._dupgeom_fix_applied.add(ri)
+                        self._dupgeom_paint_status(tr, self._DG_STATUS_FIXED)
+                        ok += 1
+                    else:
+                        self._dupgeom_paint_status(tr, self._DG_STATUS_FAILED)
+                        fail += 1
+                lyr.endEditCommand()
+                self._dupgeom_log(
+                    f"'{lyr.name()}': {ok} fixed, {fail} failed.")
+                fixed_total += ok
+                self.dupgeom_progress.setValue(li + 1)
+                QgsApplication.processEvents()
+
+            self.dupgeom_progress.setRange(0, 1)
+            self.dupgeom_progress.setValue(1)
+            self._dupgeom_log(
+                f"Done. {fixed_total} issue(s) fixed (layers left in edit mode; save to keep).")
+            if fixed_total:
+                self.set_hint(self.dupgeom_run_hint,
+                              f"{fixed_total} issue(s) fixed. Save layer edits to keep.",
+                              "ok")
+            self._dupgeom_update_buttons()
+
         def _build_help_tab(self):
             tab = QtWidgets.QWidget()
             lay = QtWidgets.QVBoxLayout(tab)
@@ -2045,6 +2584,12 @@ def make_dialog_class():
             self.target.list.setStyleSheet(t["list"])
             self.ref.list.setStyleSheet(t["list"])
             self.legend.setStyleSheet(f"font-size:11px; color:{t['hint']}; padding:2px 0;")
+            # Duplicate Geometry Fixer tab
+            self.dupgeom_log.setStyleSheet(t["log"])
+            self.dupgeom_table.setStyleSheet(t["table"])
+            self.dupgeom_layer_list.setStyleSheet(t["list"])
+            self.dupgeom_summary.setStyleSheet(
+                f"font-size:13px; font-weight:600; color:{t['summary']};")
             html = HELP_HTML
             if self.is_dark:
                 for a, b in HELP_DARK_SWAPS:
@@ -2068,6 +2613,10 @@ def make_dialog_class():
             for sig in (prj.layersAdded, prj.layersRemoved):
                 try:
                     sig.disconnect(self.on_layers_added)
+                except (TypeError, RuntimeError):
+                    pass
+                try:
+                    sig.disconnect(self._dupgeom_refresh_layers)
                 except (TypeError, RuntimeError):
                     pass
 
@@ -2173,7 +2722,7 @@ def make_dialog_class():
         # ----------------------------------------------------------- busy
         def set_busy(self, busy):
             self.running = busy
-            for w in [self.target, self.ref, self.min_area, self.table, self.filter, self.search_edit,
+            for w in [self.target, self.ref, self.table, self.filter, self.search_edit,
                       self.clear_btn, *self.mode_buttons.values()]:
                 w.setEnabled(not busy)
             self.progress.setRange(0, 0 if busy else 1)
@@ -2239,15 +2788,21 @@ def make_dialog_class():
             self.log("=" * 50)
             against = f"{len(refs)} reference layer(s)" if refs else "each other (overlaps and gaps)"
             self.log(f"Scan {m['label']}: {len(targets)} layer(s) vs {against}, "
-                     f"slivers < {self.min_area.value():g} sqm")
+                     f"slivers < {MIN_AREA_SQM:g} sqm")
             self.log("  Checked: " + ", ".join(lyr.name() for lyr in targets))
             if refs:
                 self.log("  Reference: " + ", ".join(lyr.name() for lyr in refs))
+            edited = [lyr for lyr in targets + refs if lyr.isEditable()]
+            if edited:
+                self.log("  Note: " + ", ".join(lyr.name() for lyr in edited) +
+                         " ha" + ("ve" if len(edited) > 1 else "s") +
+                         " unsaved edits — the scan reads those edits, so any discrepancy"
+                         " found here is genuine (not a re-read of the pre-snap geometry).")
             self.set_busy(True)
             stream = _LogStream(self.log)
             try:
                 with redirect_stdout(stream), redirect_stderr(stream):
-                    scan = run_check(refs, targets, self.min_area.value(), mode=mode)
+                    scan = run_check(refs, targets, MIN_AREA_SQM, mode=mode)
                 stream.flush()
             except Exception as e:  # noqa: BLE001 - report every failure in the log
                 stream.flush()
