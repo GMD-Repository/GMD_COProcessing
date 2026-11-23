@@ -9354,12 +9354,13 @@ class COProcessingDialog(QDialog):
 
         self.kpi_mon_total = self._create_kpi_card("Total Cities/Municipalities", "1,655", "#0284c7")
         self.kpi_mon_total.setToolTip("Fixed Benchmark: 1,655 Official Philippine Cities & Municipalities (POPCEN)")
-        self.kpi_mon_complete = self._create_kpi_card("Fully Complete (3/3)", "0", "#16a34a")
+        self.kpi_mon_complete = self._create_kpi_card("Fully Complete (4/4)", "0", "#16a34a")
         self.kpi_mon_percent = self._create_kpi_card("Percent Completed", "0.0%", "#0d9488")
-        self.kpi_mon_percent.setToolTip("Percent Completed: Total Fully Complete (3/3) / 1,655 Cities/Municipalities")
+        self.kpi_mon_percent.setToolTip("Percent Completed: Total Fully Complete (4/4) / 1,655 Cities/Municipalities")
         self.kpi_mon_gpkg = self._create_kpi_card("Output GPKG Ready", "0", "#0ea5e9")
         self.kpi_mon_final_earf = self._create_kpi_card("Final EARF Ready", "0", "#059669")
         self.kpi_mon_mis_earf = self._create_kpi_card("MIS EARF Ready", "0", "#7c3aed")
+        self.kpi_mon_pcd_earf = self._create_kpi_card("PCD EARF Ready", "0", "#d97706")
         self.kpi_mon_incomplete = self._create_kpi_card("Incomplete / Pending", "1,655", "#e11d48")
 
         for k in (
@@ -9369,6 +9370,7 @@ class COProcessingDialog(QDialog):
             self.kpi_mon_gpkg,
             self.kpi_mon_final_earf,
             self.kpi_mon_mis_earf,
+            self.kpi_mon_pcd_earf,
             self.kpi_mon_incomplete,
         ):
             kpi_layout.addWidget(k)
@@ -9411,12 +9413,13 @@ class COProcessingDialog(QDialog):
         self.cmb_mon_status = QComboBox()
         self.cmb_mon_status.addItems([
             "All Statuses",
-            "Complete (3/3)",
-            "Partial (1-2/3)",
-            "Missing All (0/3)",
+            "Complete (4/4)",
+            "Partial (1-3/4)",
+            "Missing All (0/4)",
             "Missing GPKG",
             "Missing Final EARF",
             "Missing MIS EARF",
+            "Missing PCD EARF",
         ])
         self.cmb_mon_status.currentIndexChanged.connect(self._on_mon_filter_changed)
         filter_bar.addWidget(self.cmb_mon_status)
@@ -9466,6 +9469,7 @@ class COProcessingDialog(QDialog):
             "Output GPKG",
             "Final EARF",
             "MIS EARF",
+            "PCD EARF",
             "Last Modified",
             "Subfolder Location",
         ]
@@ -9481,15 +9485,17 @@ class COProcessingDialog(QDialog):
         h.setSectionResizeMode(6, QHeaderView.Interactive)
         h.setSectionResizeMode(7, QHeaderView.Interactive)
         h.setSectionResizeMode(8, QHeaderView.Interactive)
-        h.setSectionResizeMode(9, QHeaderView.Stretch)
+        h.setSectionResizeMode(9, QHeaderView.Interactive)
+        h.setSectionResizeMode(10, QHeaderView.Stretch)
         self.table_monitoring.setColumnWidth(1, 140)
         self.table_monitoring.setColumnWidth(2, 110)
         self.table_monitoring.setColumnWidth(3, 170)
         self.table_monitoring.setColumnWidth(4, 125)
-        self.table_monitoring.setColumnWidth(5, 145)
-        self.table_monitoring.setColumnWidth(6, 145)
-        self.table_monitoring.setColumnWidth(7, 145)
-        self.table_monitoring.setColumnWidth(8, 125)
+        self.table_monitoring.setColumnWidth(5, 140)
+        self.table_monitoring.setColumnWidth(6, 140)
+        self.table_monitoring.setColumnWidth(7, 140)
+        self.table_monitoring.setColumnWidth(8, 140)
+        self.table_monitoring.setColumnWidth(9, 125)
 
         layout.addWidget(self.table_monitoring, 1)
 
@@ -9536,7 +9542,7 @@ class COProcessingDialog(QDialog):
 
         detail_layout.addLayout(det_head)
 
-        # 3 Deliverable Status Detail Cards
+        # 4 Deliverable Status Detail Cards
         cards_layout = QHBoxLayout()
         cards_layout.setSpacing(8)
 
@@ -9605,6 +9611,28 @@ class COProcessingDialog(QDialog):
         cm_layout.addWidget(self.lbl_det_mis_info)
         cm_layout.addWidget(self.btn_mon_open_mis)
         cards_layout.addWidget(self.card_det_mis, 1)
+
+        # PCD EARF Block
+        self.card_det_pcd = QFrame()
+        self.card_det_pcd.setObjectName("kpiCard")
+        cp_layout = QVBoxLayout(self.card_det_pcd)
+        cp_layout.setContentsMargins(8, 6, 8, 6)
+        cp_layout.setSpacing(3)
+        cp_title = QLabel("4. PCD EARF Excel (.xlsx)")
+        cp_title.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        cp_title.setStyleSheet("color: #d97706;")
+        self.lbl_det_pcd_status = QLabel("Status: -")
+        self.lbl_det_pcd_info = QLabel("File: -")
+        self.lbl_det_pcd_info.setWordWrap(True)
+        self.btn_mon_open_pcd = QPushButton("Open PCD EARF")
+        self.btn_mon_open_pcd.setObjectName("secondaryBtn")
+        self.btn_mon_open_pcd.setEnabled(False)
+        self.btn_mon_open_pcd.clicked.connect(self._open_selected_pcd_earf)
+        cp_layout.addWidget(cp_title)
+        cp_layout.addWidget(self.lbl_det_pcd_status)
+        cp_layout.addWidget(self.lbl_det_pcd_info)
+        cp_layout.addWidget(self.btn_mon_open_pcd)
+        cards_layout.addWidget(self.card_det_pcd, 1)
 
         detail_layout.addLayout(cards_layout)
         layout.addWidget(self.mon_detail_frame)
@@ -9801,11 +9829,11 @@ class COProcessingDialog(QDialog):
             # Status filter
             if status_filter and status_filter != "All Statuses":
                 st = r.get("status")
-                if status_filter == "Complete (3/3)" and st != "COMPLETE":
+                if status_filter in ("Complete (4/4)", "Complete (3/3)") and st != "COMPLETE":
                     continue
-                elif status_filter == "Partial (1-2/3)" and st != "PARTIAL":
+                elif status_filter in ("Partial (1-3/4)", "Partial (1-2/3)") and st != "PARTIAL":
                     continue
-                elif status_filter == "Missing All (0/3)" and st != "MISSING":
+                elif status_filter in ("Missing All (0/4)", "Missing All (0/3)") and st != "MISSING":
                     continue
                 elif status_filter == "Missing GPKG" and r["gpkg"]["exists"]:
                     continue
@@ -9813,10 +9841,13 @@ class COProcessingDialog(QDialog):
                     continue
                 elif status_filter == "Missing MIS EARF" and r["mis_earf"]["exists"]:
                     continue
+                elif status_filter == "Missing PCD EARF" and r.get("pcd_earf", {}).get("exists"):
+                    continue
 
             # Search query
             if search_query:
-                haystack = f"{r.get('code', '')} {r.get('pppmm', '')} {r.get('name', '')} {r.get('province', '')} {r.get('region', '')} {r['gpkg']['filename']} {r['final_earf']['filename']} {r['mis_earf']['filename']}".lower()
+                pcd_fn = r.get('pcd_earf', {}).get('filename', '')
+                haystack = f"{r.get('code', '')} {r.get('pppmm', '')} {r.get('name', '')} {r.get('province', '')} {r.get('region', '')} {r['gpkg']['filename']} {r['final_earf']['filename']} {r['mis_earf']['filename']} {pcd_fn}".lower()
                 if search_query not in haystack:
                     continue
 
@@ -9828,7 +9859,7 @@ class COProcessingDialog(QDialog):
         self._fetch_and_render_mon_page()
 
     def _update_monitoring_kpi_cards(self, records):
-        """Updates the 7 KPI cards on the monitoring tab with fixed 1,655 benchmark."""
+        """Updates the KPI cards on the monitoring tab with fixed 1,655 benchmark."""
         FIXED_TOTAL_CITIES_MUN = 1655
         tot = len(records)
         comp = sum(1 for r in records if r.get("status") == "COMPLETE")
@@ -9837,11 +9868,12 @@ class COProcessingDialog(QDialog):
         gpkg_cnt = sum(1 for r in records if r.get("gpkg", {}).get("exists"))
         earf_cnt = sum(1 for r in records if r.get("final_earf", {}).get("exists"))
         mis_cnt = sum(1 for r in records if r.get("mis_earf", {}).get("exists"))
+        pcd_cnt = sum(1 for r in records if r.get("pcd_earf", {}).get("exists"))
 
         # The total count of cities/municipalities is fixed at 1,655 nationwide
         self.kpi_mon_total.val_label.setText("1,655")
 
-        # Percent Completed = Total Fully Complete (3/3) / 1,655 Cities/Municipalities * 100%
+        # Percent Completed = Total Fully Complete (4/4) / 1,655 Cities/Municipalities * 100%
         pct = (comp / FIXED_TOTAL_CITIES_MUN * 100.0)
         self.kpi_mon_percent.val_label.setText(f"{pct:.1f}%")
 
@@ -9849,6 +9881,7 @@ class COProcessingDialog(QDialog):
         self.kpi_mon_gpkg.val_label.setText(f"{gpkg_cnt:,}")
         self.kpi_mon_final_earf.val_label.setText(f"{earf_cnt:,}")
         self.kpi_mon_mis_earf.val_label.setText(f"{mis_cnt:,}")
+        self.kpi_mon_pcd_earf.val_label.setText(f"{pcd_cnt:,}")
 
         # Incomplete / Pending
         incomp = FIXED_TOTAL_CITIES_MUN - comp if (not self.mon_records or tot >= len(self.mon_records)) else (tot - comp)
@@ -9922,7 +9955,7 @@ class COProcessingDialog(QDialog):
 
             # Col 4: Overall Status Badge
             st = r.get("status", "MISSING")
-            ratio = r.get("completion_ratio", "0/3")
+            ratio = r.get("completion_ratio", "0/4")
             status_item = SmartTableWidgetItem(f"{ratio} {st}")
             status_item.setTextAlignment(Qt.AlignCenter)
             status_font = QFont()
@@ -9989,16 +10022,32 @@ class COProcessingDialog(QDialog):
                 mis_item.setToolTip(f"Expected: {r.get('pppmm')}_MIS_{r.get('clean_name')}.xlsx")
             self.table_monitoring.setItem(row_idx, 7, mis_item)
 
-            # Col 8: Last Modified
+            # Col 8: PCD EARF Excel
+            pcd = r.get("pcd_earf", {})
+            if pcd.get("exists"):
+                pcd_item = SmartTableWidgetItem(f"READY ({pcd.get('size_str', '')})")
+                pcd_item.setTextAlignment(Qt.AlignCenter)
+                pcd_item.setForeground(QColor("#b45309"))
+                pcd_item.setBackground(QColor("#fef3c7"))
+                pcd_item.setToolTip(f"File: {pcd.get('filename')}\nPath: {pcd.get('path')}\nSize: {pcd.get('size_str')}\nModified: {pcd.get('mtime_str')}")
+            else:
+                pcd_item = SmartTableWidgetItem("MISSING")
+                pcd_item.setTextAlignment(Qt.AlignCenter)
+                pcd_item.setForeground(QColor("#94a3b8"))
+                pcd_item.setBackground(QColor("#f8fafc"))
+                pcd_item.setToolTip(f"Expected: {r.get('pppmm')}_earf2026_PCD.xlsx")
+            self.table_monitoring.setItem(row_idx, 8, pcd_item)
+
+            # Col 9: Last Modified
             mod_str = str(r.get("last_modified_str") or r.get("last_modified") or "-")
             mod_item = SmartTableWidgetItem(mod_str)
             mod_item.setTextAlignment(Qt.AlignCenter)
-            self.table_monitoring.setItem(row_idx, 8, mod_item)
+            self.table_monitoring.setItem(row_idx, 9, mod_item)
 
-            # Col 9: Subfolder Location
+            # Col 10: Subfolder Location
             loc_item = SmartTableWidgetItem(r.get("folder_path", "") or "-")
             loc_item.setToolTip(r.get("folder_path", ""))
-            self.table_monitoring.setItem(row_idx, 9, loc_item)
+            self.table_monitoring.setItem(row_idx, 10, loc_item)
 
         self.table_monitoring.setSortingEnabled(True)
 
@@ -10032,6 +10081,9 @@ class COProcessingDialog(QDialog):
             self.lbl_det_mis_status.setText("Status: -")
             self.lbl_det_mis_info.setText("File: -")
             self.btn_mon_open_mis.setEnabled(False)
+            self.lbl_det_pcd_status.setText("Status: -")
+            self.lbl_det_pcd_info.setText("File: -")
+            self.btn_mon_open_pcd.setEnabled(False)
             return
 
         m_title = f"<b>Selected:</b> {rec.get('code', '')} - {rec.get('name', '')} ({rec.get('province', '')}, {rec.get('region', '')})"
@@ -10044,7 +10096,8 @@ class COProcessingDialog(QDialog):
             rec.get("has_matching_data") or
             rec.get("gpkg", {}).get("exists") or
             rec.get("final_earf", {}).get("exists") or
-            rec.get("mis_earf", {}).get("exists")
+            rec.get("mis_earf", {}).get("exists") or
+            rec.get("pcd_earf", {}).get("exists")
         )
         self.btn_mon_review_qa.setEnabled(has_any_deliv)
 
@@ -10082,6 +10135,17 @@ class COProcessingDialog(QDialog):
             self.lbl_det_mis_info.setText(f"File: Expected {rec.get('pppmm')}_MIS_{rec.get('clean_name')}.xlsx")
             self.btn_mon_open_mis.setEnabled(False)
 
+        # PCD EARF Block
+        pcd = rec.get("pcd_earf", {})
+        if pcd.get("exists"):
+            self.lbl_det_pcd_status.setText(f"Status: <b style='color:#d97706;'>READY</b> ({pcd.get('size_str')})")
+            self.lbl_det_pcd_info.setText(f"File: {pcd.get('filename')}\nModified: {pcd.get('mtime_str')}")
+            self.btn_mon_open_pcd.setEnabled(True)
+        else:
+            self.lbl_det_pcd_status.setText("Status: <b style='color:#dc2626;'>MISSING</b>")
+            self.lbl_det_pcd_info.setText(f"File: Expected {rec.get('pppmm')}_earf2026_PCD.xlsx")
+            self.btn_mon_open_pcd.setEnabled(False)
+
     def _on_monitoring_row_double_clicked(self, row, col):
         """Double clicking a row loads GPKG to map if available, or opens the subfolder."""
         page_size = self.mon_page_size if self.mon_page_size > 0 else len(self.mon_filtered_records)
@@ -10118,6 +10182,10 @@ class COProcessingDialog(QDialog):
         action_mis.setEnabled(bool(rec.get("mis_earf", {}).get("exists")))
         action_mis.triggered.connect(self._open_selected_mis_earf)
 
+        action_pcd = menu.addAction("Open PCD EARF Spreadsheet")
+        action_pcd.setEnabled(bool(rec.get("pcd_earf", {}).get("exists")))
+        action_pcd.triggered.connect(self._open_selected_pcd_earf)
+
         menu.addSeparator()
 
         action_folder = menu.addAction("Open Subfolder in Windows Explorer")
@@ -10135,7 +10203,8 @@ class COProcessingDialog(QDialog):
             rec.get("has_matching_data") or
             rec.get("gpkg", {}).get("exists") or
             rec.get("final_earf", {}).get("exists") or
-            rec.get("mis_earf", {}).get("exists")
+            rec.get("mis_earf", {}).get("exists") or
+            rec.get("pcd_earf", {}).get("exists")
         ))
         action_qa.triggered.connect(lambda: self._open_qa_review_for_record(rec))
 
@@ -10185,6 +10254,16 @@ class COProcessingDialog(QDialog):
             os.startfile(p)
         except Exception as e:
             QMessageBox.warning(self, "Open File Failed", f"Could not open MIS EARF file: {e}")
+
+    def _open_selected_pcd_earf(self):
+        rec = self.mon_selected_record
+        if not rec or not rec.get("pcd_earf", {}).get("exists"):
+            return
+        p = rec["pcd_earf"]["path"]
+        try:
+            os.startfile(p)
+        except Exception as e:
+            QMessageBox.warning(self, "Open File Failed", f"Could not open PCD EARF file: {e}")
 
     def _open_selected_folder(self):
         rec = self.mon_selected_record

@@ -2979,6 +2979,13 @@ class POPCENDatabase:
                 mis_earf_size_str TEXT DEFAULT '',
                 mis_earf_mtime REAL DEFAULT 0,
                 mis_earf_mtime_str TEXT DEFAULT '',
+                pcd_earf_exists INTEGER DEFAULT 0,
+                pcd_earf_filename TEXT DEFAULT '',
+                pcd_earf_path TEXT DEFAULT '',
+                pcd_earf_size INTEGER DEFAULT 0,
+                pcd_earf_size_str TEXT DEFAULT '',
+                pcd_earf_mtime REAL DEFAULT 0,
+                pcd_earf_mtime_str TEXT DEFAULT '',
                 subfolder_path TEXT DEFAULT '',
                 subfolder_exists INTEGER DEFAULT 0,
                 last_modified REAL DEFAULT 0,
@@ -2986,6 +2993,18 @@ class POPCENDatabase:
                 last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """)
+
+            cur.execute("PRAGMA table_info(dashboard_monitoring_records);")
+            dmr_cols = {row[1] for row in cur.fetchall()}
+            if "pcd_earf_exists" not in dmr_cols:
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_exists INTEGER DEFAULT 0;")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_filename TEXT DEFAULT '';")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_path TEXT DEFAULT '';")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_size INTEGER DEFAULT 0;")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_size_str TEXT DEFAULT '';")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_mtime REAL DEFAULT 0;")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_mtime_str TEXT DEFAULT '';")
+
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dash_reg ON dashboard_monitoring_records(region);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dash_prv ON dashboard_monitoring_records(province);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dash_stat ON dashboard_monitoring_records(status);")
@@ -6703,6 +6722,7 @@ class POPCENDatabase:
         gpkg_data = {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-", "layer_name": "", "feature_count": 0}
         earf_data = {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"}
         mis_data = {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"}
+        pcd_data = {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"}
 
         for sdir in search_dirs:
             try:
@@ -6838,15 +6858,48 @@ class POPCENDatabase:
                     except Exception:
                         pass
 
-        files_present = sum([gpkg_data["exists"], earf_data["exists"], mis_data["exists"]])
-        if files_present == 3:
+            # 4. PCD EARF Excel
+            if not pcd_data["exists"]:
+                excel_cands = [f for f in entries if f.lower().endswith((".xlsx", ".xls")) and not f.startswith("~$") and not f.startswith("._")]
+                pcd_cands = [f for f in excel_cands if "pcd" in f.lower()]
+                best_pcd = None
+                if pcd_cands:
+                    for f in pcd_cands:
+                        if f.startswith(pppmm) and "pcd" in f.lower():
+                            best_pcd = f; break
+                    if not best_pcd:
+                        for f in pcd_cands:
+                            if "pcd" in f.lower() and (clean_cm in f.lower() or is_specific):
+                                best_pcd = f; break
+                    if not best_pcd and is_specific:
+                        best_pcd = pcd_cands[0]
+
+                if best_pcd:
+                    p = os.path.join(sdir, best_pcd)
+                    try:
+                        st = os.stat(p)
+                        dt_str = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+                        pcd_data = {
+                            "exists": True,
+                            "filename": best_pcd,
+                            "path": p,
+                            "size": st.st_size,
+                            "size_str": _fmt_size(st.st_size),
+                            "mtime": st.st_mtime,
+                            "mtime_str": dt_str,
+                        }
+                    except Exception:
+                        pass
+
+        files_present = sum([gpkg_data["exists"], earf_data["exists"], mis_data["exists"], pcd_data["exists"]])
+        if files_present == 4:
             status = "COMPLETE"
         elif files_present > 0:
             status = "PARTIAL"
         else:
             status = "MISSING"
 
-        latest_mtime = max([gpkg_data["mtime"], earf_data["mtime"], mis_data["mtime"]])
+        latest_mtime = max([gpkg_data["mtime"], earf_data["mtime"], mis_data["mtime"], pcd_data["mtime"]])
         latest_mtime_str = datetime.datetime.fromtimestamp(latest_mtime).strftime("%Y-%m-%d %H:%M") if latest_mtime > 0 else "-"
 
         # Check if matched records exist for this municipality
@@ -6871,13 +6924,14 @@ class POPCENDatabase:
             "folder_exists": folder_exists,
             "status": status,
             "completion_count": files_present,
-            "completion_ratio": f"{files_present}/3",
+            "completion_ratio": f"{files_present}/4",
             "last_modified": latest_mtime_str,
             "last_modified_ts": latest_mtime,
             "has_matching_data": has_matching,
             "gpkg": gpkg_data,
             "final_earf": earf_data,
             "mis_earf": mis_data,
+            "pcd_earf": pcd_data,
         }
 
     def find_last_subfolders_in_root(self, root_dir: str) -> List[Tuple[str, List[str]]]:
@@ -6947,6 +7001,7 @@ class POPCENDatabase:
                 gpkg_cnt = sum(1 for r in saved if r.get("gpkg", {}).get("exists"))
                 earf_cnt = sum(1 for r in saved if r.get("final_earf", {}).get("exists"))
                 mis_cnt = sum(1 for r in saved if r.get("mis_earf", {}).get("exists"))
+                pcd_cnt = sum(1 for r in saved if r.get("pcd_earf", {}).get("exists"))
                 pct_comp = round((comp / 1655 * 100), 1)
                 return {
                     "root_dir": root_dir,
@@ -6961,6 +7016,7 @@ class POPCENDatabase:
                     "gpkg_ready": gpkg_cnt,
                     "final_earf_ready": earf_cnt,
                     "mis_earf_ready": mis_cnt,
+                    "pcd_earf_ready": pcd_cnt,
                     "completion_percentage": pct_comp,
                     "records": saved,
                 }
@@ -7143,8 +7199,9 @@ class POPCENDatabase:
                     "gpkg": {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-", "layer_name": "", "feature_count": 0},
                     "final_earf": {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"},
                     "mis_earf": {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"},
+                    "pcd_earf": {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"},
                     "status": "MISSING",
-                    "completion_ratio": "0/3",
+                    "completion_ratio": "0/4",
                     "last_modified": 0,
                     "last_modified_str": "-",
                     "has_matching_data": False,
@@ -7173,24 +7230,27 @@ class POPCENDatabase:
             # Apply search filter if specified
             if search:
                 s_lower = search.strip().lower()
-                searchable = f"{rec['code']} {rec['pppmm']} {rec['name']} {rec['province']} {rec['region']} {rec['gpkg']['filename']} {rec['final_earf']['filename']} {rec['mis_earf']['filename']}".lower()
+                pcd_fname = rec.get("pcd_earf", {}).get("filename", "")
+                searchable = f"{rec['code']} {rec['pppmm']} {rec['name']} {rec['province']} {rec['region']} {rec['gpkg']['filename']} {rec['final_earf']['filename']} {rec['mis_earf']['filename']} {pcd_fname}".lower()
                 if s_lower not in searchable:
                     continue
 
             # Apply status filter if specified
             if status_filter and status_filter != "All Statuses":
                 sf = status_filter.strip()
-                if sf == "Complete (3/3)" and rec["status"] != "COMPLETE":
+                if sf in ("Complete (4/4)", "Complete (3/3)") and rec["status"] != "COMPLETE":
                     continue
-                elif sf == "Partial (1-2/3)" and rec["status"] != "PARTIAL":
+                elif sf in ("Partial (1-3/4)", "Partial (1-2/3)") and rec["status"] != "PARTIAL":
                     continue
-                elif sf == "Missing All (0/3)" and rec["status"] != "MISSING":
+                elif sf in ("Missing All (0/4)", "Missing All (0/3)") and rec["status"] != "MISSING":
                     continue
                 elif sf == "Missing GPKG" and rec["gpkg"]["exists"]:
                     continue
                 elif sf == "Missing Final EARF" and rec["final_earf"]["exists"]:
                     continue
                 elif sf == "Missing MIS EARF" and rec["mis_earf"]["exists"]:
+                    continue
+                elif sf == "Missing PCD EARF" and rec.get("pcd_earf", {}).get("exists"):
                     continue
 
             all_records.append(rec)
@@ -7205,6 +7265,7 @@ class POPCENDatabase:
         gpkg_cnt = sum(1 for r in all_records if r["gpkg"]["exists"])
         earf_cnt = sum(1 for r in all_records if r["final_earf"]["exists"])
         mis_cnt = sum(1 for r in all_records if r["mis_earf"]["exists"])
+        pcd_cnt = sum(1 for r in all_records if r.get("pcd_earf", {}).get("exists"))
         pct_comp = round((comp / FIXED_TOTAL_CITIES_MUN * 100), 1)
 
         # Persist scan results in SQLite so the dashboard keeps the records across sessions
@@ -7226,6 +7287,7 @@ class POPCENDatabase:
             "gpkg_ready": gpkg_cnt,
             "final_earf_ready": earf_cnt,
             "mis_earf_ready": mis_cnt,
+            "pcd_earf_ready": pcd_cnt,
             "completion_percentage": pct_comp,
             "records": all_records,
         }
@@ -7242,10 +7304,12 @@ class POPCENDatabase:
                 "Output GPKG Status", "Output GPKG File", "Output GPKG Size",
                 "Final EARF Status", "Final EARF File", "Final EARF Size",
                 "MIS EARF Status", "MIS EARF File", "MIS EARF Size",
+                "PCD EARF Status", "PCD EARF File", "PCD EARF Size",
                 "Subfolder Path", "Folder Exists", "Last Modified"
             ])
             for r in records:
                 c5 = str(r.get("pppmm") or r.get("code") or "")[:5]
+                pcd = r.get("pcd_earf", {})
                 writer.writerow([
                     r.get("region", ""),
                     r.get("province", ""),
@@ -7263,6 +7327,9 @@ class POPCENDatabase:
                     "READY" if r["mis_earf"]["exists"] else "MISSING",
                     r["mis_earf"]["filename"],
                     r["mis_earf"]["size_str"],
+                    "READY" if pcd.get("exists") else "MISSING",
+                    pcd.get("filename", ""),
+                    pcd.get("size_str", ""),
                     r.get("folder_path", ""),
                     "YES" if r.get("folder_exists") else "NO",
                     r.get("last_modified", ""),
@@ -7287,10 +7354,12 @@ class POPCENDatabase:
                     gpkg_exists, gpkg_filename, gpkg_path, gpkg_size, gpkg_size_str, gpkg_mtime, gpkg_mtime_str, gpkg_feature_count,
                     final_earf_exists, final_earf_filename, final_earf_path, final_earf_size, final_earf_size_str, final_earf_mtime, final_earf_mtime_str,
                     mis_earf_exists, mis_earf_filename, mis_earf_path, mis_earf_size, mis_earf_size_str, mis_earf_mtime, mis_earf_mtime_str,
+                    pcd_earf_exists, pcd_earf_filename, pcd_earf_path, pcd_earf_size, pcd_earf_size_str, pcd_earf_mtime, pcd_earf_mtime_str,
                     subfolder_path, subfolder_exists, last_modified, last_modified_str, last_scanned
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, CURRENT_TIMESTAMP
@@ -7301,6 +7370,7 @@ class POPCENDatabase:
                     g = r.get("gpkg", {})
                     fe = r.get("final_earf", {})
                     me = r.get("mis_earf", {})
+                    pe = r.get("pcd_earf", {})
                     c_code = r.get("code") or r.get("city_mun_code") or ""
                     if not c_code:
                         continue
@@ -7333,6 +7403,13 @@ class POPCENDatabase:
                         me.get("size_str") or "",
                         me.get("mtime") or 0.0,
                         me.get("mtime_str") or "",
+                        1 if pe.get("exists") else 0,
+                        pe.get("filename") or "",
+                        pe.get("path") or "",
+                        pe.get("size") or 0,
+                        pe.get("size_str") or "",
+                        pe.get("mtime") or 0.0,
+                        pe.get("mtime_str") or "",
                         r.get("folder_path") or r.get("subfolder_path") or "",
                         1 if r.get("folder_exists") or r.get("subfolder_exists") else 0,
                         r.get("last_modified") or 0.0,
@@ -7364,9 +7441,10 @@ class POPCENDatabase:
                     g_exists = bool(r_dict.get("gpkg_exists"))
                     fe_exists = bool(r_dict.get("final_earf_exists"))
                     me_exists = bool(r_dict.get("mis_earf_exists"))
+                    pe_exists = bool(r_dict.get("pcd_earf_exists"))
                     
-                    ready_cnt = sum([1 if g_exists else 0, 1 if fe_exists else 0, 1 if me_exists else 0])
-                    comp_ratio = f"{ready_cnt}/3"
+                    ready_cnt = sum([1 if g_exists else 0, 1 if fe_exists else 0, 1 if me_exists else 0, 1 if pe_exists else 0])
+                    comp_ratio = f"{ready_cnt}/4"
 
                     records.append({
                         "code": c_code,
@@ -7405,6 +7483,15 @@ class POPCENDatabase:
                             "size_str": r_dict.get("mis_earf_size_str", ""),
                             "mtime": r_dict.get("mis_earf_mtime", 0.0),
                             "mtime_str": r_dict.get("mis_earf_mtime_str", ""),
+                        },
+                        "pcd_earf": {
+                            "exists": pe_exists,
+                            "filename": r_dict.get("pcd_earf_filename", ""),
+                            "path": r_dict.get("pcd_earf_path", ""),
+                            "size": r_dict.get("pcd_earf_size", 0),
+                            "size_str": r_dict.get("pcd_earf_size_str", ""),
+                            "mtime": r_dict.get("pcd_earf_mtime", 0.0),
+                            "mtime_str": r_dict.get("pcd_earf_mtime_str", ""),
                         },
                         "folder_path": r_dict.get("subfolder_path", ""),
                         "subfolder_path": r_dict.get("subfolder_path", ""),
