@@ -846,22 +846,24 @@ def audit_matched_flags(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def export_matched_to_excel(
     records: List[Dict[str, Any]], 
     out_path: str,
-    metadata: Optional[Dict[str, str]] = None
+    metadata: Optional[Dict[str, str]] = None,
+    is_pcd: bool = False
 ):
     """
     Exports matched records to the official PSA Final EARF Excel workbook (.xlsx)
     matching the exact 15-column template structure:
-      - Sheet 1: '2026 Final EARF' (15-column PSA official hierarchical format)
+      - Sheet 1: '2026 Final EARF' (15-column PSA official hierarchical format, or 11-column for PCD)
         - Row 1: '2026 Final Enumeration Area Reference File'
         - Row 2: 'As of Oct 2026'
-        - Row 3: Group Headers ('2024 EARF' [A3:H3] | '2026 Preliminary EA' [I3:O3])
+        - Row 3: Group Headers ('2024 EARF' [B3:I3] | '2026 Preliminary EA' [J3:P3] or [J3:K3] for PCD)
         - Row 4: Column Headers (Prov, Mun, Brgy, EA, Number of EAs, Province/City/Barangay/EA name,
                  Number of Households, Number of Buildings, Prelim EA Code, Final EA Code,
                  Household Count, Building Count, EA Type, Source Year, Remarks)
+                 (For PCD: columns J, L, M, N, O are removed and remarks values are cleared)
         - Row 5: Numbered tags (2) to (14)
         - Row 6+: Hierarchical rows (Province summary, Municipality summary, Barangay summary,
                  and pure EA rows with recoded_ean in Final EA Code, peach highlight for MERGED EAs)
-      - Sheet 2: 'Reconciliation Log' (22-column comprehensive side-by-side reconciliation)
+      - Sheet 2: 'Reconciliation Log' (22-column comprehensive side-by-side reconciliation, omitted for PCD)
     """
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -1008,31 +1010,54 @@ def export_matched_to_excel(
     ws1["B3"].font = font_group_header
     ws1["B3"].alignment = center_align
 
-    # 2026 Preliminary EA covers Prelim EA Code to Remarks (Cols J to P)
-    ws1.merge_cells("J3:P3")
-    ws1["J3"] = "2026 Preliminary EA"
-    ws1["J3"].font = font_group_header
-    ws1["J3"].alignment = center_align
-
     for c in range(2, 10):
         cell = ws1.cell(row=3, column=c)
         cell.fill = fill_green_grp
         cell.border = thin_border
-    for c in range(10, 17):
-        cell = ws1.cell(row=3, column=c)
-        cell.fill = fill_blue_grp
-        cell.border = thin_border
 
-    # Row 4: Column Headers (16 Columns with Geocode as Column 1)
-    col_names = [
-        "Geocode",
-        "Prov", "Mun", "Brgy", "EA", "Number of\nEAs",
-        "Province, City, Municipality,\nBarangay, and EA",
-        "Number of\nHouseholds", "Number of\nBuildings",
-        "Prelim Enumeration\nArea Code", "Final Enumeration\nArea Code",
-        "Household\nCount", "Building\nCount", "EA Type",
-        "Source\nYear", "Remarks"
-    ]
+    if is_pcd:
+        # PCD: 2026 Preliminary EA covers Final EA Code to Remarks (Cols J to K, cols 10 to 11)
+        ws1.merge_cells("J3:K3")
+        ws1["J3"] = "2026 Preliminary EA"
+        ws1["J3"].font = font_group_header
+        ws1["J3"].alignment = center_align
+
+        for c in range(10, 12):
+            cell = ws1.cell(row=3, column=c)
+            cell.fill = fill_blue_grp
+            cell.border = thin_border
+    else:
+        # 2026 Preliminary EA covers Prelim EA Code to Remarks (Cols J to P, cols 10 to 16)
+        ws1.merge_cells("J3:P3")
+        ws1["J3"] = "2026 Preliminary EA"
+        ws1["J3"].font = font_group_header
+        ws1["J3"].alignment = center_align
+
+        for c in range(10, 17):
+            cell = ws1.cell(row=3, column=c)
+            cell.fill = fill_blue_grp
+            cell.border = thin_border
+
+    # Row 4: Column Headers (16 Columns for Final EARF, 11 Columns for PCD)
+    if is_pcd:
+        # Removed columns J (Prelim EA), L (HH Count), M (Bldg Count), N (EA Type), O (Source Year)
+        col_names = [
+            "Geocode",
+            "Prov", "Mun", "Brgy", "EA", "Number of\nEAs",
+            "Province, City, Municipality,\nBarangay, and EA",
+            "Number of\nHouseholds", "Number of\nBuildings",
+            "Final Enumeration\nArea Code", "Remarks"
+        ]
+    else:
+        col_names = [
+            "Geocode",
+            "Prov", "Mun", "Brgy", "EA", "Number of\nEAs",
+            "Province, City, Municipality,\nBarangay, and EA",
+            "Number of\nHouseholds", "Number of\nBuildings",
+            "Prelim Enumeration\nArea Code", "Final Enumeration\nArea Code",
+            "Household\nCount", "Building\nCount", "EA Type",
+            "Source\nYear", "Remarks"
+        ]
 
     for idx, name in enumerate(col_names, start=1):
         cell = ws1.cell(row=4, column=idx, value=name)
@@ -1046,14 +1071,22 @@ def export_matched_to_excel(
             cell.fill = fill_blue_grp
         cell.border = thin_border
 
-    # Row 5: Column Numbers ((1) to (14))
-    col_nums = [
-        "(1)",
-        "(2)", "(3)", "(4)", "(5)", "(6)",
-        "(7)", "(8)", "(9)",
-        "(10)", "",
-        "(11)", "(12)", "(13)", "(14)", ""
-    ]
+    # Row 5: Column Numbers
+    if is_pcd:
+        col_nums = [
+            "(1)",
+            "(2)", "(3)", "(4)", "(5)", "(6)",
+            "(7)", "(8)", "(9)",
+            "(10)", ""
+        ]
+    else:
+        col_nums = [
+            "(1)",
+            "(2)", "(3)", "(4)", "(5)", "(6)",
+            "(7)", "(8)", "(9)",
+            "(10)", "",
+            "(11)", "(12)", "(13)", "(14)", ""
+        ]
 
     for idx, num in enumerate(col_nums, start=1):
         cell = ws1.cell(row=5, column=idx, value=num)
@@ -1167,11 +1200,18 @@ def export_matched_to_excel(
 
     # 1. Province Header Row (Row 6)
     prov_gc = f"{resolved_prov_code}00000000000"
-    prov_row_vals = [
-        prov_gc, resolved_prov_code, "00", "000", "000000", tot_eas,
-        resolved_prov_name, tot_hh, tot_bldg,
-        "", "", "", "", "", "", ""
-    ]
+    if is_pcd:
+        prov_row_vals = [
+            prov_gc, resolved_prov_code, "00", "000", "000000", tot_eas,
+            resolved_prov_name, tot_hh, tot_bldg,
+            "", ""
+        ]
+    else:
+        prov_row_vals = [
+            prov_gc, resolved_prov_code, "00", "000", "000000", tot_eas,
+            resolved_prov_name, tot_hh, tot_bldg,
+            "", "", "", "", "", "", ""
+        ]
     for c_idx, val in enumerate(prov_row_vals, start=1):
         cell = ws1.cell(row=current_row, column=c_idx, value=val)
         cell.font = font_bold
@@ -1198,11 +1238,18 @@ def export_matched_to_excel(
         # Municipality Header Row
         m_name_disp = resolved_mun_name
         mun_gc = f"{p_c}{m_c}000000000"
-        mun_row_vals = [
-            mun_gc, p_c, m_c, "000", "000000", "",
-            m_name_disp, "", "",
-            "", "", "", "", "", "", ""
-        ]
+        if is_pcd:
+            mun_row_vals = [
+                mun_gc, p_c, m_c, "000", "000000", "",
+                m_name_disp, "", "",
+                "", ""
+            ]
+        else:
+            mun_row_vals = [
+                mun_gc, p_c, m_c, "000", "000000", "",
+                m_name_disp, "", "",
+                "", "", "", "", "", "", ""
+            ]
         for c_idx, val in enumerate(mun_row_vals, start=1):
             cell = ws1.cell(row=current_row, column=c_idx, value=val)
             cell.font = font_bold
@@ -1224,11 +1271,18 @@ def export_matched_to_excel(
 
             # Barangay Header Row
             brgy_gc = f"{p_c}{m_c}{b_code}000000"
-            brgy_row_vals = [
-                brgy_gc, p_c, m_c, b_code, "000000", "",
-                b_name, "", "",
-                "", "", "", "", "", "", ""
-            ]
+            if is_pcd:
+                brgy_row_vals = [
+                    brgy_gc, p_c, m_c, b_code, "000000", "",
+                    b_name, "", "",
+                    "", ""
+                ]
+            else:
+                brgy_row_vals = [
+                    brgy_gc, p_c, m_c, b_code, "000000", "",
+                    b_name, "", "",
+                    "", "", "", "", "", "", ""
+                ]
             for c_idx, val in enumerate(brgy_row_vals, start=1):
                 cell = ws1.cell(row=current_row, column=c_idx, value=val)
                 cell.font = font_bold
@@ -1279,21 +1333,33 @@ def export_matched_to_excel(
                     ea_t = "RETAINED"
 
                 src_y = str(r.get("source_year") or ("2024" if ea_t == "RETAINED" else "2026")).strip()
-                rem_str = str(r.get("remarks") or r.get("earf_remarks") or "").strip()
+                rem_str = "" if is_pcd else str(r.get("remarks") or r.get("earf_remarks") or "").strip()
 
                 is_merged = (ea_t == "MERGED")
 
                 effective_name_ean = final_ea or prelim_ea or ean_raw
-                ea_row_vals = [
-                    ea_gc, p_c, m_c, b_code, ean_raw, 1,
-                    f"EA {effective_name_ean}",
-                    int(p_hh_val) if str(p_hh_val).isdigit() else p_hh_val,
-                    int(p_bldg_val) if str(p_bldg_val).isdigit() else p_bldg_val,
-                    prelim_ea, final_ea,
-                    int(e_hh_val) if str(e_hh_val).isdigit() else e_hh_val,
-                    int(e_bldg_val) if str(e_bldg_val).isdigit() else e_bldg_val,
-                    ea_t, src_y, rem_str
-                ]
+                if is_pcd:
+                    # PCD: Columns J (Prelim EA), L (HH Count), M (Bldg Count), N (EA Type), O (Source Year) removed.
+                    # Column Remarks has values cleared.
+                    ea_row_vals = [
+                        ea_gc, p_c, m_c, b_code, ean_raw, 1,
+                        f"EA {effective_name_ean}",
+                        int(p_hh_val) if str(p_hh_val).isdigit() else p_hh_val,
+                        int(p_bldg_val) if str(p_bldg_val).isdigit() else p_bldg_val,
+                        final_ea,
+                        ""
+                    ]
+                else:
+                    ea_row_vals = [
+                        ea_gc, p_c, m_c, b_code, ean_raw, 1,
+                        f"EA {effective_name_ean}",
+                        int(p_hh_val) if str(p_hh_val).isdigit() else p_hh_val,
+                        int(p_bldg_val) if str(p_bldg_val).isdigit() else p_bldg_val,
+                        prelim_ea, final_ea,
+                        int(e_hh_val) if str(e_hh_val).isdigit() else e_hh_val,
+                        int(e_bldg_val) if str(e_bldg_val).isdigit() else e_bldg_val,
+                        ea_t, src_y, rem_str
+                    ]
 
                 for c_idx, val in enumerate(ea_row_vals, start=1):
                     cell = ws1.cell(row=current_row, column=c_idx, value=val)
@@ -1301,33 +1367,58 @@ def export_matched_to_excel(
                     if is_merged:
                         cell.fill = fill_peach_merged
 
-                    if c_idx == 11:  # Final EA Code (from recoded_ean)
-                        cell.font = font_final_ea
-                        cell.alignment = center_align
-                        cell.number_format = "@"
-                    elif c_idx in (1, 2, 3, 4, 5, 10, 14, 15):
-                        cell.font = font_data
-                        cell.alignment = center_align
-                        if c_idx in (1, 2, 3, 4, 5, 10):
+                    if is_pcd:
+                        if c_idx == 10:  # Final EA Code (from recoded_ean)
+                            cell.font = font_final_ea
+                            cell.alignment = center_align
                             cell.number_format = "@"
-                    elif c_idx in (6, 8, 9, 12, 13):
-                        cell.font = font_data
-                        cell.alignment = right_align
-                        if isinstance(val, int):
-                            cell.number_format = "#,##0"
+                        elif c_idx in (1, 2, 3, 4, 5):
+                            cell.font = font_data
+                            cell.alignment = center_align
+                            cell.number_format = "@"
+                        elif c_idx in (6, 8, 9):
+                            cell.font = font_data
+                            cell.alignment = right_align
+                            if isinstance(val, int):
+                                cell.number_format = "#,##0"
+                        else:
+                            cell.font = font_data
+                            cell.alignment = left_align
                     else:
-                        cell.font = font_data
-                        cell.alignment = left_align
+                        if c_idx == 11:  # Final EA Code (from recoded_ean)
+                            cell.font = font_final_ea
+                            cell.alignment = center_align
+                            cell.number_format = "@"
+                        elif c_idx in (1, 2, 3, 4, 5, 10, 14, 15):
+                            cell.font = font_data
+                            cell.alignment = center_align
+                            if c_idx in (1, 2, 3, 4, 5, 10):
+                                cell.number_format = "@"
+                        elif c_idx in (6, 8, 9, 12, 13):
+                            cell.font = font_data
+                            cell.alignment = right_align
+                            if isinstance(val, int):
+                                cell.number_format = "#,##0"
+                        else:
+                            cell.font = font_data
+                            cell.alignment = left_align
 
                 ws1.row_dimensions[current_row].height = 20
                 current_row += 1
 
-    # Format Column Widths for Sheet 1 (16 Columns: A to P)
-    col_w_map = {
-        "A": 18, "B": 8, "C": 8, "D": 8, "E": 10,
-        "F": 14, "G": 36, "H": 14, "I": 14, "J": 16,
-        "K": 16, "L": 14, "M": 14, "N": 14, "O": 12, "P": 30
-    }
+    # Format Column Widths for Sheet 1
+    if is_pcd:
+        col_w_map = {
+            "A": 18, "B": 8, "C": 8, "D": 8, "E": 10,
+            "F": 14, "G": 36, "H": 14, "I": 14, "J": 16,
+            "K": 30
+        }
+    else:
+        col_w_map = {
+            "A": 18, "B": 8, "C": 8, "D": 8, "E": 10,
+            "F": 14, "G": 36, "H": 14, "I": 14, "J": 16,
+            "K": 16, "L": 14, "M": 14, "N": 14, "O": 12, "P": 30
+        }
     for col_letter, width in col_w_map.items():
         ws1.column_dimensions[col_letter].width = width
 
@@ -1335,128 +1426,129 @@ def export_matched_to_excel(
     ws1.views.sheetView[0].showGridLines = True
 
     # ----------------------------------------------------
-    # SHEET 2: Full 22-Column Reconciliation Log
+    # SHEET 2: Full 22-Column Reconciliation Log (Omitted for PCD)
     # ----------------------------------------------------
-    ws2 = wb.create_sheet(title="Reconciliation Log")
+    if not is_pcd:
+        ws2 = wb.create_sheet(title="Reconciliation Log")
 
-    fill_popcen_s2 = PatternFill(start_color="FDE8E8", end_color="FDE8E8", fill_type="solid")
-    fill_prelim_s2 = PatternFill(start_color="DEF7EC", end_color="DEF7EC", fill_type="solid")
-    fill_final_s2 = PatternFill(start_color="E1EFFE", end_color="E1EFFE", fill_type="solid")
-    fill_rec_cell_s2 = PatternFill(start_color="EFF6FF", end_color="EFF6FF", fill_type="solid")
-    font_rec_s2 = Font(name="Calibri", size=10, bold=True, color="1E40AF")
+        fill_popcen_s2 = PatternFill(start_color="FDE8E8", end_color="FDE8E8", fill_type="solid")
+        fill_prelim_s2 = PatternFill(start_color="DEF7EC", end_color="DEF7EC", fill_type="solid")
+        fill_final_s2 = PatternFill(start_color="E1EFFE", end_color="E1EFFE", fill_type="solid")
+        fill_rec_cell_s2 = PatternFill(start_color="EFF6FF", end_color="EFF6FF", fill_type="solid")
+        font_rec_s2 = Font(name="Calibri", size=10, bold=True, color="1E40AF")
 
-    ws2.merge_cells("A1:O1")
-    ws2["A1"] = "2024 POPCEN-CBMS Worksheet"
-    ws2["A1"].font = font_group_header
-    ws2["A1"].alignment = center_align
+        ws2.merge_cells("A1:O1")
+        ws2["A1"] = "2024 POPCEN-CBMS Worksheet"
+        ws2["A1"].font = font_group_header
+        ws2["A1"].alignment = center_align
 
-    ws2.merge_cells("P1:V1")
-    ws2["P1"] = "2026 EARF Worksheet"
-    ws2["P1"].font = font_group_header
-    ws2["P1"].alignment = center_align
+        ws2.merge_cells("P1:V1")
+        ws2["P1"] = "2026 EARF Worksheet"
+        ws2["P1"].font = font_group_header
+        ws2["P1"].alignment = center_align
 
-    for col in range(1, 16):
-        c = ws2.cell(row=1, column=col)
-        c.fill = fill_popcen_s2
-        c.border = thin_border
-    for col in range(16, 23):
-        c = ws2.cell(row=1, column=col)
-        c.fill = fill_prelim_s2 if col <= 21 else fill_final_s2
-        c.border = thin_border
+        for col in range(1, 16):
+            c = ws2.cell(row=1, column=col)
+            c.fill = fill_popcen_s2
+            c.border = thin_border
+        for col in range(16, 23):
+            c = ws2.cell(row=1, column=col)
+            c.fill = fill_prelim_s2 if col <= 21 else fill_final_s2
+            c.border = thin_border
 
-    headers_s2 = [
-        "Geocode", "Geographic Name", "Geographic Level", "region_code", "province_code",
-        "city_mun_code", "barangay_code", "ean", "No. of EAs", "Areaname",
-        "Household Population", "No. of Households", "EA Subject for Delineation", "EA Subject for Merging", "Remarks",
-        "New Enumeration Area Code", "Household Count", "Building Count", "EA Type", "Source Year", "Remarks",
-        "Recoded Enumeration Area"
-    ]
+        headers_s2 = [
+            "Geocode", "Geographic Name", "Geographic Level", "region_code", "province_code",
+            "city_mun_code", "barangay_code", "ean", "No. of EAs", "Areaname",
+            "Household Population", "No. of Households", "EA Subject for Delineation", "EA Subject for Merging", "Remarks",
+            "New Enumeration Area Code", "Household Count", "Building Count", "EA Type", "Source Year", "Remarks",
+            "Recoded Enumeration Area"
+        ]
 
-    for col_idx, h_text in enumerate(headers_s2, start=1):
-        cell = ws2.cell(row=2, column=col_idx, value=h_text)
-        cell.font = font_col_header
-        cell.alignment = wrap_center_align
-        cell.fill = fill_popcen_s2 if col_idx <= 15 else (fill_prelim_s2 if col_idx <= 21 else fill_final_s2)
-        cell.border = thin_border
-
-    field_keys_s2 = [
-        "geocode", "geographic_name", "geographic_level", "region_code", "province_code",
-        "city_mun_code", "barangay_code", "ean", "no_of_eas", "areaname",
-        "household_population", "no_of_households", "ea_subject_for_delineation", "ea_subject_for_merging", "popcen_remarks",
-        "new_enumeration_area_code", "household_count", "building_count", "ea_type", "source_year", "earf_remarks",
-        "recoded_ean"
-    ]
-
-    for row_idx, r in enumerate(records, start=3):
-        is_pop = r.get("in_popcen") in (1, "1", True) and bool(r.get("geographic_name"))
-        for col_idx, k in enumerate(field_keys_s2, start=1):
-            if not is_pop and k in (
-                "geographic_name", "geographic_level", "region_code", "province_code",
-                "city_mun_code", "barangay_code", "ean", "no_of_eas", "areaname",
-                "household_population", "no_of_households", "ea_subject_for_delineation",
-                "ea_subject_for_merging", "popcen_remarks"
-            ):
-                val = ""
-            else:
-                val = r.get(k, "")
-                if (val is None or val == "") and k == "new_enumeration_area_code":
-                    val = r.get("new_ean", "")
-                elif (val is None or val == "") and k == "household_count":
-                    val = r.get("earf_household_count") or r.get("earf_households", "")
-                elif (val is None or val == "") and k == "building_count":
-                    val = r.get("earf_building_count", "")
-                elif (val is None or val == "") and k == "earf_remarks":
-                    val = r.get("remarks", "")
-                elif (val is None or val == "") and k == "popcen_remarks" and is_pop:
-                    val = r.get("remarks", "")
-                elif (val is None or val == "") and k == "no_of_households" and is_pop:
-                    val = r.get("popcen_households", "")
-                elif (val is None or val == "") and k == "ea_subject_for_delineation" and is_pop:
-                    val = r.get("popcen_delineation", "")
-                elif (val is None or val == "") and k == "ea_subject_for_merging" and is_pop:
-                    val = r.get("popcen_merging", "")
-
-            cell_val = str(val).strip() if val is not None else ""
-            if cell_val.endswith(".0"):
-                cell_val = cell_val[:-2]
-
-            cell = ws2.cell(row=row_idx, column=col_idx)
+        for col_idx, h_text in enumerate(headers_s2, start=1):
+            cell = ws2.cell(row=2, column=col_idx, value=h_text)
+            cell.font = font_col_header
+            cell.alignment = wrap_center_align
+            cell.fill = fill_popcen_s2 if col_idx <= 15 else (fill_prelim_s2 if col_idx <= 21 else fill_final_s2)
             cell.border = thin_border
 
-            if k == "recoded_ean":
-                cell.value = cell_val
-                cell.font = font_rec_s2
-                cell.fill = fill_rec_cell_s2
-                cell.alignment = center_align
-            elif k in ("geocode", "region_code", "province_code", "city_mun_code", "barangay_code", "ean", "new_enumeration_area_code", "source_year"):
-                cell.value = cell_val
-                cell.font = font_data
-                cell.alignment = center_align
-            elif k in ("no_of_eas", "household_population", "no_of_households", "household_count", "building_count"):
-                if cell_val.isdigit():
-                    cell.value = int(cell_val)
-                    cell.number_format = "#,##0"
+        field_keys_s2 = [
+            "geocode", "geographic_name", "geographic_level", "region_code", "province_code",
+            "city_mun_code", "barangay_code", "ean", "no_of_eas", "areaname",
+            "household_population", "no_of_households", "ea_subject_for_delineation", "ea_subject_for_merging", "popcen_remarks",
+            "new_enumeration_area_code", "household_count", "building_count", "ea_type", "source_year", "earf_remarks",
+            "recoded_ean"
+        ]
+
+        for row_idx, r in enumerate(records, start=3):
+            is_pop = r.get("in_popcen") in (1, "1", True) and bool(r.get("geographic_name"))
+            for col_idx, k in enumerate(field_keys_s2, start=1):
+                if not is_pop and k in (
+                    "geographic_name", "geographic_level", "region_code", "province_code",
+                    "city_mun_code", "barangay_code", "ean", "no_of_eas", "areaname",
+                    "household_population", "no_of_households", "ea_subject_for_delineation",
+                    "ea_subject_for_merging", "popcen_remarks"
+                ):
+                    val = ""
+                else:
+                    val = r.get(k, "")
+                    if (val is None or val == "") and k == "new_enumeration_area_code":
+                        val = r.get("new_ean", "")
+                    elif (val is None or val == "") and k == "household_count":
+                        val = r.get("earf_household_count") or r.get("earf_households", "")
+                    elif (val is None or val == "") and k == "building_count":
+                        val = r.get("earf_building_count", "")
+                    elif (val is None or val == "") and k == "earf_remarks":
+                        val = r.get("remarks", "")
+                    elif (val is None or val == "") and k == "popcen_remarks" and is_pop:
+                        val = r.get("remarks", "")
+                    elif (val is None or val == "") and k == "no_of_households" and is_pop:
+                        val = r.get("popcen_households", "")
+                    elif (val is None or val == "") and k == "ea_subject_for_delineation" and is_pop:
+                        val = r.get("popcen_delineation", "")
+                    elif (val is None or val == "") and k == "ea_subject_for_merging" and is_pop:
+                        val = r.get("popcen_merging", "")
+
+                cell_val = str(val).strip() if val is not None else ""
+                if cell_val.endswith(".0"):
+                    cell_val = cell_val[:-2]
+
+                cell = ws2.cell(row=row_idx, column=col_idx)
+                cell.border = thin_border
+
+                if k == "recoded_ean":
+                    cell.value = cell_val
+                    cell.font = font_rec_s2
+                    cell.fill = fill_rec_cell_s2
+                    cell.alignment = center_align
+                elif k in ("geocode", "region_code", "province_code", "city_mun_code", "barangay_code", "ean", "new_enumeration_area_code", "source_year"):
+                    cell.value = cell_val
+                    cell.font = font_data
+                    cell.alignment = center_align
+                elif k in ("no_of_eas", "household_population", "no_of_households", "household_count", "building_count"):
+                    if cell_val.isdigit():
+                        cell.value = int(cell_val)
+                        cell.number_format = "#,##0"
+                    else:
+                        cell.value = cell_val
+                    cell.font = font_data
+                    cell.alignment = right_align
                 else:
                     cell.value = cell_val
-                cell.font = font_data
-                cell.alignment = right_align
-            else:
-                cell.value = cell_val
-                cell.font = font_data
-                cell.alignment = left_align
+                    cell.font = font_data
+                    cell.alignment = left_align
 
-        ws2.row_dimensions[row_idx].height = 20
+            ws2.row_dimensions[row_idx].height = 20
 
-    for col in ws2.columns:
-        col_letter = get_column_letter(col[0].column)
-        lengths = [len(str(cell.value or '')) for cell in col[1:]]
-        max_len = max(lengths) if lengths else 10
-        ws2.column_dimensions[col_letter].width = max(max_len + 3, 12)
+        for col in ws2.columns:
+            col_letter = get_column_letter(col[0].column)
+            lengths = [len(str(cell.value or '')) for cell in col[1:]]
+            max_len = max(lengths) if lengths else 10
+            ws2.column_dimensions[col_letter].width = max(max_len + 3, 12)
 
-    ws2.row_dimensions[1].height = 24
-    ws2.row_dimensions[2].height = 28
-    ws2.freeze_panes = "B3"
-    ws2.views.sheetView[0].showGridLines = True
+        ws2.row_dimensions[1].height = 24
+        ws2.row_dimensions[2].height = 28
+        ws2.freeze_panes = "B3"
+        ws2.views.sheetView[0].showGridLines = True
 
     # Make Sheet 1 the default active sheet
     wb.active = ws1
@@ -6105,7 +6197,7 @@ class POPCENDatabase:
         # Strictly sort by geocode before generating PCD Excel
         pcd_rows.sort(key=lambda r: str(r.get("ea_geocode") or r.get("geocode") or "").strip())
 
-        export_matched_to_excel(pcd_rows, out_excel, metadata=meta)
+        export_matched_to_excel(pcd_rows, out_excel, metadata=meta, is_pcd=True)
 
     @staticmethod
     def is_summary_header_record(r: Dict[str, Any]) -> bool:
