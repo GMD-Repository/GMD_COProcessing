@@ -16,7 +16,7 @@ from qgis.PyQt.QtCore import Qt, QUrl
 from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import QAction, QMenu
 
-from .script_registry import SCRIPTS_DIR, earf_icon, group_icon, grouped_scripts, mbi_coverage_icon, plugin_icon, theme_icon
+from .script_registry import SCRIPTS_DIR, earf_icon, earf_inconsistency_icon, group_icon, grouped_scripts, mbi_coverage_icon, plugin_icon, theme_icon
 
 MENU_TITLE = "&GMD CO Processing"
 # Scripts listed directly under the GMD CO Processing menu instead of inside their group submenu
@@ -32,6 +32,7 @@ class GMDCOProcessingPlugin:
         self.panel_action = None
         self.earf_action = None
         self.mbi_coverage_action = None
+        self.earf_incons_action = None
         self.help_action = None
         self._tools_end = None       # separator after the tool groups
         self._tool_actions = []      # group submenus, rebuilt every time the menu opens
@@ -82,6 +83,14 @@ class GMDCOProcessingPlugin:
         self.mbi_coverage_action.triggered.connect(
             lambda: self._open_script_file("mbi_coverage_selector.py"))
 
+        # Dedicated action for [TEST] EARF Inconsistency Checks (toolbar button)
+        self.earf_incons_action = QAction(earf_inconsistency_icon(), "[TEST] EARF Inconsistency Checks",
+                                          main_window)
+        self.earf_incons_action.setObjectName("GMDEARFInconsistencyAction")
+        self.earf_incons_action.setToolTip("Open [TEST] EARF Inconsistency Checks (check and fix)")
+        self.earf_incons_action.triggered.connect(
+            lambda: self._open_script_file("test_earf_inconsistency.py"))
+
         self.menu.addAction(self.panel_action)
         self.menu.addAction(theme_icon("mActionFileNew.svg"), "New Script…", self._new_script)
         self.menu.addAction(
@@ -101,6 +110,7 @@ class GMDCOProcessingPlugin:
         # ---- toolbar buttons
         self.iface.addToolBarIcon(self.earf_action)
         self.iface.addToolBarIcon(self.mbi_coverage_action)
+        self.iface.addToolBarIcon(self.earf_incons_action)
 
         # ---- help entry under Help > Plugins (PyQGIS cookbook convention)
         self.help_action = QAction(plugin_icon(), "GMD CO Processing Help", main_window)
@@ -198,6 +208,11 @@ class GMDCOProcessingPlugin:
             self.iface.removeToolBarIcon(self.mbi_coverage_action)
             self.mbi_coverage_action.deleteLater()
             self.mbi_coverage_action = None
+
+        if self.earf_incons_action is not None:
+            self.iface.removeToolBarIcon(self.earf_incons_action)
+            self.earf_incons_action.deleteLater()
+            self.earf_incons_action = None
 
         if self.panel_action is not None:
             self.panel_action.deleteLater()

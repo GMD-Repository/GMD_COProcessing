@@ -14,7 +14,10 @@ also fixes the records. It writes two workbooks in the *EA List of Inconsistenci
 
 ## Quick start
 
-1. Add the EA GeoPackage layer to the QGIS project and choose it in **1. EA GeoPackage (ea2026)**.
+1. Add the EA GeoPackage layer to the QGIS project and choose it in **1. EA GeoPackage (ea2026)**. The list
+   shows every polygon layer with a geocode field (`geocode`, `ea_geocode` or `psgc_ea`, any letter case).
+   When there are several, a layer named *ea2026* is picked first, then the one with the most EA fields
+   (`new_ean`, `ea_type`, `sy`, `hh_count`, `ean`). The tool also has its own toolbar button.
 2. **2. Preliminary EARF** and **3. Est. No. of Households** are files, not layers. The tool searches the
    GeoPackage's folder and fills in the spreadsheet whose name matches (`earf`; `household`, `hh`,
    `popcen` or `estimated`). Otherwise press **Browse…** (it opens in that folder) or type the path,
