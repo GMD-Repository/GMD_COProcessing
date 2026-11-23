@@ -1004,29 +1004,40 @@ def export_matched_to_excel(
     cell_a3.fill = fill_neutral_gray
     cell_a3.border = thin_border
 
-    # 2024 EARF covers Prov to Number of Buildings (Cols B to I)
-    ws1.merge_cells("B3:I3")
-    ws1["B3"] = "2024 EARF"
-    ws1["B3"].font = font_group_header
-    ws1["B3"].alignment = center_align
-
-    for c in range(2, 10):
-        cell = ws1.cell(row=3, column=c)
-        cell.fill = fill_green_grp
-        cell.border = thin_border
-
     if is_pcd:
-        # PCD: 2026 Preliminary EA covers Final EA Code to Remarks (Cols J to K, cols 10 to 11)
-        ws1.merge_cells("J3:K3")
-        ws1["J3"] = "2026 Preliminary EA"
-        ws1["J3"].font = font_group_header
-        ws1["J3"].alignment = center_align
+        # PCD: 2024 EARF covers Prov to Name (Cols B to G, cols 2 to 7)
+        ws1.merge_cells("B3:G3")
+        ws1["B3"] = "2024 EARF"
+        ws1["B3"].font = font_group_header
+        ws1["B3"].alignment = center_align
 
-        for c in range(10, 12):
+        for c in range(2, 8):
+            cell = ws1.cell(row=3, column=c)
+            cell.fill = fill_green_grp
+            cell.border = thin_border
+
+        # PCD: 2026 Preliminary EA covers Final EA Code to Remarks (Cols H to I, cols 8 to 9)
+        ws1.merge_cells("H3:I3")
+        ws1["H3"] = "2026 Preliminary EA"
+        ws1["H3"].font = font_group_header
+        ws1["H3"].alignment = center_align
+
+        for c in range(8, 10):
             cell = ws1.cell(row=3, column=c)
             cell.fill = fill_blue_grp
             cell.border = thin_border
     else:
+        # 2024 EARF covers Prov to Number of Buildings (Cols B to I)
+        ws1.merge_cells("B3:I3")
+        ws1["B3"] = "2024 EARF"
+        ws1["B3"].font = font_group_header
+        ws1["B3"].alignment = center_align
+
+        for c in range(2, 10):
+            cell = ws1.cell(row=3, column=c)
+            cell.fill = fill_green_grp
+            cell.border = thin_border
+
         # 2026 Preliminary EA covers Prelim EA Code to Remarks (Cols J to P, cols 10 to 16)
         ws1.merge_cells("J3:P3")
         ws1["J3"] = "2026 Preliminary EA"
@@ -1038,14 +1049,13 @@ def export_matched_to_excel(
             cell.fill = fill_blue_grp
             cell.border = thin_border
 
-    # Row 4: Column Headers (16 Columns for Final EARF, 11 Columns for PCD)
+    # Row 4: Column Headers (16 Columns for Final EARF, 9 Columns for PCD)
     if is_pcd:
-        # Removed columns J (Prelim EA), L (HH Count), M (Bldg Count), N (EA Type), O (Source Year)
+        # Removed columns H (HH Count), I (Bldg Count), J (Prelim EA), L (HH Count), M (Bldg Count), N (EA Type), O (Source Year)
         col_names = [
             "Geocode",
             "Prov", "Mun", "Brgy", "EA", "Number of\nEAs",
             "Province, City, Municipality,\nBarangay, and EA",
-            "Number of\nHouseholds", "Number of\nBuildings",
             "Final Enumeration\nArea Code", "Remarks"
         ]
     else:
@@ -1065,7 +1075,7 @@ def export_matched_to_excel(
         cell.alignment = wrap_center_align
         if idx == 1:
             cell.fill = fill_neutral_gray
-        elif idx <= 9:
+        elif (is_pcd and idx <= 7) or (not is_pcd and idx <= 9):
             cell.fill = fill_green_grp
         else:
             cell.fill = fill_blue_grp
@@ -1076,8 +1086,8 @@ def export_matched_to_excel(
         col_nums = [
             "(1)",
             "(2)", "(3)", "(4)", "(5)", "(6)",
-            "(7)", "(8)", "(9)",
-            "(10)", ""
+            "(7)",
+            "(8)", ""
         ]
     else:
         col_nums = [
@@ -1094,7 +1104,7 @@ def export_matched_to_excel(
         cell.alignment = center_align
         if idx == 1:
             cell.fill = fill_neutral_gray
-        elif idx <= 9:
+        elif (is_pcd and idx <= 7) or (not is_pcd and idx <= 9):
             cell.fill = fill_green_grp
         else:
             cell.fill = fill_blue_grp
@@ -1203,7 +1213,7 @@ def export_matched_to_excel(
     if is_pcd:
         prov_row_vals = [
             prov_gc, resolved_prov_code, "00", "000", "000000", tot_eas,
-            resolved_prov_name, tot_hh, tot_bldg,
+            resolved_prov_name,
             "", ""
         ]
     else:
@@ -1226,7 +1236,7 @@ def export_matched_to_excel(
                 cell.number_format = "#,##0"
         elif c_idx == 7:
             cell.alignment = left_align
-        elif c_idx in (8, 9):
+        elif not is_pcd and c_idx in (8, 9):
             cell.alignment = right_align
             if isinstance(val, int):
                 cell.number_format = "#,##0"
@@ -1241,7 +1251,7 @@ def export_matched_to_excel(
         if is_pcd:
             mun_row_vals = [
                 mun_gc, p_c, m_c, "000", "000000", "",
-                m_name_disp, "", "",
+                m_name_disp,
                 "", ""
             ]
         else:
@@ -1274,7 +1284,7 @@ def export_matched_to_excel(
             if is_pcd:
                 brgy_row_vals = [
                     brgy_gc, p_c, m_c, b_code, "000000", "",
-                    b_name, "", "",
+                    b_name,
                     "", ""
                 ]
             else:
@@ -1339,13 +1349,11 @@ def export_matched_to_excel(
 
                 effective_name_ean = final_ea or prelim_ea or ean_raw
                 if is_pcd:
-                    # PCD: Columns J (Prelim EA), L (HH Count), M (Bldg Count), N (EA Type), O (Source Year) removed.
+                    # PCD: Columns H (HH Count), I (Bldg Count), J (Prelim EA), L (HH Count), M (Bldg Count), N (EA Type), O (Source Year) removed.
                     # Column Remarks has values cleared.
                     ea_row_vals = [
                         ea_gc, p_c, m_c, b_code, ean_raw, 1,
                         f"EA {effective_name_ean}",
-                        int(p_hh_val) if str(p_hh_val).isdigit() else p_hh_val,
-                        int(p_bldg_val) if str(p_bldg_val).isdigit() else p_bldg_val,
                         final_ea,
                         ""
                     ]
@@ -1368,7 +1376,7 @@ def export_matched_to_excel(
                         cell.fill = fill_peach_merged
 
                     if is_pcd:
-                        if c_idx == 10:  # Final EA Code (from recoded_ean)
+                        if c_idx == 8:  # Final EA Code (from recoded_ean)
                             cell.font = font_final_ea
                             cell.alignment = center_align
                             cell.number_format = "@"
@@ -1376,12 +1384,12 @@ def export_matched_to_excel(
                             cell.font = font_data
                             cell.alignment = center_align
                             cell.number_format = "@"
-                        elif c_idx in (6, 8, 9):
+                        elif c_idx == 6:
                             cell.font = font_data
                             cell.alignment = right_align
                             if isinstance(val, int):
                                 cell.number_format = "#,##0"
-                        else:
+                        else:  # c_idx 7 (Name) and c_idx 9 (Remarks)
                             cell.font = font_data
                             cell.alignment = left_align
                     else:
@@ -1410,8 +1418,7 @@ def export_matched_to_excel(
     if is_pcd:
         col_w_map = {
             "A": 18, "B": 8, "C": 8, "D": 8, "E": 10,
-            "F": 14, "G": 36, "H": 14, "I": 14, "J": 16,
-            "K": 30
+            "F": 14, "G": 36, "H": 16, "I": 30
         }
     else:
         col_w_map = {
