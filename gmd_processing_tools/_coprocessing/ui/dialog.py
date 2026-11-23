@@ -2608,9 +2608,14 @@ class COProcessingDialog(QDialog):
 
         if selected_cm:
             subfolder, hier = self.db.resolve_final_export_subfolder(root_dir, selected_cm)
-            if subfolder:
+            if subfolder and os.path.exists(subfolder):
                 self.txt_match_export_dir.setText(subfolder)
-                self.txt_match_export_dir.setToolTip(f"Export Folder: {hier.get('city_mun')}, {hier.get('province')} ({hier.get('region')})")
+                self.txt_match_export_dir.setToolTip(f"Export Folder: {hier.get('city_mun')}, {hier.get('province')} ({hier.get('region')})\n{subfolder}")
+            else:
+                self.txt_match_export_dir.setText("")
+                mun_name = hier.get("city_mun") or selected_cm
+                self.txt_match_export_dir.setPlaceholderText(f"Subfolder for '{mun_name}' not found under root directory")
+                self.txt_match_export_dir.setToolTip(f"No existing subfolder matching '{mun_name}' was found in:\n{root_dir}")
         else:
             if os.path.exists(root_dir):
                 self.txt_match_export_dir.setText(root_dir)
@@ -3862,11 +3867,6 @@ class COProcessingDialog(QDialog):
         # Case 1: A specific City/Mun is selected in the filter
         if selected_cm:
             target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, selected_cm)
-            if not target_folder:
-                target_folder = export_dir if os.path.exists(export_dir) else root_dir
-            os.makedirs(target_folder, exist_ok=True)
-            self.txt_match_export_dir.setText(target_folder)
-
             mun_name = hier.get("city_mun")
             if not is_valid_mun_name(mun_name):
                 cm_txt = cm.currentText()
@@ -3876,6 +3876,22 @@ class COProcessingDialog(QDialog):
                     mun_name = cm_txt
                 else:
                     mun_name = f"City/Mun {selected_cm}"
+
+            # Check if typed export_dir points to an existing directory matching this municipality
+            if (not target_folder or not os.path.exists(target_folder)) and export_dir and os.path.exists(export_dir) and os.path.isdir(export_dir):
+                if _match_hier_names(os.path.basename(export_dir), mun_name) or selected_cm[:5] in os.path.basename(export_dir):
+                    target_folder = export_dir
+
+            if not target_folder or not os.path.exists(target_folder):
+                QMessageBox.warning(
+                    self,
+                    "Subfolder Not Found",
+                    f"No existing subfolder found matching '{mun_name}' ({selected_cm}) in root directory:\n{root_dir}\n\n"
+                    "Please ensure the municipality subfolder exists in the root directory before exporting."
+                )
+                return
+
+            self.txt_match_export_dir.setText(target_folder)
             clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
             clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
             if not clean_cm:
@@ -3959,7 +3975,7 @@ class COProcessingDialog(QDialog):
                 self,
                 "Export All Processed City/Municipalities",
                 f"No specific City/Municipality is selected.\n\n"
-                f"Would you like to export all {len(processed_citymuns)} processed City/Municipalities into their respective subfolders under:\n"
+                f"Would you like to export all {len(processed_citymuns)} processed City/Municipalities into their existing subfolders under:\n"
                 f"{root_dir}?\n\n"
                 f"Each City/Municipality will generate:\n"
                 + "\n".join(file_bullets),
@@ -3970,12 +3986,15 @@ class COProcessingDialog(QDialog):
                 return
 
             tasks = []
+            skipped_muns = []
             for cm_item in processed_citymuns:
                 c_code = cm_item["code"]
                 target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, c_code)
-                if not target_folder:
-                    target_folder = export_dir if os.path.exists(export_dir) else root_dir
-                os.makedirs(target_folder, exist_ok=True)
+                if not target_folder or not os.path.exists(target_folder):
+                    m_label = hier.get("city_mun") or cm_item.get("name") or c_code
+                    skipped_muns.append(f"{m_label} ({c_code})")
+                    continue
+
                 m_name = hier.get("city_mun") or cm_item.get("name")
                 if not is_valid_mun_name(m_name):
                     m_name = f"City/Mun {c_code}"
@@ -4008,6 +4027,31 @@ class COProcessingDialog(QDialog):
                     "layer_name": clean_cm,
                 })
 
+            if skipped_muns:
+                if not tasks:
+                    QMessageBox.warning(
+                        self,
+                        "Subfolders Not Found",
+                        f"None of the {len(skipped_muns)} processed City/Municipalities have an existing subfolder in:\n{root_dir}\n\n"
+                        "No files were exported."
+                    )
+                    return
+                else:
+                    preview_skip = "\n".join(f"• {m}" for m in skipped_muns[:8])
+                    if len(skipped_muns) > 8:
+                        preview_skip += f"\n... and {len(skipped_muns) - 8} more"
+                    reply_cont = QMessageBox.question(
+                        self,
+                        "Some Subfolders Not Found",
+                        f"{len(skipped_muns)} City/Municipality subfolder(s) were not found in:\n{root_dir}\n\n"
+                        f"{preview_skip}\n\n"
+                        f"Would you like to proceed with exporting the remaining {len(tasks)} municipality(ies) that have existing subfolders?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes
+                    )
+                    if reply_cont != QMessageBox.Yes:
+                        return
+
             self._start_deliverables_export(tasks, is_batch=True, post_action_ask_canvas=False)
 
     def _export_output_summary_excel(self):
@@ -4028,10 +4072,6 @@ class COProcessingDialog(QDialog):
         # Case 1: A specific City/Municipality is selected in the filter
         if selected_cm:
             target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, selected_cm)
-            if not target_folder:
-                target_folder = export_dir if (export_dir and os.path.exists(export_dir)) else root_dir
-            os.makedirs(target_folder, exist_ok=True)
-
             mun_name = hier.get("city_mun")
             if not is_valid_mun_name(mun_name):
                 cm_txt = cm.currentText()
@@ -4041,6 +4081,20 @@ class COProcessingDialog(QDialog):
                     mun_name = cm_txt
                 else:
                     mun_name = f"City/Mun {selected_cm}"
+
+            if (not target_folder or not os.path.exists(target_folder)) and export_dir and os.path.exists(export_dir) and os.path.isdir(export_dir):
+                if _match_hier_names(os.path.basename(export_dir), mun_name) or selected_cm[:5] in os.path.basename(export_dir):
+                    target_folder = export_dir
+
+            if not target_folder or not os.path.exists(target_folder):
+                QMessageBox.warning(
+                    self,
+                    "Subfolder Not Found",
+                    f"No existing subfolder found matching '{mun_name}' ({selected_cm}) in root directory:\n{root_dir}\n\n"
+                    "Please ensure the municipality subfolder exists in the root directory before exporting."
+                )
+                return
+
             clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
             clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
             if not clean_cm:
@@ -4116,12 +4170,14 @@ class COProcessingDialog(QDialog):
 
             exported_files = []
             errors = []
+            skipped_muns = []
             for cm_item in processed_citymuns:
                 c_code = cm_item["code"]
                 target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, c_code)
-                if not target_folder:
-                    target_folder = export_dir if (export_dir and os.path.exists(export_dir)) else root_dir
-                os.makedirs(target_folder, exist_ok=True)
+                if not target_folder or not os.path.exists(target_folder):
+                    m_label = hier.get("city_mun") or cm_item.get("name") or c_code
+                    skipped_muns.append(f"{m_label} ({c_code})")
+                    continue
 
                 m_name = hier.get("city_mun") or cm_item.get("name")
                 if not is_valid_mun_name(m_name):
@@ -10369,15 +10425,27 @@ class COProcessingDialog(QDialog):
         self._export_deliverables_for_citymun(c_code)
 
     def _export_deliverables_for_citymun(self, city_mun_code: str) -> bool:
-        """Exports the 3 final deliverables for a specific municipality in a background worker thread."""
+        """Exports the final deliverables for a specific municipality in a background worker thread."""
         root_dir = self.txt_mon_root_dir.text().strip() or getattr(self, "_final_export_root_dir", None) or DEFAULT_FINAL_EXPORT_ROOT
         if not os.path.exists(root_dir):
             root_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
-        target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, city_mun_code)
-        if not target_folder:
-            target_folder = root_dir
-        os.makedirs(target_folder, exist_ok=True)
+        rec = getattr(self, "mon_selected_record", None)
+        if rec and rec.get("code") == city_mun_code and rec.get("folder_path") and os.path.exists(rec.get("folder_path")):
+            target_folder = rec["folder_path"]
+            hier = self.db.get_citymun_hierarchy(city_mun_code)
+        else:
+            target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, city_mun_code)
+
+        if not target_folder or not os.path.exists(target_folder):
+            mun_display = hier.get("city_mun") or city_mun_code
+            QMessageBox.warning(
+                self,
+                "Subfolder Not Found",
+                f"No existing subfolder found matching '{mun_display}' ({city_mun_code}) in root directory:\n{root_dir}\n\n"
+                "Please ensure the municipality subfolder exists in the root directory before exporting."
+            )
+            return False
 
         mun_name = hier.get("city_mun")
         if not is_valid_mun_name(mun_name):

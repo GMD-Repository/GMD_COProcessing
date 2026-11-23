@@ -203,12 +203,17 @@ def _match_hier_names(d_name: str, target_name: str) -> bool:
     ct = _clean_hier_name(target_name)
     if not cd or not ct:
         return False
-    if cd == ct or cd in ct or ct in cd:
+    if cd == ct:
+        return True
+    if len(cd) >= 4 and len(ct) >= 4 and (cd in ct or ct in cd):
         return True
     cd_strip = cd.replace("cityof", "").replace("city", "").replace("municipalityof", "").replace("provinceof", "")
     ct_strip = ct.replace("cityof", "").replace("city", "").replace("municipalityof", "").replace("provinceof", "")
-    if cd_strip and ct_strip and (cd_strip == ct_strip or cd_strip in ct_strip or ct_strip in cd_strip):
-        return True
+    if cd_strip and ct_strip:
+        if cd_strip == ct_strip:
+            return True
+        if len(cd_strip) >= 4 and len(ct_strip) >= 4 and (cd_strip in ct_strip or ct_strip in cd_strip):
+            return True
     return False
 
 
@@ -5803,62 +5808,111 @@ class POPCENDatabase:
             "city_mun_code": cm_5,
         }
 
+    def _get_root_subfolders_tree(self, root_dir: str) -> List[Tuple[str, str, str, str, List[str], bool]]:
+        """
+        Indexes all subfolders under root_dir to allow rapid searching across all municipalities
+        without repeatedly walking the file system. Cached in memory.
+        Returns list of tuples: (dirpath, folder_name, parent_name, grandparent_name, filenames, is_leaf).
+        """
+        if not root_dir or not os.path.exists(root_dir) or not os.path.isdir(root_dir):
+            return []
+
+        norm_root = os.path.normcase(os.path.abspath(root_dir))
+        try:
+            mtime = os.path.getmtime(root_dir)
+        except Exception:
+            mtime = 0
+
+        cached = getattr(self, "_root_subfolders_tree_cache", None)
+        if cached and cached.get("root") == norm_root and cached.get("mtime") == mtime:
+            return cached.get("tree", [])
+
+        tree = []
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            dirnames[:] = [d for d in dirnames if not d.startswith('.') and not d.startswith('_') and not is_version_dir(d)]
+            if os.path.abspath(dirpath) == os.path.abspath(root_dir):
+                continue
+            folder_name = os.path.basename(dirpath)
+            parent_dir = os.path.dirname(dirpath)
+            parent_name = os.path.basename(parent_dir) if parent_dir != root_dir else ""
+            gp_dir = os.path.dirname(parent_dir) if parent_dir != root_dir else ""
+            gp_name = os.path.basename(gp_dir) if gp_dir != root_dir else ""
+            is_leaf = len(dirnames) == 0
+            tree.append((dirpath, folder_name, parent_name, gp_name, filenames, is_leaf))
+
+        self._root_subfolders_tree_cache = {
+            "root": norm_root,
+            "mtime": mtime,
+            "tree": tree,
+        }
+        return tree
+
+    def find_subfolder_for_citymun(self, root_dir: str, city_mun_code: str, hier: Optional[Dict[str, str]] = None) -> Optional[str]:
+        """
+        Searches root_dir recursively for an existing subfolder matching the given city/municipality
+        by name or 5-digit code. Does NOT create any new directories.
+        Returns the absolute path to the matching existing subfolder, or None if not found.
+        """
+        if not root_dir or not os.path.exists(root_dir) or not os.path.isdir(root_dir):
+            return None
+
+        if not hier:
+            hier = self.get_citymun_hierarchy(city_mun_code)
+        mun_name = hier.get("city_mun", "")
+        prov_name = hier.get("province", "")
+        reg_name = hier.get("region", "")
+        pppmm = str(city_mun_code)[:5] if len(str(city_mun_code)) >= 5 else str(city_mun_code)
+
+        tree = self._get_root_subfolders_tree(root_dir)
+        best_match = None
+        best_score = 0
+
+        for dirpath, folder_name, parent_name, gp_name, filenames, is_leaf in tree:
+            score = 0
+
+            # 1. 5-digit code match in folder name (e.g. '01915 - San Pedro', '01915_san_pedro', '01915')
+            if pppmm and pppmm in folder_name:
+                score += 80
+                if folder_name.startswith(pppmm):
+                    score += 20
+
+            # 2. City / Municipality name match
+            if mun_name and _match_hier_names(folder_name, mun_name):
+                score += 70
+
+            # 3. Existing deliverables or files with 5-digit code prefix inside folder
+            if pppmm and any(f.startswith(f"{pppmm}_") or f.startswith(f"{pppmm}.") for f in filenames):
+                score += 90
+
+            if score > 0:
+                if prov_name and _match_hier_names(parent_name, prov_name):
+                    score += 30
+                if reg_name and _match_hier_names(gp_name, reg_name):
+                    score += 20
+                if is_leaf:
+                    score += 15
+
+                if score > best_score:
+                    best_score = score
+                    best_match = dirpath
+
+        if best_score >= 60:
+            return best_match
+
+        return None
+
     def resolve_final_export_subfolder(self, root_dir: str, city_mun_code: str) -> Tuple[Optional[str], Dict[str, str]]:
         """
-        Locates or constructs the specific City/Municipality subfolder under root_dir
-        following the official hierarchy: <root_dir>/<Region>/<Province>/<CityMun>.
-        Checks the Region, Province, and CityMun folder names dynamically on disk.
+        Locates the specific City/Municipality subfolder under root_dir by searching
+        for the city/mun name or 5-digit code dynamically across existing subfolders.
+        Does NOT create any new directories.
         """
         hier = self.get_citymun_hierarchy(city_mun_code)
-        reg_name = hier.get("region", "")
-        prov_name = hier.get("province", "")
-        mun_name = hier.get("city_mun", "")
-
         if not root_dir or not os.path.exists(root_dir):
             return None, hier
 
-        matched_reg_dir = None
-        try:
-            for d in os.listdir(root_dir):
-                full_d = os.path.join(root_dir, d)
-                if os.path.isdir(full_d) and _match_hier_names(d, reg_name):
-                    matched_reg_dir = full_d
-                    break
-        except Exception:
-            pass
-
-        if not matched_reg_dir:
-            fallback = os.path.join(root_dir, reg_name or "Region", prov_name or "Province", mun_name or city_mun_code)
-            return fallback, hier
-
-        # 1. Try matching Province/District then CityMun
-        try:
-            for d in os.listdir(matched_reg_dir):
-                full_d = os.path.join(matched_reg_dir, d)
-                if os.path.isdir(full_d) and _match_hier_names(d, prov_name):
-                    for sub_d in os.listdir(full_d):
-                        full_sub = os.path.join(full_d, sub_d)
-                        if os.path.isdir(full_sub) and _match_hier_names(sub_d, mun_name):
-                            return full_sub, hier
-        except Exception:
-            pass
-
-        # 2. Try matching CityMun anywhere under matched_reg_dir (handles NCR districts like NCR I - NCR V)
-        try:
-            for d in os.listdir(matched_reg_dir):
-                full_d = os.path.join(matched_reg_dir, d)
-                if os.path.isdir(full_d):
-                    if _match_hier_names(d, mun_name):
-                        return full_d, hier
-                    for sub_d in os.listdir(full_d):
-                        full_sub = os.path.join(full_d, sub_d)
-                        if os.path.isdir(full_sub) and _match_hier_names(sub_d, mun_name):
-                            return full_sub, hier
-        except Exception:
-            pass
-
-        fallback = os.path.join(matched_reg_dir, prov_name or "Province", mun_name or city_mun_code)
-        return fallback, hier
+        matched = self.find_subfolder_for_citymun(root_dir, city_mun_code, hier)
+        return matched, hier
 
     def query_matched_records(
         self,
