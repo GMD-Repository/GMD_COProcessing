@@ -83,9 +83,7 @@ try:
     )
     from ..db.database import (
         POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder, find_popcen_files_in_folder,
-        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, GPKG_COLUMN_ALIASES,
-        validate_gpkg_attribute_table_detailed, validate_all_gpkg_sources,
-        compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, is_valid_mun_name, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
+        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, is_valid_mun_name, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
     )
 except (ImportError, ValueError):
     from algorithm import (
@@ -99,9 +97,7 @@ except (ImportError, ValueError):
     )
     from database import (
         POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder, find_popcen_files_in_folder,
-        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, GPKG_COLUMN_ALIASES,
-        validate_gpkg_attribute_table_detailed, validate_all_gpkg_sources,
-        compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, is_valid_mun_name, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
+        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, is_valid_mun_name, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
     )
 
 if "DEFAULT_GPKG_ROOT" not in globals():
@@ -568,14 +564,12 @@ def load_gpkg_data(sources_str):
     Reads polygon vector layers or GeoPackage files into a unified pandas DataFrame,
     capturing attribute columns, geometry status, and consistency metrics for preview.
     Ensures that only polygon / multipolygon vector layers are loaded.
-    Records validation failures on df._validation_errors.
     """
     if not sources_str or not sources_str.strip():
         return pd.DataFrame()
 
     items = resolve_gpkg_sources(sources_str)
     all_rows = []
-    validation_errors = []
 
     for item in items:
         # 1. Check if item matches an active QGIS vector layer
@@ -590,17 +584,8 @@ def load_gpkg_data(sources_str):
             lyr = None
 
         if lyr is not None and lyr.isValid():
-            is_valid_cols, missing_cols, existing_cols = validate_gpkg_columns(lyr)
+            is_valid_cols, _, _ = validate_gpkg_columns(lyr)
             if not is_valid_cols:
-                validation_errors.append({
-                    "source": lyr.name() or item,
-                    "source_name": lyr.name() or item,
-                    "is_valid": False,
-                    "missing_columns": missing_cols,
-                    "existing_columns": existing_cols,
-                    "has_poly": True,
-                    "geometry_desc": "Polygon",
-                })
                 continue
             field_names = [f.name() for f in lyr.fields()]
             src_name = lyr.name() or item
@@ -634,15 +619,6 @@ def load_gpkg_data(sources_str):
 
             # Skip files that are confirmed non-polygon (e.g. points, lines only)
             if not has_poly and poly_tables is not None and len(poly_tables) == 0 and "non-polygon" in desc.lower():
-                validation_errors.append({
-                    "source": item,
-                    "source_name": os.path.basename(item),
-                    "is_valid": False,
-                    "missing_columns": [],
-                    "existing_columns": [],
-                    "has_poly": False,
-                    "geometry_desc": desc or "Non-Polygon",
-                })
                 continue
 
             loaded_any = False
@@ -657,17 +633,8 @@ def load_gpkg_data(sources_str):
                         sub_lyr = None
 
                     if sub_lyr is not None and sub_lyr.isValid() and is_polygon_layer(sub_lyr):
-                        is_valid_cols, missing_cols, existing_cols = validate_gpkg_columns(sub_lyr)
+                        is_valid_cols, _, _ = validate_gpkg_columns(sub_lyr)
                         if not is_valid_cols:
-                            validation_errors.append({
-                                "source": f"{item}|layername={tbl_name}",
-                                "source_name": f"{os.path.basename(item)} ({tbl_name})",
-                                "is_valid": False,
-                                "missing_columns": missing_cols,
-                                "existing_columns": existing_cols,
-                                "has_poly": True,
-                                "geometry_desc": "Polygon",
-                            })
                             continue
                         field_names = [f.name() for f in sub_lyr.fields()]
                         for feat in sub_lyr.getFeatures():
@@ -697,17 +664,8 @@ def load_gpkg_data(sources_str):
                 try:
                     direct_lyr = QgsVectorLayer(item, base_name, "ogr")
                     if direct_lyr.isValid() and is_polygon_layer(direct_lyr):
-                        is_valid_cols, missing_cols, existing_cols = validate_gpkg_columns(direct_lyr)
+                        is_valid_cols, _, _ = validate_gpkg_columns(direct_lyr)
                         if not is_valid_cols:
-                            validation_errors.append({
-                                "source": item,
-                                "source_name": os.path.basename(item),
-                                "is_valid": False,
-                                "missing_columns": missing_cols,
-                                "existing_columns": existing_cols,
-                                "has_poly": True,
-                                "geometry_desc": "Polygon",
-                            })
                             continue
                         field_names = [f.name() for f in direct_lyr.fields()]
                         for feat in direct_lyr.getFeatures():
@@ -749,18 +707,6 @@ def load_gpkg_data(sources_str):
                     for t in poly_tables_sql:
                         cur.execute(f'PRAGMA table_info("{t}")')
                         cols = [r[1] for r in cur.fetchall()]
-                        is_valid_cols, missing_cols, existing_cols = validate_gpkg_columns(item, table_name=t)
-                        if not is_valid_cols:
-                            validation_errors.append({
-                                "source": f"{item}|layername={t}",
-                                "source_name": f"{os.path.basename(item)} ({t})",
-                                "is_valid": False,
-                                "missing_columns": missing_cols,
-                                "existing_columns": existing_cols,
-                                "has_poly": True,
-                                "geometry_desc": "Polygon",
-                            })
-                            continue
                         cur.execute(f'SELECT * FROM "{t}"')
                         for r in cur.fetchall():
                             d = dict(zip(cols, r))
@@ -776,9 +722,7 @@ def load_gpkg_data(sources_str):
                     pass
 
     if not all_rows:
-        empty_df = pd.DataFrame()
-        empty_df._validation_errors = validation_errors
-        return empty_df
+        return pd.DataFrame()
 
     df = pd.DataFrame(all_rows)
     if "eacount" not in df.columns:
@@ -790,239 +734,7 @@ def load_gpkg_data(sources_str):
             df[c] = df[c].apply(to_whole_number_str)
     df, summary = analyze_gpkg_consistency(df)
     df._consistency_summary = summary
-    df._validation_errors = validation_errors
     return df
-
-
-class GPKGAttributeValidationDialog(QDialog):
-    """
-    Detailed modal report displaying GeoPackage attribute table schema validation results,
-    highlighting missing required columns, present columns, and geometry compliance.
-    """
-    def __init__(self, parent, sources_str: Optional[str] = None, reports: Optional[List[Dict[str, Any]]] = None, errors: Optional[List[Dict[str, Any]]] = None):
-        super().__init__(parent)
-        self.sources_str = sources_str
-        if reports is not None:
-            self.reports = reports
-        elif errors is not None and errors:
-            self.reports = errors
-        elif sources_str:
-            self.reports = validate_all_gpkg_sources(sources_str)
-        else:
-            self.reports = []
-
-        self.setWindowTitle("EA GeoPackage Attribute Table Validation Report")
-        self.resize(880, 580)
-        self.setModal(True)
-        self._init_ui()
-
-    def _init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-
-        # Header banner
-        header = QFrame()
-        header.setStyleSheet("background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px;")
-        h_layout = QVBoxLayout(header)
-        h_layout.setContentsMargins(0, 0, 0, 0)
-        h_layout.setSpacing(4)
-
-        invalid_reports = [r for r in self.reports if not r.get("is_valid", False)]
-        total_reports = len(self.reports)
-
-        if invalid_reports:
-            badge_html = f"<span style='background:#fee2e2; color:#b91c1c; font-weight:bold; padding:3px 8px; border-radius:4px;'>VALIDATION FAILED: {len(invalid_reports)} INVALID</span>"
-            desc_html = f"Detected <b>{len(invalid_reports)}</b> of <b>{total_reports}</b> GeoPackage source(s) with missing required columns or invalid geometries."
-        else:
-            badge_html = "<span style='background:#dcfce7; color:#15803d; font-weight:bold; padding:3px 8px; border-radius:4px;'>PASSED: 100% SCHEMA COMPLIANT</span>"
-            desc_html = f"All <b>{total_reports}</b> GeoPackage source(s) contain all 17 required attribute columns and valid polygon geometries."
-
-        title_lbl = QLabel(f"<h3 style='margin:0; padding:0;'>GeoPackage Attribute Table Validation &nbsp; {badge_html}</h3>")
-        desc_lbl = QLabel(f"{desc_html}<br><span style='color:#64748b; font-size:11px;'>Required schema: 17 official columns &nbsp;|&nbsp; Polygon / MultiPolygon vector geometry</span>")
-        desc_lbl.setWordWrap(True)
-        h_layout.addWidget(title_lbl)
-        h_layout.addWidget(desc_lbl)
-        layout.addWidget(header)
-
-        # Schema reference box
-        ref_frame = QFrame()
-        ref_frame.setStyleSheet("background: #f1f5f9; border-left: 4px solid #0284c7; border-radius: 4px; padding: 8px;")
-        r_layout = QVBoxLayout(ref_frame)
-        r_layout.setContentsMargins(6, 4, 6, 4)
-        cols_formatted = ", ".join(f"<code>{c}</code>" for c in REQUIRED_GPKG_COLUMNS)
-        ref_text = QLabel(
-            f"<b>Standard Accepted Attribute Table Schema ({len(REQUIRED_GPKG_COLUMNS)} columns):</b><br>"
-            f"{cols_formatted}"
-        )
-        ref_text.setWordWrap(True)
-        ref_text.setStyleSheet("color: #0f172a; font-size: 11px;")
-        r_layout.addWidget(ref_text)
-        layout.addWidget(ref_frame)
-
-        # Validation Results Table
-        layout.addWidget(QLabel(f"<b>Inspected GeoPackage Layers & Files ({total_reports} source(s)):</b>"))
-
-        self.table = QTableWidget()
-        self.table.setAlternatingRowColors(True)
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["#", "Source / File Name", "Attribute Status", "Missing Columns", "Columns Found", "Geometry"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Interactive)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(total_reports)
-
-        for i, rep in enumerate(self.reports):
-            # 0: #
-            num_item = SmartTableWidgetItem(str(i + 1))
-            num_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(i, 0, num_item)
-
-            # 1: Source
-            src_name = rep.get("source_name") or os.path.basename(rep.get("source", f"Layer {i+1}"))
-            src_item = SmartTableWidgetItem(src_name)
-            f = src_item.font()
-            f.setBold(True)
-            src_item.setFont(f)
-            src_item.setToolTip(rep.get("source", src_name))
-            self.table.setItem(i, 1, src_item)
-
-            # 2: Status
-            is_valid = rep.get("is_valid", False)
-            missing = rep.get("missing_columns", [])
-            has_poly = rep.get("has_poly", True)
-
-            if not has_poly:
-                status_item = SmartTableWidgetItem("Non-Polygon")
-                status_item.setForeground(QColor("#d97706"))
-            elif is_valid:
-                status_item = SmartTableWidgetItem("Valid (17/17)")
-                status_item.setForeground(QColor("#059669"))
-            else:
-                status_item = SmartTableWidgetItem(f"Missing {len(missing)} Col(s)")
-                status_item.setForeground(QColor("#dc2626"))
-            status_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(i, 2, status_item)
-
-            # 3: Missing Columns
-            if missing:
-                missing_str = ", ".join(missing)
-                miss_item = SmartTableWidgetItem(missing_str)
-                miss_item.setForeground(QColor("#dc2626"))
-                miss_item.setToolTip(f"Missing: {missing_str}")
-            else:
-                miss_item = SmartTableWidgetItem("None (All required columns present)")
-                miss_item.setForeground(QColor("#059669"))
-            self.table.setItem(i, 3, miss_item)
-
-            # 4: Columns Count
-            cnt_str = f"{len(rep.get('matched_columns', {})) or (len(REQUIRED_GPKG_COLUMNS) - len(missing))} / {len(REQUIRED_GPKG_COLUMNS)}"
-            cnt_item = SmartTableWidgetItem(cnt_str)
-            cnt_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(i, 4, cnt_item)
-
-            # 5: Geometry
-            geom_str = rep.get("geometry_desc", "Polygon" if has_poly else "Non-Polygon")
-            geom_item = SmartTableWidgetItem(geom_str)
-            geom_item.setTextAlignment(Qt.AlignCenter)
-            geom_item.setForeground(QColor("#059669") if has_poly else QColor("#d97706"))
-            self.table.setItem(i, 5, geom_item)
-
-        self.table.setColumnWidth(1, 240)
-        self.table.itemSelectionChanged.connect(self._on_row_selected)
-        layout.addWidget(self.table, 1)
-
-        # Details box for selected source
-        details_box = QGroupBox("Selected Source Column Breakdown")
-        det_layout = QHBoxLayout(details_box)
-        det_layout.setContentsMargins(8, 8, 8, 8)
-        det_layout.setSpacing(12)
-
-        self.txt_missing_details = QTextEdit()
-        self.txt_missing_details.setReadOnly(True)
-        self.txt_missing_details.setStyleSheet("background: #fff5f5; color: #991b1b; font-size: 11px; border: 1px solid #fed7d7; border-radius: 4px;")
-        self.txt_missing_details.setPlaceholderText("Select a row above to see missing columns...")
-
-        self.txt_existing_details = QTextEdit()
-        self.txt_existing_details.setReadOnly(True)
-        self.txt_existing_details.setStyleSheet("background: #f8fafc; color: #334155; font-size: 11px; border: 1px solid #e2e8f0; border-radius: 4px;")
-        self.txt_existing_details.setPlaceholderText("Select a row above to see found columns...")
-
-        left_v = QVBoxLayout()
-        left_v.addWidget(QLabel("<b style='color:#dc2626;'>Missing Required Columns:</b>"))
-        left_v.addWidget(self.txt_missing_details)
-
-        right_v = QVBoxLayout()
-        right_v.addWidget(QLabel("<b style='color:#0f172a;'>Columns Present in Source:</b>"))
-        right_v.addWidget(self.txt_existing_details)
-
-        det_layout.addLayout(left_v, 1)
-        det_layout.addLayout(right_v, 1)
-        layout.addWidget(details_box)
-
-        # Action Buttons
-        btn_layout = QHBoxLayout()
-        btn_copy = QPushButton("Copy Missing Columns")
-        btn_copy.setObjectName("secondaryBtn")
-        btn_copy.clicked.connect(self._copy_missing_to_clipboard)
-        btn_layout.addWidget(btn_copy)
-
-        btn_layout.addStretch()
-
-        btn_close = QPushButton("Close")
-        btn_close.setObjectName("primaryBtn")
-        btn_close.clicked.connect(self.accept)
-        btn_layout.addWidget(btn_close)
-        layout.addLayout(btn_layout)
-
-        if total_reports > 0:
-            self.table.selectRow(0)
-
-    def _on_row_selected(self):
-        sel = self.table.selectionModel().selectedRows()
-        if not sel:
-            return
-        row = sel[0].row()
-        if 0 <= row < len(self.reports):
-            rep = self.reports[row]
-            missing = rep.get("missing_columns", [])
-            existing = rep.get("existing_columns", [])
-            
-            if missing:
-                self.txt_missing_details.setHtml(
-                    "<p style='margin:0 0 6px 0; color:#dc2626;'><b>The following required columns were NOT found:</b></p>"
-                    + "<br>".join(f"• <b>{c}</b>" for c in missing)
-                )
-            else:
-                self.txt_missing_details.setHtml(
-                    "<p style='color:#15803d;'><b>All 17 required columns are present in this layer!</b></p>"
-                )
-
-            if existing:
-                self.txt_existing_details.setHtml(
-                    f"<p style='margin:0 0 6px 0; color:#334155;'><b>Found {len(existing)} column(s) in source:</b></p>"
-                    + "<br>".join(f"• {c}" for c in existing)
-                )
-            else:
-                self.txt_existing_details.setHtml("<span style='color:#64748b;'>No columns detected.</span>")
-
-    def _copy_missing_to_clipboard(self):
-        all_missing = []
-        for rep in self.reports:
-            m = rep.get("missing_columns", [])
-            if m:
-                src = rep.get("source_name") or os.path.basename(rep.get("source", "Unknown"))
-                all_missing.append(f"{src}: {', '.join(m)}")
-        if all_missing:
-            text = "\n".join(all_missing)
-            QApplication.clipboard().setText(text)
-            QMessageBox.information(self, "Copied", f"Copied missing columns for {len(all_missing)} source(s) to clipboard.")
-        else:
-            QMessageBox.information(self, "Copied", "No missing columns to copy — all inspected layers are valid!")
 
 
 class GPKGConsistencyDialog(QDialog):
@@ -5162,12 +4874,6 @@ class COProcessingDialog(QDialog):
         btn_project_layers.clicked.connect(self._detect_project_layers_preview)
         file_layout.addWidget(btn_project_layers)
 
-        btn_validate_schema = QPushButton("Validate Schema")
-        btn_validate_schema.setObjectName("secondaryBtn")
-        btn_validate_schema.setToolTip("Validate attribute table columns of the selected GeoPackage(s) against required schema")
-        btn_validate_schema.clicked.connect(self._validate_gpkg_schema_action)
-        file_layout.addWidget(btn_validate_schema)
-
         btn_load_gpkg = QPushButton("Load GPKG Preview")
         btn_load_gpkg.setObjectName("actionBtn")
         btn_load_gpkg.clicked.connect(self._load_gpkg_preview)
@@ -8328,18 +8034,6 @@ class COProcessingDialog(QDialog):
         # 3. Fallback to default GPKG root directory
         return DEFAULT_GPKG_ROOT
 
-    def _validate_gpkg_schema_action(self):
-        sources_str = self.txt_gpkg_preview_layers.text().strip() or self.txt_gpkg_layers.text().strip()
-        if not sources_str:
-            QMessageBox.information(
-                self,
-                "No GeoPackage Selected",
-                "Please select or specify GeoPackage file(s) or project layer(s) first before running schema validation."
-            )
-            return
-        dlg = GPKGAttributeValidationDialog(self, sources_str=sources_str)
-        dlg.exec_()
-
     def _browse_gpkg_preview(self):
         init_dir = self._get_initial_gpkg_dir() or DEFAULT_GPKG_ROOT
         files, _ = QFileDialog.getOpenFileNames(
@@ -8348,20 +8042,14 @@ class COProcessingDialog(QDialog):
         if files:
             valid_poly = []
             non_poly = []
-            invalid_schema = []
-
             for f in files:
                 has_poly, _, _ = get_gpkg_polygon_layer_info(f)
-                if not has_poly:
-                    non_poly.append(f)
-                    continue
-                is_valid_cols, missing_cols, _ = validate_gpkg_columns(f)
-                if not is_valid_cols:
-                    invalid_schema.append((f, missing_cols))
-                else:
+                if has_poly:
                     valid_poly.append(f)
+                else:
+                    non_poly.append(f)
 
-            if non_poly and not valid_poly and not invalid_schema:
+            if non_poly and not valid_poly:
                 QMessageBox.warning(
                     self,
                     "Invalid Geometry Type",
@@ -8369,34 +8057,7 @@ class COProcessingDialog(QDialog):
                     "Only polygon vector layers can be loaded."
                 )
                 return
-
-            if invalid_schema:
-                missing_msg = "\n".join(
-                    f"• {os.path.basename(fpath)}: Missing {', '.join(m_cols[:5])}{'...' if len(m_cols) > 5 else ''}"
-                    for fpath, m_cols in invalid_schema[:5]
-                )
-                if not valid_poly:
-                    QMessageBox.warning(
-                        self,
-                        "Invalid Attribute Table",
-                        f"The selected GeoPackage file(s) have invalid attribute tables (missing required columns):\n\n"
-                        f"{missing_msg}\n\n"
-                        f"Expected required columns: {', '.join(REQUIRED_GPKG_COLUMNS[:6])}..."
-                    )
-                    # Show detailed validation report
-                    dlg = GPKGAttributeValidationDialog(self, sources_str=";".join(f for f, _ in invalid_schema))
-                    dlg.exec_()
-                    return
-                else:
-                    QMessageBox.warning(
-                        self,
-                        "Some GeoPackages Excluded",
-                        f"{len(invalid_schema)} file(s) were excluded because of missing attribute columns:\n\n"
-                        f"{missing_msg}\n\n"
-                        f"{len(valid_poly)} valid polygon file(s) will be loaded."
-                    )
-
-            if non_poly:
+            elif non_poly:
                 QMessageBox.warning(
                     self,
                     "Non-Polygon Layers Excluded",
@@ -8464,53 +8125,18 @@ class COProcessingDialog(QDialog):
 
     def _detect_project_layers_preview(self):
         layers = [lyr for lyr in QgsProject.instance().mapLayers().values() if isinstance(lyr, QgsVectorLayer) and lyr.isValid() and is_polygon_layer(lyr)]
-        if not layers:
+        if layers:
+            p_str = ";".join([lyr.name() for lyr in layers])
+            self.txt_gpkg_preview_layers.setText(p_str)
+            self.txt_gpkg_layers.setText(p_str)
+            self._load_gpkg_preview()
+        else:
             QMessageBox.information(
                 self,
                 "No Polygon Layers",
                 "No valid polygon vector layers (EA boundaries) were found in the current QGIS project.\n\n"
                 "Only polygon/multipolygon vector layers can be previewed or processed."
             )
-            return
-
-        valid_poly = []
-        invalid_schema = []
-        for lyr in layers:
-            is_valid_cols, missing_cols, _ = validate_gpkg_columns(lyr)
-            if not is_valid_cols:
-                invalid_schema.append((lyr.name(), missing_cols))
-            else:
-                valid_poly.append(lyr.name())
-
-        if invalid_schema:
-            missing_msg = "\n".join(
-                f"• {name}: Missing {', '.join(m_cols[:5])}{'...' if len(m_cols) > 5 else ''}"
-                for name, m_cols in invalid_schema[:5]
-            )
-            if not valid_poly:
-                QMessageBox.warning(
-                    self,
-                    "Invalid Attribute Table",
-                    f"All detected project layers have invalid attribute tables (missing required columns):\n\n"
-                    f"{missing_msg}\n\n"
-                    f"Expected required columns: {', '.join(REQUIRED_GPKG_COLUMNS[:6])}..."
-                )
-                dlg = GPKGAttributeValidationDialog(self, sources_str=";".join(n for n, _ in invalid_schema))
-                dlg.exec_()
-                return
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Some Layers Excluded",
-                    f"{len(invalid_schema)} project layer(s) were excluded due to missing columns:\n\n"
-                    f"{missing_msg}\n\n"
-                    f"{len(valid_poly)} valid layer(s) will be loaded."
-                )
-
-        p_str = ";".join(valid_poly)
-        self.txt_gpkg_preview_layers.setText(p_str)
-        self.txt_gpkg_layers.setText(p_str)
-        self._load_gpkg_preview()
 
     def _load_gpkg_preview(self):
         sources_str = self.txt_gpkg_preview_layers.text().strip() or self.txt_gpkg_layers.text().strip()
@@ -8534,25 +8160,6 @@ class COProcessingDialog(QDialog):
         except Exception as e:
             self.lbl_gpkg_table_info.setText(f"Error loading GeoPackage: {e}")
             self.gpkg_df = pd.DataFrame()
-
-        val_errors = getattr(self.gpkg_df, "_validation_errors", [])
-        if val_errors:
-            if self.gpkg_df.empty:
-                self.lbl_gpkg_table_info.setText(
-                    f"<span style='color:#dc2626; font-weight:600;'>"
-                    f"Attribute validation failed: {len(val_errors)} source(s) missing required columns."
-                    f"</span>"
-                )
-                dlg = GPKGAttributeValidationDialog(self, sources_str=sources_str, reports=val_errors)
-                dlg.exec_()
-            else:
-                self.lbl_gpkg_table_info.setText(
-                    f"<span style='color:#ea580c; font-weight:600;'>"
-                    f"Loaded {len(self.gpkg_df):,} features. Notice: {len(val_errors)} file(s) excluded due to missing columns."
-                    f"</span>"
-                )
-                dlg = GPKGAttributeValidationDialog(self, sources_str=sources_str, reports=val_errors)
-                dlg.exec_()
 
         self._update_gpkg_kpis()
         self.gpkg_page = 0
@@ -9436,19 +9043,14 @@ class COProcessingDialog(QDialog):
         if files:
             valid_poly = []
             non_poly = []
-            invalid_schema = []
             for f in files:
                 has_poly, _, _ = get_gpkg_polygon_layer_info(f)
-                if not has_poly:
-                    non_poly.append(f)
-                    continue
-                is_valid_cols, missing_cols, _ = validate_gpkg_columns(f)
-                if not is_valid_cols:
-                    invalid_schema.append((f, missing_cols))
-                else:
+                if has_poly:
                     valid_poly.append(f)
+                else:
+                    non_poly.append(f)
 
-            if non_poly and not valid_poly and not invalid_schema:
+            if non_poly and not valid_poly:
                 QMessageBox.warning(
                     self,
                     "Invalid Geometry Type",
@@ -9456,33 +9058,7 @@ class COProcessingDialog(QDialog):
                     "Only polygon vector layers can be processed."
                 )
                 return
-
-            if invalid_schema:
-                missing_msg = "\n".join(
-                    f"• {os.path.basename(fpath)}: Missing {', '.join(m_cols[:5])}{'...' if len(m_cols) > 5 else ''}"
-                    for fpath, m_cols in invalid_schema[:5]
-                )
-                if not valid_poly:
-                    QMessageBox.warning(
-                        self,
-                        "Invalid Attribute Table",
-                        f"The selected GeoPackage file(s) have invalid attribute tables (missing required columns):\n\n"
-                        f"{missing_msg}\n\n"
-                        f"Expected required columns: {', '.join(REQUIRED_GPKG_COLUMNS[:6])}..."
-                    )
-                    dlg = GPKGAttributeValidationDialog(self, sources_str=";".join(f for f, _ in invalid_schema))
-                    dlg.exec_()
-                    return
-                else:
-                    QMessageBox.warning(
-                        self,
-                        "Some GeoPackages Excluded",
-                        f"{len(invalid_schema)} file(s) were excluded because of missing attribute columns:\n\n"
-                        f"{missing_msg}\n\n"
-                        f"{len(valid_poly)} valid polygon file(s) will be loaded."
-                    )
-
-            if non_poly:
+            elif non_poly:
                 QMessageBox.warning(
                     self,
                     "Non-Polygon Layers Excluded",
@@ -9496,53 +9072,18 @@ class COProcessingDialog(QDialog):
 
     def _detect_project_layers(self):
         layers = [lyr for lyr in QgsProject.instance().mapLayers().values() if isinstance(lyr, QgsVectorLayer) and lyr.isValid() and is_polygon_layer(lyr)]
-        if not layers:
+        if layers:
+            p_str = ";".join([lyr.name() for lyr in layers])
+            self.txt_gpkg_layers.setText(p_str)
+            self.txt_gpkg_preview_layers.setText(p_str)
+            self.console_log.append(f"<span style='color:#059669;'>Selected {len(layers)} active polygon vector layers from QGIS project.</span>")
+        else:
             QMessageBox.information(
                 self,
                 "No Polygon Layers",
                 "No valid polygon vector layers (EA boundaries) were found in the current QGIS project.\n\n"
                 "Only polygon/multipolygon vector layers can be processed."
             )
-            return
-
-        valid_poly = []
-        invalid_schema = []
-        for lyr in layers:
-            is_valid_cols, missing_cols, _ = validate_gpkg_columns(lyr)
-            if not is_valid_cols:
-                invalid_schema.append((lyr.name(), missing_cols))
-            else:
-                valid_poly.append(lyr.name())
-
-        if invalid_schema:
-            missing_msg = "\n".join(
-                f"• {name}: Missing {', '.join(m_cols[:5])}{'...' if len(m_cols) > 5 else ''}"
-                for name, m_cols in invalid_schema[:5]
-            )
-            if not valid_poly:
-                QMessageBox.warning(
-                    self,
-                    "Invalid Attribute Table",
-                    f"All detected project layers have invalid attribute tables (missing required columns):\n\n"
-                    f"{missing_msg}\n\n"
-                    f"Expected required columns: {', '.join(REQUIRED_GPKG_COLUMNS[:6])}..."
-                )
-                dlg = GPKGAttributeValidationDialog(self, sources_str=";".join(n for n, _ in invalid_schema))
-                dlg.exec_()
-                return
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Some Layers Excluded",
-                    f"{len(invalid_schema)} project layer(s) were excluded due to missing columns:\n\n"
-                    f"{missing_msg}\n\n"
-                    f"{len(valid_poly)} valid layer(s) will be loaded."
-                )
-
-        p_str = ";".join(valid_poly)
-        self.txt_gpkg_layers.setText(p_str)
-        self.txt_gpkg_preview_layers.setText(p_str)
-        self.console_log.append(f"<span style='color:#059669;'>Selected {len(valid_poly)} valid polygon vector layer(s) from QGIS project.</span>")
 
     def _browse_earf_files(self):
         init_dir = self._get_initial_earf_dir() or DEFAULT_EARF_ROOT
@@ -9595,23 +9136,6 @@ class COProcessingDialog(QDialog):
 
         if not gpkg_layers_str:
             QMessageBox.warning(self, "Input Error", "Please select at least one Processed EA GeoPackage layer.")
-            self.tabs.setCurrentIndex(self.tabs.indexOf(self.post_processing_tab))
-            return
-
-        # Validate GeoPackage attribute table schema before starting matching
-        gpkg_val_reports = validate_all_gpkg_sources(gpkg_layers_str)
-        invalid_gpkgs = [r for r in gpkg_val_reports if not r.get("is_valid", False)]
-        if invalid_gpkgs:
-            dlg = GPKGAttributeValidationDialog(self, reports=gpkg_val_reports)
-            dlg.exec_()
-            QMessageBox.warning(
-                self,
-                "Attribute Table Validation Failed",
-                f"Cannot proceed with Geocode Matching.\n\n"
-                f"{len(invalid_gpkgs)} of {len(gpkg_val_reports)} GeoPackage layer(s) have invalid attribute tables "
-                f"or are missing required columns.\n\n"
-                f"Please inspect the validation report and ensure the input GeoPackage contains all required columns."
-            )
             self.tabs.setCurrentIndex(self.tabs.indexOf(self.post_processing_tab))
             return
 
