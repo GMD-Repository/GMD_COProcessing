@@ -1,3 +1,23 @@
+# =====================================================================================
+# EA vs Barangay Check (GMD CO Processing > EA Tools)
+# Timestamp : 2026-11-23 14:34 (Asia/Manila, UTC+08:00)
+# Version   : 1.1.0
+#
+# Changelog (oldest to newest)
+#   1.0.0  Baseline as supplied: EA vs BGY / BGY vs BGY / EA vs EA checks, snapping of selected
+#          discrepancies, Undo Last Snap, Duplicate Geometry Fixer tab, Help tab.
+#   1.1.0  2026-11-23  Fix: snapping one EA no longer creates new overlaps / gaps with its neighbours.
+#          - snapped_geometry(): cut / added pieces are snapped onto the EA before the overlay, and the
+#            0.1 mm / 1 mm / 1 cm grid fallbacks no longer move the EA's untouched vertices
+#            (new restore_vertices()). Before, a grid fallback rounded every vertex of the EA, including
+#            the edges shared with its neighbours, so an EA vs EA scan after a snap found new
+#            overlaps / gaps along edges that were never edited.
+#          - to_layer_geometry(): the feature's own vertices keep their exact layer-CRS coordinates
+#            (new layer_xy()); only the new vertices at the cut are converted lat/lon -> layer CRS, so a
+#            datum round trip (e.g. PRS92 <-> WGS84) cannot nudge shared edges either.
+#          - to_layer_geometry(): the repair no longer snaps the whole feature to a grid; if the new
+#            shape cannot be made valid the row is marked Failed and the feature is left untouched.
+# =====================================================================================
 r"""
 EA vs Barangay boundary check (QGIS), with three check modes chosen in the window:
 
@@ -77,6 +97,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 import pyogrio
 import shapely
@@ -89,6 +110,8 @@ MIN_AREA_SQM = 0.1  # fixed: differences smaller than this are slivers and ignor
 TOUCH_TOL_M = 1.0   # a gap within this distance of an EA counts as bordering that EA
 MIN_OWNER_SHARE = 0.3  # a gap is added to one EA only if that EA has at least this share of its EA border
 GRID_DEG = 1e-9     # fallback precision grid (~0.1 mm) when an exact snap gives an invalid geometry
+SNAP_TOL_DEG = 2e-9  # cut / added pieces are snapped onto the EA within this distance (~0.2 mm) before the overlay
+KEEP_VERTEX_TOL_DEG = 1e-10  # a vertex this close (~0.01 mm) to one of the feature's own keeps that exact position
 
 # Layer-name patterns used, after the fields, to autodetect the layers in the panel.
 BGY_LAYER_HINT = r"bgy|barangay"
@@ -716,19 +739,44 @@ def drop_specks(geom, min_area):
     return polys[0] if len(polys) == 1 else MultiPolygon(polys)
 
 
+def restore_vertices(new, original, tol):
+    """Put every vertex of `new` that lies within `tol` of a vertex of `original` back on that vertex exactly.
+
+    A grid overlay rounds every coordinate of the EA, including the vertices along edges it shares with its
+    neighbours. Those neighbours are not edited, so a moved shared vertex leaves a hairline overlap / gap
+    between the two features. This undoes that: only genuinely new vertices (where the cut or the added land
+    meets the old outline) keep their grid position.
+    """
+    old_xy, new_xy = shapely.get_coordinates(original), shapely.get_coordinates(new)
+    if not len(old_xy) or not len(new_xy):
+        return new
+    tree = shapely.STRtree(shapely.points(old_xy))
+    hit = tree.query_nearest(shapely.points(new_xy), max_distance=tol, return_distance=False, all_matches=False)
+    if not hit.shape[1]:
+        return new
+    new_xy = new_xy.copy()
+    new_xy[hit[0]] = old_xy[hit[1]]
+    return shapely.set_coordinates(new, new_xy)
+
+
 def snapped_geometry(geom, cuts, adds, min_area):
     """The EA after cutting off `cuts` and adding `adds`: (geometry, None), or (None, why it failed).
 
-    The exact overlay keeps the EA's own vertices. Its result is rejected if it is invalid or has
-    near-zero-width spikes (a vertex almost on another edge): those are valid in lat/lon by a hair but
-    break when converted to the layer's CRS or edited. The overlay is then redone on a 0.1 mm, 1 mm and
-    1 cm grid, which merges such vertices; the first sturdy result (or else the sturdiest) is used.
+    Only the edge being fixed may change: every other vertex of the EA is kept bit-for-bit, because the
+    neighbouring EAs share those vertices and are not edited. The cut / added pieces are first snapped onto
+    the EA (they were found on a 0.1 mm grid, so their edges can miss the EA's own edge by a hair, which
+    would leave near-zero-width spikes). The exact overlay keeps the EA's vertices; if its result is invalid
+    or has such spikes (a vertex almost on another edge), the overlay is redone on a 0.1 mm, 1 mm and 1 cm
+    grid, which merges them, and the EA's own vertices are put back afterwards (restore_vertices). The first
+    sturdy result (or else the sturdiest) is used.
     """
     # Clearance = how far a vertex can move before the polygon becomes invalid. The result should not be
     # more fragile than the EA already was, nor below 1 mm.
     needed = min(10 * GRID_DEG, shapely.minimum_clearance(geom) * 0.999)
     reason = "invalid"
     best, best_clearance = None, -1.0
+    cuts = [shapely.snap(c, geom, SNAP_TOL_DEG) for c in cuts]
+    adds = [shapely.snap(a, geom, SNAP_TOL_DEG) for a in adds]
     for grid in (None, GRID_DEG, 10 * GRID_DEG, 100 * GRID_DEG):
         try:
             g = geom
@@ -749,6 +797,8 @@ def snapped_geometry(geom, cuts, adds, min_area):
             reason = "empty"
             continue
         g = drop_specks(g, min_area)
+        if grid is not None and not g.is_empty:
+            g = restore_vertices(g, geom, 1.5 * grid)  # the grid must not move the EA's untouched vertices
         if g.is_valid and not g.is_empty:
             clearance = shapely.minimum_clearance(g)
             if clearance >= needed:
@@ -762,24 +812,72 @@ def snapped_geometry(geom, cuts, adds, min_area):
     return None, reason
 
 
-def to_layer_geometry(geom, ea_layer):
-    """Shapely geometry (lat/lon) -> valid QgsGeometry in the EA layer's CRS and geometry type, or (None, why)."""
-    from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry, QgsProject,
-                           QgsWkbTypes)
+def layer_xy(geom, original_latlon, original_layer, convert):
+    """x / y of every vertex of the lat/lon geometry `geom` in the layer's CRS, as an (n, 2) array.
 
-    g = QgsGeometry()
-    g.fromWkb(shapely.to_wkb(shapely.force_2d(geom)))
+    A vertex that is one of the feature's own (the lat/lon copy of an original vertex, matched within
+    KEEP_VERTEX_TOL_DEG) gets that original layer coordinate back untouched, so converting lat/lon -> layer CRS
+    cannot nudge the edges shared with neighbouring features (the round trip is not exact for datum
+    shifts, e.g. PRS92 <-> WGS84). Only new vertices (where the cut / added land meets the outline) are
+    converted, with convert((lon, lat)) -> (x, y).
+    """
+    xy = shapely.get_coordinates(geom)
+    out = np.empty_like(xy)
+    done = np.zeros(len(xy), dtype=bool)
+    if len(original_latlon) and len(xy):
+        tree = shapely.STRtree(shapely.points(original_latlon))
+        hit = tree.query_nearest(shapely.points(xy), max_distance=KEEP_VERTEX_TOL_DEG, return_distance=False,
+                                 all_matches=False)
+        out[hit[0]] = original_layer[hit[1]]
+        done[hit[0]] = True
+    for i in np.flatnonzero(~done):
+        out[i] = convert(xy[i])
+    return out
+
+
+def to_layer_geometry(geom, ea_layer, original=None):
+    """Shapely geometry (lat/lon) -> valid QgsGeometry in the EA layer's CRS and geometry type, or (None, why).
+
+    `original` is the feature's current QgsGeometry in the layer's CRS: its vertices are kept exactly as they
+    are (see layer_xy), so only the edge that was fixed changes.
+    """
+    from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry, QgsPointXY,
+                           QgsProject, QgsWkbTypes)
+
     crs = ea_layer.crs()
+    geom = shapely.force_2d(geom)
     if crs.isValid() and crs.authid() != DATA_CRS:
-        g.transform(QgsCoordinateTransform(QgsCoordinateReferenceSystem(DATA_CRS), crs, QgsProject.instance()))
+        wgs = QgsCoordinateReferenceSystem(DATA_CRS)
+        forward = QgsCoordinateTransform(wgs, crs, QgsProject.instance())
+
+        def convert(p):
+            q = forward.transform(QgsPointXY(float(p[0]), float(p[1])))
+            return q.x(), q.y()
+
+        if original is not None and not original.isNull():
+            # Same transform that layer_to_gdf used to read the layer, so the copies match exactly.
+            backward = QgsCoordinateTransform(crs, wgs, QgsProject.instance())
+            own = np.array([(p.x(), p.y()) for p in original.vertices()], dtype=float).reshape(-1, 2)
+            own_latlon = np.array([(q.x(), q.y()) for q in
+                                   (backward.transform(QgsPointXY(float(x), float(y))) for x, y in own)],
+                                  dtype=float).reshape(-1, 2)
+            geom = shapely.set_coordinates(geom, layer_xy(geom, own_latlon, own, convert))
+        else:
+            geom = shapely.set_coordinates(geom, np.array([convert(p) for p in shapely.get_coordinates(geom)],
+                                                          dtype=float).reshape(-1, 2))
+    g = QgsGeometry()
+    g.fromWkb(shapely.to_wkb(geom))
     if g.isNull() or g.isEmpty():
         return None, "it is empty in the EA layer's CRS"
 
     if not g.isGeosValid():
-        # Converting coordinates can leave near-duplicate vertices or hairline self-touches: try to repair
-        # them, and accept a repair only if it is valid polygon geometry with the same area.
-        grid = 1e-9 if crs.isGeographic() else 1e-4
-        candidates = [g.snappedToGrid(grid, grid), g.makeValid()]
+        # Converting the new vertices can leave near-duplicate vertices or hairline self-touches: try to repair
+        # them, and accept a repair only if it is valid polygon geometry with the same area. The repairs only
+        # touch the broken spot: snapping the whole feature to a grid is not used, because it would move the
+        # edges shared with the neighbouring features and leave hairline overlaps / gaps between them.
+        deduped = QgsGeometry(g)
+        deduped.removeDuplicateNodes(1e-12)
+        candidates = [g.makeValid(), deduped]
         fixed = None
         for c in candidates:
             if c is None or c.isNull() or c.isEmpty():
@@ -792,7 +890,8 @@ def to_layer_geometry(geom, ea_layer):
                 fixed = c
                 break
         if fixed is None:
-            return None, "it becomes invalid when converted to the EA layer's CRS"
+            return None, ("it becomes invalid when converted to the EA layer's CRS (left untouched rather than "
+                          "moving the edges it shares with its neighbours). Fix it by hand")
         g = fixed
 
     if QgsWkbTypes.isMultiType(ea_layer.wkbType()):
@@ -924,7 +1023,7 @@ def snap_rows(scan, rows):
             scan.needs_multi.setdefault(layer_id, []).extend(ea_rows)
             continue
 
-        geom, why = to_layer_geometry(new, ea_layer)
+        geom, why = to_layer_geometry(new, ea_layer, feature.geometry())
         if geom is None:
             fail(why)
             continue
