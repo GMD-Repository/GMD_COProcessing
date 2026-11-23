@@ -83,7 +83,7 @@ try:
     )
     from ..db.database import (
         POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder, find_popcen_files_in_folder,
-        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
+        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, is_valid_mun_name, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
     )
 except (ImportError, ValueError):
     from algorithm import (
@@ -97,7 +97,7 @@ except (ImportError, ValueError):
     )
     from database import (
         POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder, find_popcen_files_in_folder,
-        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
+        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, is_valid_mun_name, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
     )
 
 if "DEFAULT_GPKG_ROOT" not in globals():
@@ -1743,6 +1743,9 @@ class DeliverablesExportWorker(QThread):
 
             c_code = task.get("city_mun", "")
             m_name = task.get("mun_name", c_code)
+            if not is_valid_mun_name(m_name):
+                h = self.db.get_citymun_hierarchy(c_code)
+                m_name = h.get("city_mun") or f"City/Mun {c_code}"
             out_gpkg = task.get("out_gpkg_path", "")
             out_excel = task.get("out_excel_path", "")
             out_mis = task.get("out_mis_path", "")
@@ -1760,7 +1763,10 @@ class DeliverablesExportWorker(QThread):
                 if self._is_cancelled:
                     return False
                 overall = int(base_pct + (sub_pct / 100.0) * (task_slice * 0.40))
-                self.progress_signal.emit(min(overall, 99), f"[{t_idx+1}/{total_tasks}] {m_name}: {msg}")
+                self.progress_signal.emit(
+                    min(overall, 99),
+                    f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): {msg}"
+                )
                 return True
 
             task_res = {
@@ -3503,6 +3509,10 @@ class COProcessingDialog(QDialog):
         if hasattr(self, "export_progress_dlg") and self.export_progress_dlg:
             self.export_progress_dlg.setValue(pct)
             self.export_progress_dlg.setLabelText(msg)
+            # Dynamically state the City/Municipality in the progress dialog window title
+            if "Exporting " in msg and ":" in msg:
+                cm_title = msg.split(":")[0].strip()
+                self.export_progress_dlg.setWindowTitle(f"Exporting Final Deliverables - {cm_title}")
         if hasattr(self, "btn_export_match_gpkg") and self.btn_export_match_gpkg:
             self.btn_export_match_gpkg.setText(f"Exporting {pct}%...")
 
@@ -3642,15 +3652,30 @@ class COProcessingDialog(QDialog):
         if hasattr(self, "btn_mon_export_now") and self.btn_mon_export_now:
             self.btn_mon_export_now.setEnabled(False)
 
+        # Determine initial title / label stating the specific City/Municipality being exported
+        first_task = tasks[0]
+        first_code = first_task.get("city_mun", "")
+        first_mun = first_task.get("mun_name") or first_code or "City/Municipality"
+        if not is_valid_mun_name(first_mun):
+            h = self.db.get_citymun_hierarchy(first_code)
+            first_mun = h.get("city_mun") or f"City/Mun {first_code}"
+
+        if len(tasks) == 1:
+            init_title = f"Exporting Final Deliverables - {first_mun} ({first_code})" if first_code else f"Exporting Final Deliverables - {first_mun}"
+            init_label = f"Exporting {first_mun} ({first_code}): Initializing deliverables export..."
+        else:
+            init_title = f"Exporting Final Deliverables [{len(tasks)} City/Municipalities]"
+            init_label = f"[1/{len(tasks)}] Exporting {first_mun} ({first_code}): Initializing deliverables export..."
+
         # Create responsive progress dialog
         self.export_progress_dlg = QProgressDialog(
-            "Initializing deliverables export...",
+            init_label,
             "Cancel",
             0,
             100,
             self
         )
-        self.export_progress_dlg.setWindowTitle("Exporting Final Deliverables")
+        self.export_progress_dlg.setWindowTitle(init_title)
         self.export_progress_dlg.setWindowModality(Qt.WindowModal)
         self.export_progress_dlg.setMinimumDuration(0)
         self.export_progress_dlg.setValue(0)
@@ -3711,7 +3736,15 @@ class COProcessingDialog(QDialog):
             os.makedirs(target_folder, exist_ok=True)
             self.txt_match_export_dir.setText(target_folder)
 
-            mun_name = hier.get("city_mun") or cm.currentText()
+            mun_name = hier.get("city_mun")
+            if not is_valid_mun_name(mun_name):
+                cm_txt = cm.currentText()
+                if " - " in cm_txt:
+                    cm_txt = cm_txt.split(" - ", 1)[1]
+                if is_valid_mun_name(cm_txt):
+                    mun_name = cm_txt
+                else:
+                    mun_name = f"City/Mun {selected_cm}"
             clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
             clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
             if not clean_cm:
@@ -3791,7 +3824,9 @@ class COProcessingDialog(QDialog):
                 if not target_folder:
                     target_folder = export_dir if os.path.exists(export_dir) else root_dir
                 os.makedirs(target_folder, exist_ok=True)
-                m_name = hier.get("city_mun") or cm_item["name"]
+                m_name = hier.get("city_mun") or cm_item.get("name")
+                if not is_valid_mun_name(m_name):
+                    m_name = f"City/Mun {c_code}"
                 clean_cm = re.sub(r'\s*\([^)]*\)', '', m_name)
                 clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
                 if not clean_cm:
@@ -3841,7 +3876,15 @@ class COProcessingDialog(QDialog):
                 target_folder = export_dir if (export_dir and os.path.exists(export_dir)) else root_dir
             os.makedirs(target_folder, exist_ok=True)
 
-            mun_name = hier.get("city_mun") or cm.currentText()
+            mun_name = hier.get("city_mun")
+            if not is_valid_mun_name(mun_name):
+                cm_txt = cm.currentText()
+                if " - " in cm_txt:
+                    cm_txt = cm_txt.split(" - ", 1)[1]
+                if is_valid_mun_name(cm_txt):
+                    mun_name = cm_txt
+                else:
+                    mun_name = f"City/Mun {selected_cm}"
             clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
             clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
             if not clean_cm:
@@ -3924,7 +3967,9 @@ class COProcessingDialog(QDialog):
                     target_folder = export_dir if (export_dir and os.path.exists(export_dir)) else root_dir
                 os.makedirs(target_folder, exist_ok=True)
 
-                m_name = hier.get("city_mun") or cm_item["name"]
+                m_name = hier.get("city_mun") or cm_item.get("name")
+                if not is_valid_mun_name(m_name):
+                    m_name = f"City/Mun {c_code}"
                 clean_cm = re.sub(r'\s*\([^)]*\)', '', m_name)
                 clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
                 if not clean_cm:
@@ -10047,7 +10092,9 @@ class COProcessingDialog(QDialog):
             target_folder = root_dir
         os.makedirs(target_folder, exist_ok=True)
 
-        mun_name = hier.get("city_mun") or city_mun_code
+        mun_name = hier.get("city_mun")
+        if not is_valid_mun_name(mun_name):
+            mun_name = f"City/Mun {city_mun_code}"
         clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
         clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
         if not clean_cm:

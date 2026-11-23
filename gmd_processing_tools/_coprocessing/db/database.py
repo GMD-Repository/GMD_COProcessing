@@ -180,6 +180,24 @@ def _clean_hier_name(s: str) -> str:
     return re.sub(r'[^a-zA-Z0-9]', '', str(s or '').lower())
 
 
+def is_valid_mun_name(name: Optional[str]) -> bool:
+    """
+    Validates whether a candidate string is an actual municipality or city name,
+    rather than an Enumeration Area (EA) label, numeric code, or empty placeholder.
+    """
+    if not name:
+        return False
+    s = str(name).strip()
+    if not s or s.lower() in ("nan", "none", "null", "undefined", ""):
+        return False
+    if s.isdigit():
+        return False
+    # Reject strings that look like EA indicators (e.g. "EA 000000", "EA 157000", "EA_001", "EA-001", "EA 01")
+    if re.match(r"^ea[\s_-]*\d+$", s, re.IGNORECASE) or re.match(r"^ea\s+", s, re.IGNORECASE):
+        return False
+    return True
+
+
 def _match_hier_names(d_name: str, target_name: str) -> bool:
     cd = _clean_hier_name(d_name)
     ct = _clean_hier_name(target_name)
@@ -5265,67 +5283,21 @@ class POPCENDatabase:
             cur.execute(f"""
                 SELECT DISTINCT SUBSTR(geocode, 1, 5), areaname 
                 FROM popcen_records 
-                WHERE geographic_level LIKE '%3 - City%' 
+                WHERE (geographic_level LIKE '%3%' OR geographic_level LIKE '%City%' OR geographic_level LIKE '%Mun%') 
                   AND SUBSTR(geocode, 1, 5) IN ({placeholders})
             """, list(codes))
             for c_code, c_name in cur.fetchall():
-                names_map[str(c_code).strip()] = str(c_name).strip()
-
-        missing_codes = [c for c in codes if c not in names_map]
-        if missing_codes and self.is_gpkg_populated():
-            with self._get_gpkg_connection() as conn:
-                cur = conn.cursor()
-                for c in missing_codes:
-                    cur.execute("""
-                        SELECT city_mun, province 
-                        FROM gpkg_records 
-                        WHERE SUBSTR(geocode, 1, 5) = ? 
-                          AND city_mun IS NOT NULL AND city_mun != '' 
-                        LIMIT 1
-                    """, (c,))
-                    row = cur.fetchone()
-                    if row and row[0]:
-                        names_map[c] = str(row[0]).strip()
-
-        missing_codes = [c for c in codes if c not in names_map]
-        if missing_codes and self.is_earf_populated():
-            with self._get_earf_connection() as conn:
-                cur = conn.cursor()
-                for c in missing_codes:
-                    cur.execute("""
-                        SELECT areaname 
-                        FROM earf_records 
-                        WHERE (SUBSTR(geocode, 1, 5) = ? OR (prov = ? AND mun = ?))
-                          AND (brgy = '000' OR SUBSTR(geocode, 6, 3) = '000')
-                          AND areaname IS NOT NULL AND TRIM(areaname) != '' 
-                        LIMIT 1
-                    """, (c, c[:3], c[3:5]))
-                    row = cur.fetchone()
-                    if row and row[0]:
-                        names_map[c] = str(row[0]).strip()
-
-        still_missing = [c for c in codes if c not in names_map]
-        if still_missing:
-            with self._get_connection() as conn:
-                cur = conn.cursor()
-                for c in still_missing:
-                    cur.execute("""
-                        SELECT areaname, geographic_name 
-                        FROM matched_records 
-                        WHERE SUBSTR(geocode, 1, 5) = ? 
-                          AND (areaname IS NOT NULL OR geographic_name IS NOT NULL) 
-                        LIMIT 1
-                    """, (c,))
-                    row = cur.fetchone()
-                    if row and (row[0] or row[1]):
-                        raw_name = str(row[0] or row[1]).strip()
-                        if " - EA" in raw_name:
-                            raw_name = raw_name.split(" - EA")[0].strip()
-                        names_map[c] = raw_name
+                if is_valid_mun_name(c_name):
+                    names_map[str(c_code).strip()] = str(c_name).strip()
 
         result = []
         for c in sorted(list(codes)):
-            c_name = names_map.get(c, f"City/Mun {c}")
+            c_name = names_map.get(c)
+            if not is_valid_mun_name(c_name):
+                h = self.get_citymun_hierarchy(c)
+                c_name = h.get("city_mun")
+            if not is_valid_mun_name(c_name):
+                c_name = f"City/Mun {c}"
             result.append({
                 "code": c,
                 "name": c_name,
@@ -5337,6 +5309,7 @@ class POPCENDatabase:
         """
         Resolves the geographic hierarchy (Region, Province, City/Municipality names and codes)
         for a 5-digit city/municipality code across gpkg_records, popcen_records, and earf_records.
+        Guarantees that city_mun is never an EA label (e.g. 'EA 000000').
         """
         cm_code = str(city_mun_code or "").strip()
         cm_5 = cm_code[:5] if len(cm_code) >= 5 else cm_code
@@ -5359,13 +5332,14 @@ class POPCENDatabase:
                     """, (cm_5, cm_code))
                     row = cur.fetchone()
                     if row:
-                        reg_name = str(row[0] or "").strip()
-                        prov_name = str(row[1] or "").strip()
-                        mun_name = str(row[2] or "").strip()
+                        if not reg_name and str(row[0] or "").strip(): reg_name = str(row[0]).strip()
+                        if not prov_name and str(row[1] or "").strip(): prov_name = str(row[1]).strip()
+                        cand = str(row[2] or "").strip()
+                        if is_valid_mun_name(cand): mun_name = cand
             except Exception:
                 pass
 
-        # 2. Check popcen_records
+        # 2. Check popcen_records (Level 3 City/Municipality)
         if (not reg_name or not prov_name or not mun_name) and self.is_populated():
             try:
                 with self._get_connection() as conn:
@@ -5373,49 +5347,100 @@ class POPCENDatabase:
                     cur.execute("""
                         SELECT region_code, province_code, city_mun_code, areaname, geographic_name 
                         FROM popcen_records 
-                        WHERE (SUBSTR(geocode, 1, 5) = ? OR SUBSTR(geocode, 1, 6) = ?)
+                        WHERE (SUBSTR(geocode, 1, 5) = ? OR (province_code = ? AND city_mun_code = ?))
+                          AND (geographic_level LIKE '%3%' OR geographic_level LIKE '%City%' OR geographic_level LIKE '%Mun%')
                         LIMIT 1
-                    """, (cm_5, cm_code))
+                    """, (cm_5, cm_5[:3], cm_5[3:5]))
                     p_row = cur.fetchone()
                     if p_row:
-                        if not mun_name:
-                            mun_name = str(p_row[4] or p_row[3] or "").strip()
+                        cand = str(p_row[4] or p_row[3] or "").strip()
+                        if is_valid_mun_name(cand):
+                            mun_name = cand
                         reg_code = str(p_row[0] or "").strip()
                         prov_code = str(p_row[1] or "").strip()
-                        if reg_code and not reg_name:
-                            cur.execute("SELECT areaname FROM popcen_records WHERE geographic_level LIKE '%1 - Region%' AND region_code = ? LIMIT 1", (reg_code,))
-                            r_res = cur.fetchone()
-                            if r_res:
-                                reg_name = str(r_res[0] or "").strip()
-                        if prov_code and not prov_name:
-                            cur.execute("SELECT areaname FROM popcen_records WHERE geographic_level LIKE '%2 - Prov%' AND province_code = ? LIMIT 1", (prov_code,))
-                            pr_res = cur.fetchone()
-                            if pr_res:
-                                prov_name = str(pr_res[0] or "").strip()
             except Exception:
                 pass
 
-        # 3. Check earf_records
+        # 3. Check earf_records for source_file naming pattern (e.g. 05418_earf_San_Simon.xlsx)
+        if (not mun_name or not is_valid_mun_name(mun_name)) and self.is_earf_populated():
+            try:
+                with self._get_earf_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT source_file 
+                        FROM earf_records 
+                        WHERE (SUBSTR(geocode, 1, 5) = ? OR (prov = ? AND mun = ?))
+                          AND source_file IS NOT NULL AND source_file != '' 
+                        LIMIT 1
+                    """, (cm_5, cm_5[:3], cm_5[3:5]))
+                    sf_row = cur.fetchone()
+                    if sf_row and sf_row[0]:
+                        sf_base = os.path.basename(sf_row[0])
+                        m_sf = re.search(r"^\d{3}(\d{2})_earf_(.+?)(?:\.[^.]+)?$", sf_base, re.IGNORECASE)
+                        if m_sf:
+                            f_mun = m_sf.group(2).replace("_", " ").strip()
+                            if is_valid_mun_name(f_mun):
+                                mun_name = f_mun
+                            real_p = sf_base[:5]
+                            if real_p.isdigit() and self.is_populated():
+                                with self._get_connection() as pconn:
+                                    pcur = pconn.cursor()
+                                    pcur.execute("""
+                                        SELECT region_code, province_code, areaname 
+                                        FROM popcen_records 
+                                        WHERE SUBSTR(geocode, 1, 5) = ? 
+                                          AND (geographic_level LIKE '%3%' OR geographic_level LIKE '%City%' OR geographic_level LIKE '%Mun%')
+                                        LIMIT 1
+                                    """, (real_p,))
+                                    pr = pcur.fetchone()
+                                    if pr:
+                                        if is_valid_mun_name(pr[2]):
+                                            mun_name = str(pr[2]).strip()
+                                        if not prov_code: prov_code = str(pr[1] or "").strip()
+                                        if not reg_code: reg_code = str(pr[0] or "").strip()
+            except Exception:
+                pass
+
+        # 4. Check earf_records (Level 3 or Barangay 000 summary record)
         if (not reg_name or not prov_name or not mun_name) and self.is_earf_populated():
             try:
                 with self._get_earf_connection() as conn:
                     cur = conn.cursor()
                     cur.execute("""
-                        SELECT region, province, city_mun 
+                        SELECT areaname 
                         FROM earf_records 
-                        WHERE (SUBSTR(geocode, 1, 5) = ? OR SUBSTR(geocode, 1, 6) = ?)
-                          AND region IS NOT NULL AND region != '' 
-                          AND province IS NOT NULL AND province != '' 
-                          AND city_mun IS NOT NULL AND city_mun != '' 
+                        WHERE (SUBSTR(geocode, 1, 5) = ? OR (prov = ? AND mun = ?))
+                          AND (brgy = '000' OR SUBSTR(geocode, 6, 3) = '000')
+                          AND areaname IS NOT NULL AND TRIM(areaname) != '' 
                         LIMIT 1
-                    """, (cm_5, cm_code))
+                    """, (cm_5, cm_5[:3], cm_5[3:5]))
                     e_row = cur.fetchone()
-                    if e_row:
-                        if not reg_name: reg_name = str(e_row[0] or "").strip()
-                        if not prov_name: prov_name = str(e_row[1] or "").strip()
-                        if not mun_name: mun_name = str(e_row[2] or "").strip()
+                    if e_row and is_valid_mun_name(e_row[0]):
+                        mun_name = str(e_row[0]).strip()
             except Exception:
                 pass
+
+        # 5. Check region and province names from popcen_records if codes are known
+        if self.is_populated():
+            try:
+                with self._get_connection() as conn:
+                    cur = conn.cursor()
+                    if reg_code and not reg_name:
+                        cur.execute("SELECT areaname FROM popcen_records WHERE geographic_level LIKE '%1 - Region%' AND region_code = ? LIMIT 1", (reg_code,))
+                        r_res = cur.fetchone()
+                        if r_res:
+                            reg_name = str(r_res[0] or "").strip()
+                    if prov_code and not prov_name:
+                        cur.execute("SELECT areaname FROM popcen_records WHERE geographic_level LIKE '%2 - Prov%' AND province_code = ? LIMIT 1", (prov_code,))
+                        pr_res = cur.fetchone()
+                        if pr_res:
+                            prov_name = str(pr_res[0] or "").strip()
+            except Exception:
+                pass
+
+        # 6. Fallback ensuring no EA string ever leaks as municipality name
+        if not is_valid_mun_name(mun_name):
+            mun_name = f"City/Mun {cm_5}"
 
         return {
             "region": reg_name,
