@@ -172,6 +172,7 @@ def get_default_gpkg_db_path() -> str:
 DEFAULT_FINAL_EXPORT_ROOT = r"Y:\2026\1Map\Final EARF and geopackages"
 DEFAULT_GPKG_ROOT = r"Y:\geotags-uploads\ea-delineation"
 DEFAULT_EARF_ROOT = r"D:\PSA-GIS\Camarines Sur\Project 1MAP\3_EA Delineation and Merging\1_Downloaded Files\Output\2_output_files"
+DEFAULT_POPCEN_ROOT = r"Y:\geotags-uploads\ea-delineation"
 
 
 
@@ -391,6 +392,42 @@ def find_earf_files_in_folder(folder_path: str, recursive: bool = False, pattern
                     earf_files.append(os.path.normpath(fpath))
 
     return earf_files
+
+
+def find_popcen_files_in_folder(folder_path: str, recursive: bool = False, pattern: Optional[str] = None) -> List[str]:
+    """
+    Scans folder_path for all 2024 POPCEN Excel/CSV files (.xlsx / .xls / .csv),
+    excluding temporary files ('~$') and 'versions' directories.
+    If pattern is given and matching files exist, returns those;
+    otherwise returns all valid Excel/CSV files in the directory.
+    """
+    if not folder_path or not os.path.exists(folder_path):
+        return []
+
+    target_pattern = pattern.lower().strip() if pattern else "popcen"
+
+    candidate_files = []
+    if recursive:
+        for root, dirs, files in os.walk(folder_path):
+            dirs[:] = [d for d in dirs if not is_version_dir(d)]
+            rel_path = os.path.relpath(root, folder_path)
+            if rel_path != "." and any(is_version_dir(part) for part in rel_path.replace(os.sep, "/").split("/")):
+                continue
+            for f in sorted(files):
+                f_low = f.lower()
+                if f_low.endswith((".xlsx", ".xls", ".csv")) and not f.startswith("~$"):
+                    candidate_files.append(os.path.normpath(os.path.join(root, f)))
+    else:
+        for f in sorted(os.listdir(folder_path)):
+            fpath = os.path.join(folder_path, f)
+            f_low = f.lower()
+            if os.path.isfile(fpath) and f_low.endswith((".xlsx", ".xls", ".csv")) and not f.startswith("~$"):
+                candidate_files.append(os.path.normpath(fpath))
+
+    matched = [f for f in candidate_files if target_pattern in os.path.basename(f).lower()]
+    if matched:
+        return matched
+    return candidate_files
 
 
 
@@ -3046,6 +3083,75 @@ class POPCENDatabase:
                 from dialog import load_popcen_data
         df = load_popcen_data(file_path, sheet_name=sheet_name)
         return self.import_dataframe(df, replace=replace, progress_callback=progress_callback)
+
+    def import_popcen_from_files(
+        self, file_list: List[str], sheet_name=0, replace: bool = True, progress_callback=None
+    ) -> Tuple[int, int]:
+        """
+        Parses multiple 2024 POPCEN Excel/CSV files and bulk-inserts them into popcen_records.
+        Returns (total_imported_records, files_count).
+        """
+        raw_valid = [f for f in file_list if f and os.path.exists(f)]
+        if not raw_valid:
+            return 0, 0
+
+        valid_files = [
+            f for f in raw_valid
+            if f.lower().endswith(('.xlsx', '.xls', '.csv')) and not os.path.basename(f).startswith('~$')
+        ]
+        if not valid_files:
+            return 0, 0
+
+        total_files = len(valid_files)
+        total_records = 0
+        successful_files = 0
+
+        try:
+            from ..ui.dialog import load_popcen_data
+        except (ImportError, ValueError):
+            try:
+                from ui.dialog import load_popcen_data
+            except (ImportError, ValueError):
+                from dialog import load_popcen_data
+
+        if replace:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM popcen_records")
+                conn.commit()
+
+        for f_idx, fpath in enumerate(valid_files):
+            fname = os.path.basename(fpath)
+            if progress_callback:
+                pct = int((f_idx / total_files) * 85)
+                if progress_callback(pct, f"Parsing POPCEN ({f_idx + 1}/{total_files}): {fname}...") is False:
+                    break
+
+            try:
+                df = load_popcen_data(fpath, sheet_name=sheet_name)
+                if df.empty:
+                    continue
+                cnt = self.import_dataframe(df, replace=False)
+                total_records += cnt
+                successful_files += 1
+            except Exception:
+                continue
+
+        if progress_callback:
+            progress_callback(100, f"Completed consolidating {total_records:,} records from {successful_files:,} POPCEN file(s).")
+
+        return total_records, successful_files
+
+    def import_popcen_from_folder(
+        self, folder_path: str, recursive: bool = False, sheet_name=0, replace: bool = True, progress_callback=None
+    ) -> Tuple[int, int]:
+        """
+        Scans folder_path for all 2024 POPCEN Excel/CSV files and imports them into popcen_records.
+        """
+        if not folder_path or not os.path.exists(folder_path):
+            return 0, 0
+        files = find_popcen_files_in_folder(folder_path, recursive=recursive)
+        return self.import_popcen_from_files(files, sheet_name=sheet_name, replace=replace, progress_callback=progress_callback)
 
     def _build_popcen_where_clause(
         self,

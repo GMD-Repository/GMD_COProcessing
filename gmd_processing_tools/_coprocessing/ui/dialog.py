@@ -82,8 +82,8 @@ try:
         to_whole_number_str,
     )
     from ..db.database import (
-        POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder,
-        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT
+        POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder, find_popcen_files_in_folder,
+        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
     )
 except (ImportError, ValueError):
     from algorithm import (
@@ -96,8 +96,8 @@ except (ImportError, ValueError):
         to_whole_number_str,
     )
     from database import (
-        POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder,
-        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT
+        POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder, find_popcen_files_in_folder,
+        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
     )
 
 if "DEFAULT_GPKG_ROOT" not in globals():
@@ -105,6 +105,9 @@ if "DEFAULT_GPKG_ROOT" not in globals():
 
 if "DEFAULT_EARF_ROOT" not in globals():
     DEFAULT_EARF_ROOT = r"D:\PSA-GIS\Camarines Sur\Project 1MAP\3_EA Delineation and Merging\1_Downloaded Files\Output\2_output_files"
+
+if "DEFAULT_POPCEN_ROOT" not in globals():
+    DEFAULT_POPCEN_ROOT = r"Y:\geotags-uploads\ea-delineation"
 
 
 try:
@@ -917,6 +920,57 @@ class ExecutionWorker(QThread):
         except Exception as e:
             self.log_signal.emit("error", f"Processing error: {str(e)}")
             self.finished_signal.emit({})
+
+
+# --------------------------------------------------------------------------
+# Background Worker for 2024 POPCEN Folder Consolidation
+# --------------------------------------------------------------------------
+class PopcenConsolidationWorker(QThread):
+    progress_signal = pyqtSignal(int, str)
+    finished_signal = pyqtSignal(int, int, str)
+
+    def __init__(self, db, folder_path=None, recursive=True, sheet_name=0, file_list=None, replace=True):
+        super().__init__()
+        self.db = db
+        self.folder_path = folder_path
+        self.recursive = recursive
+        self.sheet_name = sheet_name
+        self.file_list = file_list
+        self.replace = replace
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        def _cb(pct, msg):
+            if self._is_cancelled:
+                return False
+            self.progress_signal.emit(pct, msg)
+            return True
+
+        try:
+            if self.file_list is not None:
+                recs, files = self.db.import_popcen_from_files(
+                    self.file_list,
+                    sheet_name=self.sheet_name,
+                    replace=self.replace,
+                    progress_callback=_cb,
+                )
+            else:
+                recs, files = self.db.import_popcen_from_folder(
+                    self.folder_path,
+                    recursive=self.recursive,
+                    sheet_name=self.sheet_name,
+                    replace=self.replace,
+                    progress_callback=_cb,
+                )
+            if self._is_cancelled:
+                self.finished_signal.emit(0, 0, "Cancelled")
+            else:
+                self.finished_signal.emit(recs, files, "")
+        except Exception as e:
+            self.finished_signal.emit(0, 0, str(e))
 
 
 # --------------------------------------------------------------------------
@@ -4007,14 +4061,14 @@ class COProcessingDialog(QDialog):
 
         top_bar.addStretch()
 
-        self.btn_import_db = QPushButton("Import Excel into Local DB...")
-        self.btn_import_db.setToolTip("Load and persist a POPCEN Excel/CSV file into the local SQLite database for instant future access")
+        self.btn_import_db = QPushButton("Import Single File to DB...")
+        self.btn_import_db.setToolTip("Load and persist a single POPCEN Excel/CSV file into the local SQLite database")
         self.btn_import_db.clicked.connect(self._import_into_database_prompt)
         top_bar.addWidget(self.btn_import_db)
 
         self.btn_popcen_stop = QPushButton("Stop")
         self.btn_popcen_stop.setObjectName("stopBtn")
-        self.btn_popcen_stop.setToolTip("Stop active POPCEN database import immediately")
+        self.btn_popcen_stop.setToolTip("Stop active POPCEN database import or folder consolidation immediately")
         self.btn_popcen_stop.setEnabled(False)
         self.btn_popcen_stop.clicked.connect(self._stop_popcen_import)
         top_bar.addWidget(self.btn_popcen_stop)
@@ -4026,18 +4080,50 @@ class COProcessingDialog(QDialog):
 
         layout.addLayout(top_bar)
 
+        # 2. Folder Consolidation Bar (Visible in Database Mode)
+        self.popcen_folder_bar = QWidget()
+        folder_layout = QHBoxLayout(self.popcen_folder_bar)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        folder_layout.addWidget(QLabel("<b>POPCEN Folder:</b>"))
+
+        self.txt_popcen_folder = QLineEdit()
+        self.txt_popcen_folder.setPlaceholderText("Select directory containing 2024 POPCEN Excel files (*.xlsx, *.xls, *.csv)...")
+        self.txt_popcen_folder.setText(DEFAULT_POPCEN_ROOT if os.path.exists(DEFAULT_POPCEN_ROOT) else "")
+        folder_layout.addWidget(self.txt_popcen_folder, 1)
+
+        btn_browse_folder = QPushButton("Browse Folder...")
+        btn_browse_folder.clicked.connect(self._browse_popcen_folder)
+        folder_layout.addWidget(btn_browse_folder)
+
+        self.chk_popcen_recursive = QCheckBox("Subfolders")
+        self.chk_popcen_recursive.setChecked(True)
+        self.chk_popcen_recursive.setToolTip("Recursively scan nested subdirectories for Excel/CSV files")
+        folder_layout.addWidget(self.chk_popcen_recursive)
+
+        self.btn_consolidate_popcen = QPushButton("Consolidate Folder to DB...")
+        self.btn_consolidate_popcen.setObjectName("actionBtn")
+        self.btn_consolidate_popcen.setToolTip("Scan folder, parse all 2024 POPCEN Excel/CSV files, and save into local SQLite database (popcen_records)")
+        self.btn_consolidate_popcen.clicked.connect(self._consolidate_popcen_folder_prompt)
+        folder_layout.addWidget(self.btn_consolidate_popcen)
+
+        layout.addWidget(self.popcen_folder_bar)
+
         # File selection bar (visible when Custom File mode is selected)
         self.file_bar = QWidget()
         file_layout = QHBoxLayout(self.file_bar)
         file_layout.setContentsMargins(0, 0, 0, 0)
-        file_layout.addWidget(QLabel("POPCEN File:"))
+        file_layout.addWidget(QLabel("POPCEN File / Folder:"))
         self.txt_popcen_quick = QLineEdit()
-        self.txt_popcen_quick.setPlaceholderText("Select custom POPCEN Excel file (.xlsx)...")
+        self.txt_popcen_quick.setPlaceholderText("Select custom POPCEN Excel file (.xlsx, .xls, .csv) or folder...")
         file_layout.addWidget(self.txt_popcen_quick, 1)
 
-        btn_browse_quick = QPushButton("Browse...")
+        btn_browse_quick = QPushButton("Browse File...")
         btn_browse_quick.clicked.connect(self._browse_popcen_file)
         file_layout.addWidget(btn_browse_quick)
+
+        btn_browse_quick_folder = QPushButton("Browse Folder...")
+        btn_browse_quick_folder.clicked.connect(self._browse_popcen_folder_preview)
+        file_layout.addWidget(btn_browse_quick_folder)
 
         file_layout.addWidget(QLabel("Sheet:"))
         self.txt_sheet_quick = QLineEdit()
@@ -4775,9 +4861,13 @@ class COProcessingDialog(QDialog):
         self._reset_popcen_selection()
         mode = self.cmb_source_mode.currentIndex()
         if mode == 0:  # Local Database
+            if hasattr(self, "popcen_folder_bar"):
+                self.popcen_folder_bar.setVisible(True)
             self.file_bar.setVisible(False)
             self._check_and_load_initial_data()
         else:  # Custom File
+            if hasattr(self, "popcen_folder_bar"):
+                self.popcen_folder_bar.setVisible(False)
             self.file_bar.setVisible(True)
             if not self.popcen_df.empty:
                 self._apply_file_filters()
@@ -5695,6 +5785,135 @@ class COProcessingDialog(QDialog):
     # ----------------------------------------------------------------------
     # POPCEN Import / File Actions
     # ----------------------------------------------------------------------
+    def _get_initial_popcen_dir(self):
+        # 1. Preview / quick inputs
+        for field in (getattr(self, "txt_popcen_quick", None), getattr(self, "txt_popcen_file", None)):
+            if field:
+                cur_text = field.text().strip()
+                if cur_text:
+                    first_path = cur_text.split(";")[0].strip().strip('"').strip("'")
+                    if os.path.isdir(first_path):
+                        return first_path
+                    elif os.path.isfile(first_path) or os.path.exists(first_path):
+                        return os.path.dirname(first_path)
+
+        # 2. POPCEN folder input
+        folder_field = getattr(self, "txt_popcen_folder", None)
+        if folder_field:
+            cur_folder = folder_field.text().strip().strip('"').strip("'")
+            if os.path.isdir(cur_folder):
+                return cur_folder
+            elif os.path.isfile(cur_folder) or os.path.exists(cur_folder):
+                return os.path.dirname(cur_folder)
+            elif cur_folder:
+                return cur_folder
+
+        # 3. Fallback to default POPCEN root directory
+        return DEFAULT_POPCEN_ROOT
+
+    def _browse_popcen_folder(self):
+        start_dir = self.txt_popcen_folder.text().strip() or self._get_initial_popcen_dir() or DEFAULT_POPCEN_ROOT
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder Containing 2024 POPCEN Files", start_dir)
+        if folder:
+            self.txt_popcen_folder.setText(folder)
+            recursive = self.chk_popcen_recursive.isChecked() if hasattr(self, "chk_popcen_recursive") else False
+            found = find_popcen_files_in_folder(folder, recursive=recursive)
+
+            # If non-recursive found no files, check if subfolders have files
+            if not found and not recursive:
+                sub_found = find_popcen_files_in_folder(folder, recursive=True)
+                if sub_found:
+                    recursive = True
+                    if hasattr(self, "chk_popcen_recursive"):
+                        self.chk_popcen_recursive.setChecked(True)
+                    found = sub_found
+
+            if hasattr(self, "lbl_table_info"):
+                if found:
+                    self.lbl_table_info.setText(f"Found {len(found):,} POPCEN file(s) (*.xlsx/*.xls/*.csv). Ready to consolidate.")
+                else:
+                    self.lbl_table_info.setText("Warning: No Excel/CSV files found in selected folder.")
+
+    def _consolidate_popcen_folder_prompt(self):
+        folder = self.txt_popcen_folder.text().strip()
+        if not folder or not os.path.exists(folder):
+            QMessageBox.warning(self, "Select Folder", "Please select a valid folder containing 2024 POPCEN Excel or CSV files first.")
+            return
+
+        recursive = self.chk_popcen_recursive.isChecked() if hasattr(self, "chk_popcen_recursive") else False
+        popcen_files = find_popcen_files_in_folder(folder, recursive=recursive)
+        if not popcen_files and not recursive:
+            sub_files = find_popcen_files_in_folder(folder, recursive=True)
+            if sub_files:
+                recursive = True
+                if hasattr(self, "chk_popcen_recursive"):
+                    self.chk_popcen_recursive.setChecked(True)
+                popcen_files = sub_files
+
+        if not popcen_files:
+            QMessageBox.warning(
+                self,
+                "No POPCEN Files Found",
+                f"No Excel or CSV files were found in:\n{folder}\n\n"
+                f"(Recursive subfolders: {'Yes' if recursive else 'No'})\n\n"
+                "Please verify that the folder contains .xlsx, .xls, or .csv files.",
+            )
+            return
+
+        ret = QMessageBox.question(
+            self,
+            "Consolidation Confirmation",
+            f"Found {len(popcen_files):,} 2024 POPCEN file(s) in:\n{folder}\n\n"
+            f"(Recursive subfolders: {'Yes' if recursive else 'No'})\n\n"
+            "This will parse all matching files and save them into the local database (popcen_records). Proceed?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+
+        self.btn_consolidate_popcen.setEnabled(False)
+        self.btn_import_db.setEnabled(False)
+        if hasattr(self, "btn_popcen_stop"):
+            self.btn_popcen_stop.setEnabled(True)
+        if self.progress_bar:
+            self.progress_bar.setValue(0)
+        self.lbl_table_info.setText(f"Scanning and consolidating {len(popcen_files):,} POPCEN files...")
+
+        self.popcen_consolidation_worker = PopcenConsolidationWorker(
+            self.db, folder, recursive=recursive, sheet_name=0, file_list=popcen_files, replace=True
+        )
+        self.popcen_consolidation_worker.progress_signal.connect(
+            lambda p, m: ((self.progress_bar.setValue(p) if self.progress_bar else None), self.lbl_table_info.setText(m))
+        )
+        self.popcen_consolidation_worker.finished_signal.connect(self._popcen_consolidation_finished)
+        self.popcen_consolidation_worker.start()
+
+    def _popcen_consolidation_finished(self, recs, files, err):
+        self.btn_consolidate_popcen.setEnabled(True)
+        self.btn_import_db.setEnabled(True)
+        if hasattr(self, "btn_popcen_stop"):
+            self.btn_popcen_stop.setEnabled(False)
+        if self.progress_bar:
+            self.progress_bar.setValue(100)
+
+        if err and err != "Cancelled":
+            QMessageBox.critical(self, "Consolidation Error", f"Failed to consolidate POPCEN files:\n{err}")
+            self.lbl_table_info.setText(f"Error: {err}")
+            return
+        elif err == "Cancelled":
+            self.lbl_table_info.setText("POPCEN consolidation cancelled by user.")
+            return
+
+        QMessageBox.information(
+            self,
+            "Consolidation Successful",
+            f"Successfully consolidated {recs:,} POPCEN records across {files} file(s) into the local database!",
+        )
+
+        # Refresh database view
+        self.cmb_source_mode.setCurrentIndex(0)
+        self._check_and_load_initial_data()
+
     def _import_into_database_prompt(self):
         f, _ = QFileDialog.getOpenFileName(
             self, "Select POPCEN File to Import into Local Database", "", "Excel Files (*.xlsx *.xls);;CSV Files (*.csv)"
@@ -5715,6 +5934,8 @@ class COProcessingDialog(QDialog):
             self.progress_bar.setValue(0)
         self.lbl_table_info.setText("Importing records into local database...")
         self.btn_import_db.setEnabled(False)
+        if hasattr(self, "btn_consolidate_popcen"):
+            self.btn_consolidate_popcen.setEnabled(False)
         if hasattr(self, "btn_popcen_stop"):
             self.btn_popcen_stop.setEnabled(True)
 
@@ -5724,16 +5945,26 @@ class COProcessingDialog(QDialog):
         self.import_worker.start()
 
     def _stop_popcen_import(self):
-        """Immediately cancels running POPCEN database import."""
+        """Immediately cancels running POPCEN database import or consolidation."""
+        stopped = False
         if hasattr(self, "import_worker") and self.import_worker and self.import_worker.isRunning():
             self.import_worker.cancel()
+            stopped = True
+        if hasattr(self, "popcen_consolidation_worker") and self.popcen_consolidation_worker and self.popcen_consolidation_worker.isRunning():
+            self.popcen_consolidation_worker.cancel()
+            stopped = True
         if hasattr(self, "btn_popcen_stop"):
             self.btn_popcen_stop.setEnabled(False)
         self.btn_import_db.setEnabled(True)
-        self.lbl_table_info.setText("POPCEN import stopped by user.")
+        if hasattr(self, "btn_consolidate_popcen"):
+            self.btn_consolidate_popcen.setEnabled(True)
+        if stopped:
+            self.lbl_table_info.setText("POPCEN import/consolidation stopped by user.")
 
     def _import_finished(self, count, err_msg):
         self.btn_import_db.setEnabled(True)
+        if hasattr(self, "btn_consolidate_popcen"):
+            self.btn_consolidate_popcen.setEnabled(True)
         if hasattr(self, "btn_popcen_stop"):
             self.btn_popcen_stop.setEnabled(False)
         if self.progress_bar:
@@ -5760,25 +5991,56 @@ class COProcessingDialog(QDialog):
             self.cmb_source_mode.setCurrentIndex(1)
             self._load_file_preview()
 
+    def _browse_popcen_folder_preview(self):
+        start_dir = self._get_initial_popcen_dir() or DEFAULT_POPCEN_ROOT
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder Containing 2024 POPCEN Files", start_dir)
+        if folder:
+            self.txt_popcen_quick.setText(folder)
+            if hasattr(self, "txt_popcen_file"):
+                self.txt_popcen_file.setText(folder)
+            self.cmb_source_mode.setCurrentIndex(1)
+            self._load_file_preview()
+
     def _load_file_preview(self):
         file_path = self.txt_popcen_quick.text().strip() or self.txt_popcen_file.text().strip()
         if not file_path or not os.path.exists(file_path):
-            QMessageBox.warning(self, "Select File", "Please select a valid POPCEN Excel or CSV file first.")
+            QMessageBox.warning(self, "Select File or Folder", "Please select a valid POPCEN Excel/CSV file or folder first.")
             return
 
         sheet_name = self.txt_sheet_quick.text().strip()
-        self.lbl_table_info.setText("Loading and parsing POPCEN file...")
+        self.lbl_table_info.setText("Loading and parsing POPCEN data...")
         QApplication.processEvents()
 
         try:
-            self.popcen_df = load_popcen_data(file_path, sheet_name=sheet_name)
+            if os.path.isdir(file_path):
+                popcen_files = find_popcen_files_in_folder(file_path, recursive=True)
+                if not popcen_files:
+                    QMessageBox.warning(self, "No Files Found", f"No Excel or CSV files were found in:\n{file_path}")
+                    self.lbl_table_info.setText("No POPCEN files found in folder.")
+                    return
+                dfs = []
+                for f in popcen_files:
+                    try:
+                        df_i = load_popcen_data(f, sheet_name=sheet_name)
+                        if not df_i.empty:
+                            df_i["source_file"] = os.path.basename(f)
+                            dfs.append(df_i)
+                    except Exception:
+                        pass
+                if dfs:
+                    import pandas as pd
+                    self.popcen_df = pd.concat(dfs, ignore_index=True)
+                else:
+                    self.popcen_df = pd.DataFrame()
+            else:
+                self.popcen_df = load_popcen_data(file_path, sheet_name=sheet_name)
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Failed to load POPCEN worksheet:\n{e}")
             self.lbl_table_info.setText(f"Error loading table: {e}")
             return
 
         if self.popcen_df.empty:
-            self.lbl_table_info.setText("File loaded, but no data records were found.")
+            self.lbl_table_info.setText("Data loaded, but no data records were found.")
             return
 
         self._update_file_kpis()
