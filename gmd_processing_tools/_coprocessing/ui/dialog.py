@@ -144,6 +144,24 @@ except NameError:
         return s
 
 
+def format_time_duration(seconds: float) -> str:
+    """Formats a duration in seconds into a friendly human-readable string (e.g. 45s, 2m 15s, 1h 05m 20s)."""
+    if seconds is None or seconds < 0:
+        return "0s"
+    total_sec = int(round(seconds))
+    if total_sec < 60:
+        return f"{total_sec}s"
+    elif total_sec < 3600:
+        mins = total_sec // 60
+        secs = total_sec % 60
+        return f"{mins}m {secs:02d}s"
+    else:
+        hours = total_sec // 3600
+        mins = (total_sec % 3600) // 60
+        secs = total_sec % 60
+        return f"{hours}h {mins:02d}m {secs:02d}s"
+
+
 # --------------------------------------------------------------------------
 # Smart Table Widget Items for Natural & Numeric Sorting
 # --------------------------------------------------------------------------
@@ -3508,7 +3526,25 @@ class COProcessingDialog(QDialog):
         """Handles live progress updates from DeliverablesExportWorker."""
         if hasattr(self, "export_progress_dlg") and self.export_progress_dlg:
             self.export_progress_dlg.setValue(pct)
-            self.export_progress_dlg.setLabelText(msg)
+
+            # Compute time elapsed and estimated time remaining (ETA)
+            start_time = getattr(self, "_export_start_time", None)
+            if start_time:
+                elapsed = max(0.0, time.time() - start_time)
+                elapsed_str = format_time_duration(elapsed)
+                if pct > 0:
+                    total_est = elapsed / (pct / 100.0)
+                    rem = max(0.0, total_est - elapsed)
+                    rem_str = format_time_duration(rem)
+                    time_line = f"Estimated Time Remaining: ~{rem_str}  (Elapsed: {elapsed_str})"
+                else:
+                    time_line = f"Estimated Time Remaining: Estimating...  (Elapsed: {elapsed_str})"
+            else:
+                time_line = ""
+
+            display_text = f"{msg}\n{time_line}" if time_line else msg
+            self.export_progress_dlg.setLabelText(display_text)
+
             # Dynamically state the City/Municipality in the progress dialog window title
             if "Exporting " in msg and ":" in msg:
                 cm_title = msg.split(":")[0].strip()
@@ -3555,6 +3591,9 @@ class COProcessingDialog(QDialog):
         total_exported = summary.get("total_exported", 0)
         total_features = summary.get("total_features", 0)
 
+        start_time = getattr(self, "_export_start_time", None)
+        duration_note = f"\n\nTotal Processing Time: {format_time_duration(time.time() - start_time)}" if start_time else ""
+
         # Batch Export feedback
         if is_batch:
             root_dir = getattr(self, "_final_export_root_dir", None) or DEFAULT_FINAL_EXPORT_ROOT
@@ -3567,6 +3606,7 @@ class COProcessingDialog(QDialog):
                 f"• Final EARF Excel (<pppmm>_final_earf_<citymun>.xlsx)\n"
                 f"• Final MIS Excel (<pppmm>_MIS_<citymun>.xlsx)\n"
                 f"• PCD EARF Excel (<pppmm>_earf2026_PCD.xlsx)"
+                f"{duration_note}"
             )
             return
 
@@ -3660,12 +3700,15 @@ class COProcessingDialog(QDialog):
             h = self.db.get_citymun_hierarchy(first_code)
             first_mun = h.get("city_mun") or f"City/Mun {first_code}"
 
+        # Record start time for ETA calculations
+        self._export_start_time = time.time()
+
         if len(tasks) == 1:
             init_title = f"Exporting Final Deliverables - {first_mun} ({first_code})" if first_code else f"Exporting Final Deliverables - {first_mun}"
-            init_label = f"Exporting {first_mun} ({first_code}): Initializing deliverables export..."
+            init_label = f"Exporting {first_mun} ({first_code}): Initializing deliverables export...\nEstimated Time Remaining: Estimating..."
         else:
             init_title = f"Exporting Final Deliverables [{len(tasks)} City/Municipalities]"
-            init_label = f"[1/{len(tasks)}] Exporting {first_mun} ({first_code}): Initializing deliverables export..."
+            init_label = f"[1/{len(tasks)}] Exporting {first_mun} ({first_code}): Initializing deliverables export...\nEstimated Time Remaining: Estimating..."
 
         # Create responsive progress dialog
         self.export_progress_dlg = QProgressDialog(
@@ -3678,6 +3721,7 @@ class COProcessingDialog(QDialog):
         self.export_progress_dlg.setWindowTitle(init_title)
         self.export_progress_dlg.setWindowModality(Qt.WindowModal)
         self.export_progress_dlg.setMinimumDuration(0)
+        self.export_progress_dlg.setMinimumWidth(520)
         self.export_progress_dlg.setValue(0)
         self.export_progress_dlg.setAutoClose(False)
         self.export_progress_dlg.setAutoReset(False)
