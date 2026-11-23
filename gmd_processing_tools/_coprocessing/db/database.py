@@ -18,7 +18,7 @@ import sqlite3
 import collections
 from datetime import datetime
 import pandas as pd
-from typing import Dict, List, Optional, Tuple, Any, Union, Callable
+from typing import Dict, List, Optional, Tuple, Any, Union, Callable, Set
 
 try:
     from ..core.algorithm import build_geocode, read_earf_table, POPCEN_FIELDS, GPKG_EARF_FIELDS, to_whole_number_str
@@ -492,9 +492,140 @@ def is_summary_header_record(r: Dict[str, Any]) -> bool:
     return False
 
 
+def cluster_merged_records(b_records: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
+    """
+    Finds connected components of merged records within a barangay.
+    Returns a list of tuples: (prevailing_record, [absorbed_records]) for each merge group.
+    Prevailing record is determined under official PSA census cartography guidelines:
+      1. Higher 2024 Household Count (no_of_households / popcen_households)
+      2. Active geometry in GeoPackage (in_gpkg / has_geometry)
+      3. Remarks not containing 'merged to' or 'merged into' (survivor remarks say 'merged with')
+      4. Lowest baseline EAN
+    """
+    merged_records = []
+    for r in b_records:
+        if is_summary_header_record(r):
+            continue
+        ea_t = str(r.get("ea_type") or r.get("ea_lifecycle") or "").strip().upper()
+        rem = str(r.get("remarks") or r.get("earf_remarks") or r.get("popcen_remarks") or "").strip()
+        if ("MERG" in ea_t) or ("MERG" in rem.upper()):
+            merged_records.append(r)
+
+    if not merged_records:
+        return []
+
+    n_m = len(merged_records)
+    adj = collections.defaultdict(list)
+
+    for i in range(n_m):
+        ri = merged_records[i]
+        rem_i = str(ri.get("remarks") or ri.get("earf_remarks") or ri.get("popcen_remarks") or "").strip()
+        rec_i = str(ri.get("recoded_ean") or "").strip()
+        new_i = str(ri.get("new_enumeration_area_code") or ri.get("new_ean") or "").strip()
+        ean_i = str(ri.get("ean") or "").strip()
+
+        targets_i = set()
+        for m in re.finditer(r"merge[d\s]+(?:to|with|into)\s+(?:EA\s*)?(\d+)", rem_i, re.IGNORECASE):
+            targets_i.add(m.group(1).zfill(6))
+            targets_i.add(str(int(m.group(1))))
+
+        for j in range(i + 1, n_m):
+            rj = merged_records[j]
+            rem_j = str(rj.get("remarks") or rj.get("earf_remarks") or rj.get("popcen_remarks") or "").strip()
+            rec_j = str(rj.get("recoded_ean") or "").strip()
+            new_j = str(rj.get("new_enumeration_area_code") or rj.get("new_ean") or "").strip()
+            ean_j = str(rj.get("ean") or "").strip()
+
+            targets_j = set()
+            for m in re.finditer(r"merge[d\s]+(?:to|with|into)\s+(?:EA\s*)?(\d+)", rem_j, re.IGNORECASE):
+                targets_j.add(m.group(1).zfill(6))
+                targets_j.add(str(int(m.group(1))))
+
+            is_connected = False
+            # 1. Share non-empty recoded_ean (if valid)
+            if rec_i and rec_j and rec_i == rec_j:
+                is_connected = True
+            # 2. Share non-empty new_ean
+            elif new_i and new_j and new_i == new_j:
+                is_connected = True
+            # 3. ri targets rj's ean or new_ean
+            elif ean_j and (ean_j in targets_i or ean_j.zfill(6) in targets_i or (ean_j.isdigit() and str(int(ean_j)) in targets_i)):
+                is_connected = True
+            elif new_j and (new_j in targets_i or new_j.zfill(6) in targets_i or (new_j.isdigit() and str(int(new_j)) in targets_i)):
+                is_connected = True
+            # 4. rj targets ri's ean or new_ean
+            elif ean_i and (ean_i in targets_j or ean_i.zfill(6) in targets_j or (ean_i.isdigit() and str(int(ean_i)) in targets_j)):
+                is_connected = True
+            elif new_i and (new_i in targets_j or new_i.zfill(6) in targets_j or (new_i.isdigit() and str(int(new_i)) in targets_j)):
+                is_connected = True
+            # 5. Share common target in remarks
+            elif targets_i and targets_j and (targets_i & targets_j):
+                is_connected = True
+
+            if is_connected:
+                adj[i].append(j)
+                adj[j].append(i)
+
+    visited = [False] * n_m
+    groups = []
+    for i in range(n_m):
+        if visited[i]:
+            continue
+        comp = []
+        queue = [i]
+        visited[i] = True
+        while queue:
+            curr = queue.pop(0)
+            comp.append(curr)
+            for neighbor in adj[curr]:
+                if not visited[neighbor]:
+                    visited[neighbor] = True
+                    queue.append(neighbor)
+
+        comp_records = [merged_records[idx] for idx in comp]
+        if len(comp_records) <= 1:
+            r = comp_records[0]
+            rem = str(r.get("remarks") or r.get("earf_remarks") or r.get("popcen_remarks") or "").lower()
+            if any(k in rem for k in ("merged to", "merged into")) and not (r.get("in_gpkg") or r.get("has_geometry")):
+                groups.append((r, [r]))
+            else:
+                groups.append((r, []))
+            continue
+
+        def prevailing_score(rec):
+            hh_2024 = 0
+            try:
+                hh_raw = rec.get("no_of_households")
+                if hh_raw is None or str(hh_raw).strip() == "":
+                    hh_raw = rec.get("popcen_households")
+                if hh_raw is None or str(hh_raw).strip() == "":
+                    hh_raw = rec.get("household_count")
+                if hh_raw is None or str(hh_raw).strip() == "":
+                    hh_raw = rec.get("earf_household_count")
+                if str(hh_raw).isdigit():
+                    hh_2024 = int(hh_raw)
+            except Exception:
+                pass
+
+            has_geom = 1 if (rec.get("in_gpkg") or rec.get("has_geometry")) else 0
+            rem_low = str(rec.get("remarks") or rec.get("earf_remarks") or rec.get("popcen_remarks") or "").lower()
+            not_merged_to = 0 if any(k in rem_low for k in ("merged to", "merged into")) else 1
+            orig_ean = str(rec.get("ean") or "").strip()
+            ean_int = int(orig_ean) if orig_ean.isdigit() else 999999
+
+            return (hh_2024, has_geom, not_merged_to, -ean_int)
+
+        sorted_m = sorted(comp_records, key=prevailing_score, reverse=True)
+        prevailing = sorted_m[0]
+        absorbed = sorted_m[1:]
+        groups.append((prevailing, absorbed))
+
+    return groups
+
+
 def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Computes 'recoded_ean' (Column 22: Recoded Enumeration Area) per Barangay adhering to PSA EARF rules:
+    Computes and populates 'recoded_ean' across records using PSA rules:
       - Scope: Per Barangay (PSGC prefix: prov_code + city_mun_code + barangay_code).
       - Option B: Keeps Column 16 ('new_enumeration_area_code' / 'new_ean') as the raw preliminary input code (e.g. '004003').
       - Rule A (Single EA Barangay): If only 1 resulting EA in barangay (or merged to 1 EA), code is strictly '000000'.
@@ -535,6 +666,18 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
         by_brgy[brgy_key].append(r)
 
     for brgy_key, b_records in by_brgy.items():
+        # Cluster merged records so all records in a merge group share the prevailing EA's entity key
+        merged_groups = cluster_merged_records(b_records)
+        merged_entity_keys = {}
+        for prevailing, absorbed_list in merged_groups:
+            prev_ean = str(prevailing.get("ean") or "").strip().replace(".0", "")
+            if prev_ean.isdigit() and len(prev_ean) < 6:
+                prev_ean = f"{int(prev_ean):03d}000" if len(prev_ean) <= 3 else f"{int(prev_ean):06d}"
+            comp_key = f"MERGED_{prev_ean or id(prevailing)}"
+            merged_entity_keys[id(prevailing)] = comp_key
+            for abs_rec in absorbed_list:
+                merged_entity_keys[id(abs_rec)] = comp_key
+
         record_entities = []
         seen_base_keys = collections.defaultdict(int)
         seen_split_keys = collections.defaultdict(int)
@@ -559,6 +702,7 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
                 r["new_enumeration_area_code"] = norm_nean
                 r["new_ean"] = norm_nean
             else:
+                norm_nean = ""
                 r["new_enumeration_area_code"] = ""
                 r["new_ean"] = ""
 
@@ -586,7 +730,7 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
             cand_base = old_ean if is_base_code(old_ean) else (norm_nean if is_base_code(norm_nean) else "")
 
             if is_merged:
-                entity_key = target_merged if target_merged else (cand_base or "MERGED_TARGET")
+                entity_key = merged_entity_keys.get(id(r)) or target_merged or (cand_base or "MERGED_TARGET")
                 record_entities.append((r, entity_key, "MERGED", norm_nean, old_ean))
             elif has_sub_code:
                 # Sub-code e.g. 004003, 003002 -> Appended Delineated entity
@@ -652,19 +796,23 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
     return records
 
 
-def filter_pcd_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def identify_absorbed_records(records: List[Dict[str, Any]]) -> Set[int]:
     """
-    Filters records for the PCD deliverable (<pppmm>_earf2026_PCD.xlsx):
-      - RETAINED: 100% kept.
-      - DELINEATED / SPLIT (treated as equivalent): 100% kept (all subdivided parts).
-      - MERGED: Absorbed merged partner rows are filtered out so that only the surviving
-        primary / consolidated EA record is kept.
+    Identifies absorbed merged EAs within each barangay.
+    Under official PSA census cartography guidelines:
+      - The EA in a merge group with the HIGHER 2024 Household Count is the PREVAILING EA (The Survivor).
+      - The EA with the LOWER 2024 Household Count is the ABSORBED EA.
+      - In case of a tie in 2024 household count:
+          1. Active geometry in GeoPackage
+          2. Remarks not containing 'merged to' or 'merged into' (survivor typically has 'merged with')
+          3. Base EAN matches target recoded EAN
+          4. Lowest baseline EAN
+      - The absorbed EA should NOT have values in columns J, K, L, and M in the Final EARF Excel.
+    Returns a set of id(record) for all absorbed records.
     """
+    absorbed_set: Set[int] = set()
     if not records:
-        return []
-
-    # First ensure recoded_ean is populated across records
-    records = compute_recoded_enumeration_areas(records)
+        return absorbed_set
 
     by_brgy = collections.defaultdict(list)
     for r in records:
@@ -683,59 +831,39 @@ def filter_pcd_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             brgy_key = str(r.get("areaname", "") or r.get("geographic_name") or "UNKNOWN")
         by_brgy[brgy_key].append(r)
 
-    filtered_records: List[Dict[str, Any]] = []
-
     for brgy_key, b_records in by_brgy.items():
-        # Identify absorbed merged partner rows within the barangay
-        merged_groups = collections.defaultdict(list)
-        for r in b_records:
-            ea_t = str(r.get("ea_type") or r.get("ea_lifecycle") or "").strip().upper()
-            rem = str(r.get("remarks") or r.get("earf_remarks") or r.get("popcen_remarks") or "").strip()
-            is_merged = ("MERG" in ea_t) or ("MERG" in rem.upper())
-            if is_merged:
-                # Group by recoded_ean (the target consolidated EA code)
-                rec_ean = str(r.get("recoded_ean") or "").strip()
-                merged_groups[rec_ean].append(r)
+        groups = cluster_merged_records(b_records)
+        for prevailing, absorbed_list in groups:
+            for abs_rec in absorbed_list:
+                absorbed_set.add(id(abs_rec))
 
-        absorbed_set = set()
-        for rec_ean, m_recs in merged_groups.items():
-            if len(m_recs) <= 1:
-                # If only one record marked as merged in this group, check if it's explicitly an absorbed row
-                r = m_recs[0]
-                rem = str(r.get("remarks") or r.get("earf_remarks") or r.get("popcen_remarks") or "").lower()
-                if any(k in rem for k in ("merged to", "merged with", "merged into")) and not (r.get("in_gpkg") or r.get("has_geometry")):
-                    absorbed_set.add(id(r))
-                continue
+    return absorbed_set
 
-            # In a group of merged EAs sharing the same recoded_ean, pick the primary survivor
-            # 1st priority: Active geometry in GeoPackage
-            # 2nd priority: Does NOT contain "merged to" in remarks
-            # 3rd priority: Base EAN matches target code or lowest ean
-            def survivor_score(rec):
-                score = 0
-                if rec.get("in_gpkg") or rec.get("has_geometry"):
-                    score += 100
-                rem_low = str(rec.get("remarks") or rec.get("earf_remarks") or rec.get("popcen_remarks") or "").lower()
-                if not any(k in rem_low for k in ("merged to", "merged with", "merged into")):
-                    score += 50
-                orig_ean = str(rec.get("ean") or "").strip()
-                if orig_ean and rec_ean and orig_ean.zfill(6) == rec_ean.zfill(6):
-                    score += 25
-                return score
 
-            sorted_m = sorted(m_recs, key=survivor_score, reverse=True)
-            # The top-scoring record is the primary survivor; all other partner records are absorbed
-            for partner in sorted_m[1:]:
-                absorbed_set.add(id(partner))
+def filter_pcd_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Filters records for the PCD deliverable (<pppmm>_earf2026_PCD.xlsx):
+      - RETAINED: 100% kept.
+      - DELINEATED / SPLIT (treated as equivalent): 100% kept (all subdivided parts).
+      - MERGED: Absorbed merged partner rows are filtered out so that only the surviving
+        prevailing EA record is kept.
+    """
+    if not records:
+        return []
 
-        for r in b_records:
-            # Must be a valid physical record that belongs to the GeoPackage
-            # (or has geometry / is in_gpkg) and is not an absorbed merged partner
-            if id(r) in absorbed_set:
-                continue
-            if not (r.get("in_gpkg") or r.get("has_geometry")):
-                continue
-            filtered_records.append(r)
+    # First ensure recoded_ean is populated across records
+    records = compute_recoded_enumeration_areas(records)
+    absorbed_set = identify_absorbed_records(records)
+
+    filtered_records: List[Dict[str, Any]] = []
+    for r in records:
+        if is_summary_header_record(r):
+            continue
+        if id(r) in absorbed_set:
+            continue
+        if not (r.get("in_gpkg") or r.get("has_geometry")):
+            continue
+        filtered_records.append(r)
 
     return filtered_records
 
@@ -940,6 +1068,8 @@ def export_matched_to_excel(
     # Ensure recoded_ean is populated across records
     if any(not r.get("recoded_ean") for r in records):
         records = compute_recoded_enumeration_areas(records)
+
+    absorbed_set = identify_absorbed_records(records)
 
     wb = openpyxl.Workbook()
     
@@ -1346,9 +1476,12 @@ def export_matched_to_excel(
                 rem_str = "" if is_pcd else str(r.get("remarks") or r.get("earf_remarks") or "").strip()
 
                 is_merged = (ea_t == "MERGED")
+                is_absorbed = (id(r) in absorbed_set)
 
-                effective_name_ean = final_ea or prelim_ea or ean_raw
                 if is_pcd:
+                    if is_absorbed:
+                        continue
+                    effective_name_ean = final_ea or prelim_ea or ean_raw
                     # PCD: Columns H (HH Count), I (Bldg Count), J (Prelim EA), L (HH Count), M (Bldg Count), N (EA Type), O (Source Year) removed.
                     # Column Remarks has values cleared.
                     ea_row_vals = [
@@ -1357,7 +1490,19 @@ def export_matched_to_excel(
                         final_ea,
                         ""
                     ]
+                elif is_absorbed:
+                    # Absorbed EA in Final EARF: columns J, K, L, and M have NO values
+                    effective_name_ean = ean_raw
+                    ea_row_vals = [
+                        ea_gc, p_c, m_c, b_code, ean_raw, 1,
+                        f"EA {effective_name_ean}",
+                        int(p_hh_val) if str(p_hh_val).isdigit() else p_hh_val,
+                        int(p_bldg_val) if str(p_bldg_val).isdigit() else p_bldg_val,
+                        "", "", "", "",  # J (prelim_ea), K (final_ea), L (household_count), M (building_count) are empty
+                        ea_t, src_y, rem_str
+                    ]
                 else:
+                    effective_name_ean = final_ea or prelim_ea or ean_raw
                     ea_row_vals = [
                         ea_gc, p_c, m_c, b_code, ean_raw, 1,
                         f"EA {effective_name_ean}",
@@ -1394,7 +1539,7 @@ def export_matched_to_excel(
                             cell.alignment = left_align
                     else:
                         if c_idx == 11:  # Final EA Code (from recoded_ean)
-                            cell.font = font_final_ea
+                            cell.font = font_final_ea if val else font_data
                             cell.alignment = center_align
                             cell.number_format = "@"
                         elif c_idx in (1, 2, 3, 4, 5, 10, 14, 15):
@@ -6213,6 +6358,10 @@ class POPCENDatabase:
     @staticmethod
     def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return compute_recoded_enumeration_areas(records)
+
+    @staticmethod
+    def identify_absorbed_records(records: List[Dict[str, Any]]) -> Set[int]:
+        return identify_absorbed_records(records)
 
     @staticmethod
     def filter_pcd_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
