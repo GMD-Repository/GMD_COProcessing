@@ -2975,6 +2975,7 @@ class POPCENDatabase:
             CREATE TABLE IF NOT EXISTS earf_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 geocode TEXT,
+                new_geocode TEXT,
                 prov TEXT,
                 mun TEXT,
                 brgy TEXT,
@@ -2997,7 +2998,22 @@ class POPCENDatabase:
             )
             """)
 
+            cur.execute("PRAGMA table_info(earf_records);")
+            existing_cols = {row[1] for row in cur.fetchall()}
+            if "new_geocode" not in existing_cols:
+                cur.execute("ALTER TABLE earf_records ADD COLUMN new_geocode TEXT;")
+                cur.execute("""
+                UPDATE earf_records
+                SET new_geocode = CASE
+                    WHEN new_enumeration_area_code IS NOT NULL AND TRIM(new_enumeration_area_code) != '' AND LOWER(TRIM(new_enumeration_area_code)) NOT IN ('nan', 'none', 'null', '-')
+                    THEN printf('%03d%02d%03d%06d', CAST(prov AS INT), CAST(mun AS INT), CAST(brgy AS INT), CAST(new_enumeration_area_code AS INT))
+                    ELSE ''
+                END
+                """)
+                conn.commit()
+
             cur.execute("CREATE INDEX IF NOT EXISTS idx_earf_gc ON earf_records(geocode);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_earf_new_gc ON earf_records(new_geocode);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_earf_prov ON earf_records(prov);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_earf_mun ON earf_records(prov, mun);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_earf_brgy ON earf_records(prov, mun, brgy);")
@@ -3785,8 +3801,30 @@ class POPCENDatabase:
                     if not gc and (prov or mun or brgy or ea):
                         gc = build_geocode(row.to_dict(), GPKG_EARF_FIELDS)
 
+                    ne_code = _get_val(["new enumeration area code (2026)", "new enumeration area code", "new ea code (2026)", "new ea code", "new_ean", "new_ea_code", "code"])
+                    ne_str = str(ne_code or "").strip().replace(".0", "")
+                    if ne_str.lower() in ("nan", "none", "null", "-", ""):
+                        ne_str = ""
+                    new_gc = ""
+                    if ne_str:
+                        if ne_str.isdigit() and len(ne_str) < 6:
+                            ne_str = ne_str.zfill(6)
+                        p_s = str(prov or "").strip()
+                        m_s = str(mun or "").strip()
+                        b_s = str(brgy or "").strip()
+                        if not (p_s and m_s and b_s) and gc and len(gc) >= 8:
+                            if not p_s: p_s = gc[:3]
+                            if not m_s: m_s = gc[3:5]
+                            if not b_s: b_s = gc[5:8]
+                        if p_s and m_s and b_s:
+                            p_s = p_s.zfill(3) if p_s.isdigit() else p_s
+                            m_s = m_s.zfill(2) if m_s.isdigit() else m_s
+                            b_s = b_s.zfill(3) if b_s.isdigit() else b_s
+                            new_gc = f"{p_s}{m_s}{b_s}{ne_str}"
+
                     rec = {
                         "geocode": gc,
+                        "new_geocode": new_gc,
                         "prov": prov,
                         "mun": mun,
                         "brgy": brgy,
@@ -3800,7 +3838,7 @@ class POPCENDatabase:
                         ]),
                         "number_of_households": _get_val(["number of households", "number_of_households", "2024 estimated"]),
                         "number_of_buildings": _get_val(["number of buildings", "number_of_buildings"]),
-                        "new_enumeration_area_code": _get_val(["new enumeration area code (2026)", "new enumeration area code", "new ea code (2026)", "new ea code", "new_ean", "new_ea_code", "code"]),
+                        "new_enumeration_area_code": ne_str,
                         "household_count": _get_val(["household count (2026)", "household count", "household_count", "hh_count", "hhcount"]),
                         "building_count": _get_val(["building count (2026)", "building count", "building_count", "bldg_count", "bldgcount"]),
                         "ea_type": _get_val(["ea type", "ea_type", "type"]),
@@ -3820,7 +3858,7 @@ class POPCENDatabase:
             return 0, len(valid_files)
 
         cols = [
-            "geocode", "prov", "mun", "brgy", "ea", "number_of_eas", "areaname",
+            "geocode", "new_geocode", "prov", "mun", "brgy", "ea", "number_of_eas", "areaname",
             "number_of_households", "number_of_buildings", "new_enumeration_area_code",
             "household_count", "building_count", "ea_type", "source_year", "remarks",
             "source_file", "match_status", "consistency_status", "consistency_notes",
@@ -4157,6 +4195,7 @@ class POPCENDatabase:
             s = f"%{search.strip().lower()}%"
             conditions.append("""(
                 LOWER(geocode) LIKE ? OR
+                LOWER(new_geocode) LIKE ? OR
                 LOWER(areaname) LIKE ? OR
                 LOWER(prov) LIKE ? OR
                 LOWER(mun) LIKE ? OR
@@ -4166,7 +4205,7 @@ class POPCENDatabase:
                 LOWER(remarks) LIKE ? OR
                 LOWER(source_file) LIKE ?
             )""")
-            params.extend([s, s, s, s, s, s, s, s, s])
+            params.extend([s, s, s, s, s, s, s, s, s, s])
 
         if ea_type and ea_type != "All EA Types":
             if ea_type == "Other":

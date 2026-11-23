@@ -5355,6 +5355,12 @@ class COProcessingDialog(QDialog):
         """Helper to find the geocode string for a given row in any table widget."""
         for c in range(table.columnCount()):
             header = table.horizontalHeaderItem(c)
+            if header and header.text().strip().lower() == "geocode":
+                cell = table.item(row_idx, c)
+                if cell and cell.text().strip():
+                    return cell.text().strip()
+        for c in range(table.columnCount()):
+            header = table.horizontalHeaderItem(c)
             if header and "geocode" in header.text().lower():
                 cell = table.item(row_idx, c)
                 if cell and cell.text().strip():
@@ -6821,6 +6827,40 @@ class COProcessingDialog(QDialog):
 
         df = df.copy()
 
+        new_ea_identified = find_new_ea_code_col(df)
+        def _build_earf_new_gc(row):
+            curr_ngc = str(row.get("new_geocode") or "").strip()
+            if curr_ngc and curr_ngc.lower() not in ("nan", "none", "null", "-", ""):
+                return curr_ngc
+
+            nean = str(row.get(new_ea_identified) if new_ea_identified else (row.get("new_enumeration_area_code") or row.get("new_ean") or row.get("new_ea_code") or "")).strip()
+            if nean.endswith(".0"):
+                nean = nean[:-2].strip()
+            if not nean or nean.lower() in ("nan", "none", "null", "-", ""):
+                return ""
+            if nean.isdigit() and len(nean) < 6:
+                nean = nean.zfill(6)
+
+            p = str(row.get("prov") or "").strip()
+            m = str(row.get("mun") or "").strip()
+            b = str(row.get("brgy") or "").strip()
+
+            if not (p and m and b):
+                gc = str(row.get("geocode") or "").strip()
+                if len(gc) >= 8:
+                    if not p: p = gc[:3]
+                    if not m: m = gc[3:5]
+                    if not b: b = gc[5:8]
+
+            if p and m and b:
+                p = p.zfill(3) if p.isdigit() else p
+                m = m.zfill(2) if m.isdigit() else m
+                b = b.zfill(3) if b.isdigit() else b
+                return f"{p}{m}{b}{nean}"
+            return ""
+
+        df["new_geocode"] = df.apply(_build_earf_new_gc, axis=1)
+
         preferred_order = [
             "geocode",
             "consistency_status",
@@ -6833,6 +6873,7 @@ class COProcessingDialog(QDialog):
             "number_of_households",
             "number_of_buildings",
             "new_enumeration_area_code",
+            "new_geocode",
             "household_count",
             "building_count",
             "ea_type",
@@ -6876,6 +6917,9 @@ class COProcessingDialog(QDialog):
             "new_ea_code": "New EA Code (2026)",
             "new_ea": "New EA Code (2026)",
             "new_ean": "New EA Code (2026)",
+            "new_geocode": "New Geocode",
+            "new geocode": "New Geocode",
+            "new geocode (2026)": "New Geocode",
             "household_count": "Household Count (2026)",
             "building_count": "Building Count (2026)",
             "ea_type": "EA Type",
@@ -6941,7 +6985,15 @@ class COProcessingDialog(QDialog):
                     item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
                 # Badges & Styling
-                if "geocode" in col_low:
+                if col_low == "new_geocode":
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#047857"))  # emerald green
+                    if val:
+                        item.setBackground(QColor("#ecfdf5"))
+
+                elif "geocode" in col_low:
                     font = item.font()
                     font.setBold(True)
                     item.setFont(font)
