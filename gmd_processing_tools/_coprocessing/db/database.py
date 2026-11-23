@@ -6787,7 +6787,7 @@ class POPCENDatabase:
             # 2. Final EARF Excel
             if not earf_data["exists"]:
                 excel_cands = [f for f in entries if f.lower().endswith((".xlsx", ".xls")) and not f.startswith("~$") and not f.startswith("._")]
-                earf_cands = [f for f in excel_cands if "mis" not in f.lower()]
+                earf_cands = [f for f in excel_cands if "mis" not in f.lower() and "pcd" not in f.lower()]
                 best_earf = None
                 if earf_cands:
                     for f in earf_cands:
