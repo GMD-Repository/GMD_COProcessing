@@ -1,7 +1,7 @@
 # =====================================================================================
 # EA vs Barangay Check (GMD CO Processing > EA Tools)
-# Timestamp : 2026-11-23 14:34 (Asia/Manila, UTC+08:00)
-# Version   : 1.1.0
+# Timestamp : 2026-11-24 20:00 (Asia/Manila, UTC+08:00)
+# Version   : 1.6.0
 #
 # Changelog (oldest to newest)
 #   1.0.0  Baseline as supplied: EA vs BGY / BGY vs BGY / EA vs EA checks, snapping of selected
@@ -17,6 +17,64 @@
 #            datum round trip (e.g. PRS92 <-> WGS84) cannot nudge shared edges either.
 #          - to_layer_geometry(): the repair no longer snaps the whole feature to a grid; if the new
 #            shape cannot be made valid the row is marked Failed and the feature is left untouched.
+#   1.2.0  2026-11-24  Fix: snapped discrepancies no longer come back on the next scan.
+#          - snapped_geometry(): a result is accepted only if it really removes the cut pieces and covers the
+#            added ones (new fixes_pieces(): leftovers together under a quarter of the minimum area). Before,
+#            when several gaps went to one EA, the grid fallback's restored vertices fell back onto the old
+#            outline and undid the fix, yet the row was still marked Snapped.
+#          - EA vs EA / BGY vs BGY without a reference (new snap_inputs()): an overlap is cut with the kept
+#            feature's own outline (also taking the hairline overlaps beside it), and added gaps are clipped
+#            by the bordering features, so a snap cannot leave or create a discrepancy next to the one fixed.
+#            Only the fixed edge changes: the feature's other vertices stay exactly where they were.
+#          - Zoom highlight: the circles mark the Fix feature's out-of-place vertices (new
+#            unsnapped_vertices()) instead of one point somewhere inside the piece.
+#          - Detection with a reference (EA vs BGY, BGY vs BGY / EA vs EA with a reference): pieces found on
+#            the 0.1 mm grid are re-checked on the exact geometry (new exact_rest()). The grid could report
+#            land that is covered, or even make up a region on a long thin feature, which no snap could fix.
+#          - snapped_geometry(): also tries the pieces without the 0.2 mm nudge (it flattened very thin
+#            overlaps, so they failed with "unchanged"), and drops lines a grid collapses a hairline into
+#            (they failed with "Overlay input is mixed-dimension"). Added gaps are trimmed by the neighbours,
+#            not the whole feature, so an overlap the neighbour cuts in the same snap is not lost.
+#   1.3.0  2026-11-24  EA vs EA -> EA vs BGY -> EA vs EA now ends clean, and snapped edges share vertices.
+#          - Snap to a reference (new in snap_inputs()): around each piece the feature is cut to its own
+#            reference outline and given all reference land no other feature rightly holds, so the hairline
+#            slivers under min_area beside it are fixed too (before, they merged into new discrepancies,
+#            e.g. needle overlaps in EA vs EA after an EA vs BGY snap).
+#          - Detection with a reference uses the exact geometry (new exact_difference()): the 0.1 mm grid
+#            split thin slivers into fragments under min_area, so EA vs BGY missed what EA vs EA then found.
+#          - explode_pieces(): pieces of one row that touch (within ~0.1 mm) are one discrepancy.
+#          - New only_pieces_changed(): a snap may change land only inside the selected pieces.
+#          - New share_vertices(): after a snap, a vertex of the snapped feature lying on a neighbour's edge
+#            (within 1 micron) is put into that neighbour too, and the other way round, so both have the same
+#            vertices along the shared edge. Shapes do not change; Undo Last Snap takes it back with the snap.
+#   1.4.0  2026-11-24  Snapped edges lie exactly on the barangay / neighbour line as the map draws them.
+#          - Checks and overlays run in a projected working CRS in metres (new choose_work_crs()): the
+#            layers' own projected CRS, else the map's, else the WGS 84 / UTM zone of the data; it must
+#            convert to and from the layers' CRS exactly (a PRS92 <-> WGS 84 datum shift comes back ~1 mm
+#            off). Before, they ran in lat/lon: a vertex put on a km-long edge was exact in lat/lon but the
+#            map draws edges straight in its projected CRS, so the snapped edge showed up to ~10 cm off the
+#            barangay line (e.g. 347 sqm along a 5 km edge) while every scan reported it clean.
+#          - Tolerances are in metres (GRID_M, SNAP_TOL_M, KEEP_VERTEX_TOL_M, NEIGHBOUR_PAD_M, MIN_ZOOM_M).
+#          - share_vertices() tests "on the edge" in the working CRS and writes each shared vertex with its
+#            owner's exact layer coordinate.
+#   1.5.0  2026-11-24  Vertices along shared edges are paired (no vertex without its partner on the neighbour).
+#          - share_vertices() pairs within 1 cm (SHARE_TOL_M), not 1 micron: the data had ~980 vertices a
+#            hair (0.01-10 mm) off the neighbour's edge, drawn as one line but each with its own vertices.
+#            Such a vertex is moved onto the neighbour's edge (onto its vertex if one is that close) and put
+#            into the neighbour; a vertex shared with a third feature moves there too. Checked against a
+#            reference, a vertex on the feature's own reference line is never moved.
+#          - New Match Vertices button (match_vertices()): does this for the whole checked layer; Undo Last
+#            Snap takes it back. The snap buttons stay enabled after a clean scan.
+#   1.5.1  2026-11-24  No duplicate vertices: Match Vertices / snaps left vertices a hair apart in a row,
+#            flagged by QGIS as duplicate nodes. New weld (in share_vertices): vertices within 2 mm
+#            (DUPLICATE_M) in any of the features involved become one point in every feature that has them
+#            (one on a reference line wins), then exact duplicates and A-B-A spikes are dropped
+#            (clean_vertices). Runs before and after pairing, so neighbour pairs stay paired.
+#   1.6.0  2026-11-24  Vertex check in every scan: new issue "Unmatched vertices" (find_vertex_issues()), one
+#            row per feature with a vertex within 1 cm of a neighbour's edge but no partner vertex there, or
+#            two vertices within 2 mm. Shown as small squares; the zoom circles sit on the vertices. Snap
+#            Selected on these rows matches them (share_vertices) in the same edit command as the other
+#            snaps, then re-checks the feature: Snapped only if nothing is left, else Failed with the reason.
 # =====================================================================================
 r"""
 EA vs Barangay boundary check (QGIS), with three check modes chosen in the window:
@@ -62,8 +120,8 @@ The changed layers are left in edit mode and nothing is written to their files u
           is no longer possible once their edits are saved or discarded.
 
 Clicking a row flashes it on the map; double-click (or Zoom to Selected) zooms to it and, with the "Blinking dotted
-outline and snap preview on zoom" box ticked, blinks a dotted outline + circle on the discrepancy (orange cut,
-red add, grey fix by hand) and a dotted green outline of the Fix feature as it will be after Snap Selected.
+outline and snap preview on zoom" box ticked, blinks a dotted outline on the discrepancy, with circles on the Fix
+feature's vertices that are out of place (orange cut, red add, grey fix by hand) and a dotted green outline of the Fix feature as it will be after Snap Selected.
 Unticked, only the plain flash is shown.
 
 Only the geometry is changed: attributes such as household counts stay as they are.
@@ -109,19 +167,85 @@ warnings.filterwarnings("ignore")
 MIN_AREA_SQM = 0.1  # fixed: differences smaller than this are slivers and ignored (0.1 sqm)
 TOUCH_TOL_M = 1.0   # a gap within this distance of an EA counts as bordering that EA
 MIN_OWNER_SHARE = 0.3  # a gap is added to one EA only if that EA has at least this share of its EA border
-GRID_DEG = 1e-9     # fallback precision grid (~0.1 mm) when an exact snap gives an invalid geometry
-SNAP_TOL_DEG = 2e-9  # cut / added pieces are snapped onto the EA within this distance (~0.2 mm) before the overlay
-KEEP_VERTEX_TOL_DEG = 1e-10  # a vertex this close (~0.01 mm) to one of the feature's own keeps that exact position
+GRID_M = 1e-4      # fallback precision grid (0.1 mm) when an exact snap gives an invalid geometry
+SNAP_TOL_M = 2e-4  # cut / added pieces are snapped onto the EA within this distance (0.2 mm) before the overlay
+KEEP_VERTEX_TOL_M = 1e-5  # a vertex this close (0.01 mm) to one of the feature's own keeps that exact position
+SHARE_TOL_M = 1e-2  # a vertex this close (1 cm) to a neighbour's edge is put into that edge too (shared)
+SAME_VERTEX_M = 1e-6  # two vertices this close (1 micron) are the same vertex
 
 # Layer-name patterns used, after the fields, to autodetect the layers in the panel.
 BGY_LAYER_HINT = r"bgy|barangay"
 EA_LAYER_HINT = r"(^|_)ea"
 
-# Overlays run in the layers' own lat/lon so shared vertices and edges stay exact (reprojecting
-# first bends straight edges and creates false slivers). Areas use an equal-area projection in
-# metres centred on the Philippines.
-DATA_CRS = "EPSG:4326"
+# Checks and overlays run in a projected CRS in metres (the working CRS, picked by each scan): the map
+# canvas's CRS when it is projected, else the UTM zone of the data. An edge is straight in that CRS just
+# as the map draws it. In lat/lon a long edge (km) is a curve on the map: a vertex put on it in lat/lon
+# shows up to ~10 cm off the barangay line it should follow. The features' own vertices are written back
+# untouched (layer_xy). Areas use an equal-area projection in metres centred on the Philippines.
+DATA_CRS = "EPSG:32651"  # replaced by choose_work_crs() at each scan
 AREA_CRS = "+proj=laea +lat_0=12 +lon_0=122 +datum=WGS84 +units=m +no_defs"
+
+
+def choose_work_crs(layers):
+    """The working CRS (authid) for a scan of `layers`, the first that suits of: the layers' own CRS (when
+    projected in metres), the map's CRS, the WGS 84 / UTM zone at the centre of the layers.
+
+    It must be projected in metres and convert to and from every layer's CRS exactly (a datum shift, e.g.
+    WGS 84 <-> PRS92, comes back ~1 mm off, which would move the new vertices off the edges they meet)."""
+    from qgis.core import (Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsPointXY,
+                           QgsProject)
+
+    project = QgsProject.instance()
+    wgs = QgsCoordinateReferenceSystem("EPSG:4326")
+    srcs = [l.crs() if l.crs().isValid() else wgs for l in layers]
+
+    def metres(crs):
+        try:
+            return crs.mapUnits() == Qgis.DistanceUnit.Meters
+        except AttributeError:  # older QGIS
+            from qgis.core import QgsUnitTypes
+            return crs.mapUnits() == QgsUnitTypes.DistanceMeters
+
+    def exact(crs):
+        for layer, src in zip(layers, srcs):
+            if src == crs:
+                continue
+            there = QgsCoordinateTransform(src, crs, project)
+            back = QgsCoordinateTransform(crs, src, project)
+            box = layer.extent()
+            for fx, fy in ((0.5, 0.5), (0.1, 0.1), (0.9, 0.9), (0.1, 0.9), (0.9, 0.1)):
+                try:
+                    p = QgsPointXY(box.xMinimum() + fx * box.width(), box.yMinimum() + fy * box.height())
+                    q = there.transform(p)
+                    q2 = there.transform(back.transform(q))
+                except Exception:
+                    return False
+                if abs(q2.x() - q.x()) > 1e-6 or abs(q2.y() - q.y()) > 1e-6:
+                    return False
+        return True
+
+    for crs in [*srcs, project.crs()]:
+        if (crs.isValid() and not crs.isGeographic() and metres(crs) and crs.authid().upper().startswith("EPSG:")
+                and exact(crs)):
+            return crs.authid()
+    extent = None
+    for layer, src in zip(layers, srcs):
+        box = layer.extent()
+        if src != wgs:
+            box = QgsCoordinateTransform(src, wgs, project).transformBoundingBox(box)
+        if extent is None:
+            extent = box
+        else:
+            extent.combineExtentWith(box)
+    lon, lat = (extent.center().x(), extent.center().y()) if extent is not None else (122.0, 12.0)
+    zone = min(60, max(1, int((lon + 180) // 6) + 1))
+    return f"EPSG:{(32600 if lat >= 0 else 32700) + zone}"
+
+
+def use_crs(authid):
+    """Make `authid` the working CRS (DATA_CRS)."""
+    global DATA_CRS
+    DATA_CRS = authid
 
 # Column names to look for, in order of preference (case-insensitive).
 BGY_FIELDS = {
@@ -324,15 +448,17 @@ MODES = {
 SELF_ISSUES = ("Overlap", "Gap")
 # Map colours by what a snap does: cut (orange), add (red), nothing (grey); overlaps purple.
 KIND_COLOURS = {"cut": "255,127,0,210", "add": "227,26,28,210", "none": "158,158,158,210",
-                "overlap": "142,68,173,210"}
+                "overlap": "142,68,173,210", "vertex": "0,172,193,230"}
+VERTEX_ISSUE = "Unmatched vertices"  # every mode: vertices along shared edges without their partner
 
 
 def mode_issues(mode, self_check):
     """[(issue label, rgba)] for a mode: the legend, filter and map style of its scan."""
+    vertex = (VERTEX_ISSUE, KIND_COLOURS["vertex"])
     if self_check:
-        return [(SELF_ISSUES[0], KIND_COLOURS["overlap"]), (SELF_ISSUES[1], KIND_COLOURS["add"])]
+        return [(SELF_ISSUES[0], KIND_COLOURS["overlap"]), (SELF_ISSUES[1], KIND_COLOURS["add"]), vertex]
     out, short, orphan = MODES[mode]["issues"]
-    return [(out, KIND_COLOURS["cut"]), (short, KIND_COLOURS["add"]), (orphan, KIND_COLOURS["none"])]
+    return [(out, KIND_COLOURS["cut"]), (short, KIND_COLOURS["add"]), (orphan, KIND_COLOURS["none"]), vertex]
 
 
 def geometry_hash(geom):
@@ -341,7 +467,7 @@ def geometry_hash(geom):
 
 
 def layer_to_gdf(layer):
-    """Copy a QGIS layer (any provider, already in lat/lon) to a temp GeoPackage and read it.
+    """Copy a QGIS layer (any provider, converted to the working CRS) to a temp GeoPackage and read it.
 
     Column src_fid holds each row's feature id in the QGIS layer, src_hash a fingerprint of its geometry.
     """
@@ -355,10 +481,11 @@ def layer_to_gdf(layer):
     opts.layerName = "data"
     # A source "fid" column clashes with the GeoPackage key (e.g. merged layers), so leave it out.
     opts.attributes = [i for i, fld in enumerate(layer.fields()) if fld.name().lower() != "fid"]
-    if layer.crs().isValid():
-        opts.ct = QgsCoordinateTransform(layer.crs(), QgsCoordinateReferenceSystem(DATA_CRS), QgsProject.instance())
-    else:
+    src = layer.crs()
+    if not src.isValid():
         warn(f"{layer.name()}: layer has no CRS, assuming EPSG:4326")
+        src = QgsCoordinateReferenceSystem("EPSG:4326")
+    opts.ct = QgsCoordinateTransform(src, QgsCoordinateReferenceSystem(DATA_CRS), QgsProject.instance())
     err = QgsVectorFileWriter.writeAsVectorFormatV3(layer, tmp, QgsProject.instance().transformContext(), opts)
     try:
         if err[0] != QgsVectorFileWriter.NoError:
@@ -400,26 +527,71 @@ def merge_duplicate_barangays(bgy, what="barangay"):
     return gpd.GeoDataFrame(bgy, geometry="geometry", crs=DATA_CRS).reset_index(drop=True)
 
 
+def touching_groups(polys):
+    """Group polygons that touch (even at a single point, or within ~0.1 mm: the crossing point of two
+    edges is computed, so neighbouring lenses can miss each other by a hair): a list of index lists."""
+    parent = list(range(len(polys)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    if len(polys) > 1:
+        a, b = shapely.STRtree(polys).query(polys, predicate="dwithin", distance=GRID_M)
+        for i, j in zip(a, b):
+            if i < j:
+                parent[root(i)] = root(j)
+    groups = {}
+    for i in range(len(polys)):
+        groups.setdefault(root(i), []).append(i)
+    return list(groups.values())
+
+
 def explode_pieces(gdf, min_area):
-    """Split into single polygons and drop slivers below min_area."""
+    """Split into pieces and drop slivers below min_area.
+
+    Polygons of one row that touch, even at a single point, stay together as one (multi-polygon) piece: a
+    hairline strip where two edges cross back and forth is a chain of tiny lenses meeting at points. Split
+    up, each lens is under min_area and ignored, yet once a neighbouring piece is snapped they join into
+    one strip that the next scan does find. Kept together, the strip is found, and fixed, at once."""
     gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty]
     gdf = gdf.explode(index_parts=False)
-    gdf = gdf[gdf.geom_type == "Polygon"].copy()
-    gdf["piece_area"] = area_sqm(gdf)
-    return gdf[gdf["piece_area"] >= min_area].reset_index(drop=True)
+    gdf = gdf[gdf.geom_type == "Polygon"]
+    if not len(gdf):
+        return gdf.assign(piece_area=[]).reset_index(drop=True)
+    rows, geoms = [], []
+    for _, grp in gdf.groupby(level=0, sort=False):
+        polys = list(grp.geometry.values)
+        for members in touching_groups(polys):
+            rows.append(grp.iloc[members[0]])
+            geoms.append(polys[members[0]] if len(members) == 1 else MultiPolygon([polys[i] for i in members]))
+    out = gpd.GeoDataFrame(pd.DataFrame(rows).drop(columns=gdf.geometry.name).reset_index(drop=True),
+                           geometry=geoms, crs=gdf.crs)
+    out["piece_area"] = area_sqm(out)
+    return out[out["piece_area"] >= min_area].reset_index(drop=True)
 
 
 # ================= COMPARE =================
+def exact_difference(a, b):
+    """a - b on the exact geometry (the EA vs EA check measures the same way, so both checks agree).
+
+    A precision grid is not used: on a long thin sliver it splits the piece into fragments under the
+    minimum area, so the sliver is missed here but found by EA vs EA, and on a thin feature it can even
+    make up a region that no snap could remove. Only if the exact overlay fails is the grid used."""
+    try:
+        return shapely.difference(a, b)
+    except shapely.errors.GEOSException:
+        return shapely.difference(a, b, grid_size=GRID_M)
+
+
 def uncovered_land(inside, bgy, min_area):
     """The parts of each barangay that are not covered by its EAs."""
     scope = bgy[bgy["key"].isin(inside["key"])]
     cover = inside[["key", "geometry"]].dissolve(by="key").geometry
     cover = gpd.GeoSeries(cover.reindex(scope["key"]).values, index=scope.index, crs=DATA_CRS)
-    # Use grid_size so both the gap polygon and the snap union use the same precision grid.
-    # Without it, floating-point rounding can make bgy.difference(cover) return a polygon that
-    # is already a subset of cover, so union(EA, gap) leaves the EA area unchanged and the
-    # same gap is detected again after every snap.
-    diffs = [shapely.difference(b, c, grid_size=GRID_DEG) if c is not None else b
+    diffs = [exact_difference(b, c) if c is not None else b
              for b, c in zip(scope.geometry.values, cover.values)]
     return explode_pieces(gpd.GeoDataFrame(
         {"key": scope["key"].values}, geometry=diffs, crs=DATA_CRS), min_area)
@@ -479,8 +651,7 @@ def find_discrepancies(ea, bgy, min_area, mode="ea_bgy"):
 
     # ===== OUTSIDE: parts of each target feature beyond its reference =====
     own_bgy = gpd.GeoSeries(bgy_by_key.geometry.reindex(inside["key"]).values, index=inside.index, crs=DATA_CRS)
-    # Use grid_size for the same precision consistency as uncovered_land (see note there).
-    outside_geoms = [shapely.difference(a, b, grid_size=GRID_DEG) if b is not None else a
+    outside_geoms = [exact_difference(a, b) if b is not None else a
                      for a, b in zip(inside.geometry.values, own_bgy.values)]
     outside = explode_pieces(gpd.GeoDataFrame(
         {"ea_idx": inside.index}, geometry=outside_geoms, crs=DATA_CRS), min_area)
@@ -759,7 +930,131 @@ def restore_vertices(new, original, tol):
     return shapely.set_coordinates(new, new_xy)
 
 
-def snapped_geometry(geom, cuts, adds, min_area):
+def only_pieces_changed(old, new, cuts, adds, min_area):
+    """True if `new` differs from `old` only inside the cut / added pieces (each clump of change outside
+    them under half of min_area). Guards against an overlay or a repair (make_valid) that fills in or drops
+    land somewhere else; the area check alone would let that through on a large feature."""
+    pieces = shapely.union_all([*cuts, *adds]) if (cuts or adds) else shapely.Polygon()
+    try:
+        change = shapely.difference(shapely.symmetric_difference(old, new), pieces)
+    except shapely.errors.GEOSException:
+        return False
+    change = polygons_only(change)
+    if change is None or change.is_empty:
+        return True
+    clumps = [p for p in shapely.get_parts(change) if p.area > 0]
+    return not clumps or bool((areas_sqm(clumps) < min_area / 2).all())
+
+
+def fixes_pieces(geom, cuts, adds, min_area):
+    """True if what `geom` still keeps of the cut pieces and still misses of the added pieces is only specks:
+    the leftovers are merged first, so ones side by side count as the one piece a new scan would find, and
+    each merged clump must stay under half of min_area."""
+    left = [shapely.intersection(geom, c) for c in cuts] + [shapely.difference(a, geom) for a in adds]
+    left = [p for g in left if g is not None and not g.is_empty
+            for p in shapely.get_parts(polygons_only(g) or shapely.Polygon()) if p.area > 0]
+    if not left:
+        return True
+    clumps = [p for p in shapely.get_parts(shapely.union_all(left)) if p.area > 0]
+    return not clumps or bool((areas_sqm(clumps) < min_area / 2).all())
+
+
+def unsnapped_vertices(scan, row, tol=1e-4, limit=40):
+    """Where the circles go when zooming to a discrepancy: the vertices of the Fix feature that are out of
+    place (they lie on the overlap / gap and are not shared with the other feature(s) bordering it).
+
+    Falls back to the piece's own vertices away from the pinch points where the two outlines meet, then to
+    a point inside the piece. Returns a shapely MultiPoint (working CRS).
+    """
+    d, ea = scan.discrepancies, scan.ea
+    piece = d.geometry[row]
+    if d.at[row, "_kind"] == "vertex":  # one square per vertex to match: its centre is the vertex
+        return shapely.MultiPoint(shapely.centroid(shapely.get_parts(piece))[:limit])
+    pts = shapely.get_coordinates(piece)
+    if len(pts) > 1:
+        pts = np.unique(pts, axis=0)
+    idx = int(d.at[row, "_ea_idx"])
+    others = [int(c) for c in (d.at[row, "_candidates"] or []) if int(c) != idx and int(c) in ea.index]
+    marked = np.empty((0, 2))
+    if len(pts) and idx >= 0 and idx in ea.index:
+        fix_xy = shapely.get_coordinates(ea.geometry[idx])
+        p = shapely.points(pts)
+        on_fix = shapely.STRtree(shapely.points(fix_xy)).query_nearest(
+            p, max_distance=tol, return_distance=False, all_matches=False)[0] if len(fix_xy) else np.array([], int)
+        keep = np.zeros(len(pts), dtype=bool)
+        keep[on_fix] = True
+        other_line = shapely.union_all([ea.geometry[o].boundary for o in others]) if others else None
+        if other_line is not None and not other_line.is_empty:
+            keep &= shapely.distance(p, other_line) > tol  # shared with the neighbour: already in place
+        marked = pts[keep]
+        if not len(marked) and other_line is not None and not other_line.is_empty:
+            fix_line = ea.geometry[idx].boundary
+            pinch = (shapely.distance(p, fix_line) <= tol) & (shapely.distance(p, other_line) <= tol)
+            marked = pts[~pinch]
+    if not len(marked):
+        return shapely.MultiPoint([piece.representative_point()])
+    if len(marked) > limit:
+        marked = marked[np.linspace(0, len(marked) - 1, limit).astype(int)]
+    return shapely.MultiPoint(marked)
+
+
+NEIGHBOUR_PAD_M = 1e-2  # 1 cm: how far around a self-check piece the neighbour's own outline is used
+
+
+def snap_inputs(scan, idx, rows):
+    """(cuts, adds, clip) for snapping feature `idx` with the discrepancy rows `rows`.
+
+    Checked against a reference, these are the discrepancy pieces themselves. In a self check (features
+    against each other) the neighbour's own outline is used instead, so the fixed edge lands exactly on it:
+    an overlap is cut with the kept feature's shape around the piece (which also takes the hairline
+    overlaps under min_area along the same edge), and added gaps are clipped by the bordering features
+    so they cannot push into them.
+    """
+    d, ea = scan.discrepancies, scan.ea
+    cuts = [d.geometry[r] for r in rows if d.at[r, "_kind"] == "cut"]
+    adds = [d.geometry[r] for r in rows if d.at[r, "_kind"] == "add"]
+    if not scan.self_check:
+        own = getattr(scan, "ref", {}).get(ea.at[idx, "key"]) if "key" in ea.columns else None
+        if own is None or own.is_empty:
+            return cuts, adds, None
+        # Snapped to its reference: around each piece, everything of the feature outside the reference is
+        # cut, and all reference land not held by another feature is added. The hairline slivers under
+        # min_area beside the piece (where the two edges cross back and forth) go with it, so they cannot
+        # merge into a new discrepancy once the piece is gone.
+        pads = {r: shapely.buffer(d.geometry[r], NEIGHBOUR_PAD_M, join_style="mitre") for r in rows}
+        cuts = [polygons_only(shapely.union(d.geometry[r], shapely.difference(pads[r], own))) or d.geometry[r]
+                for r in rows if d.at[r, "_kind"] == "cut"]
+        adds = [polygons_only(shapely.union(d.geometry[r], shapely.intersection(pads[r], own))) or d.geometry[r]
+                for r in rows if d.at[r, "_kind"] == "add"]
+        if not adds:
+            return cuts, adds, None
+        reach = shapely.union_all([pads[r] for r in rows if d.at[r, "_kind"] == "add"])
+        # Only land another feature rightly holds (inside its own reference) is left to it: a feature reaching
+        # in from another reference is itself cut back to its own by the same snap.
+        def rightful(j, g):
+            theirs = scan.ref.get(ea.at[j, "key"])
+            return shapely.intersection(g, theirs) if theirs is not None else g
+        near = [polygons_only(shapely.intersection(rightful(j, g), reach)) for j, g in zip(ea.index, ea.geometry.values)
+                if j != idx and g is not None and shapely.intersects(g, reach)]
+        near = [g for g in near if g is not None and not g.is_empty]
+        return cuts, adds, (shapely.union_all(near) if near else None)
+
+    def around(r):
+        """The other candidate features' shapes within NEIGHBOUR_PAD_M of the piece."""
+        pad = shapely.buffer(d.geometry[r], NEIGHBOUR_PAD_M, join_style="mitre")
+        others = [int(c) for c in (d.at[r, "_candidates"] or []) if int(c) != idx and int(c) in ea.index]
+        parts = [shapely.intersection(ea.geometry[o], pad) for o in others]
+        return [polygons_only(p) for p in parts if p is not None and not p.is_empty and polygons_only(p) is not None]
+
+    cuts = []
+    for r in rows:
+        if d.at[r, "_kind"] == "cut":
+            cuts.append(shapely.union_all([d.geometry[r], *around(r)]))
+    near = [p for r in rows if d.at[r, "_kind"] == "add" for p in around(r)]
+    return cuts, adds, (shapely.union_all(near) if near else None)
+
+
+def snapped_geometry(geom, cuts, adds, min_area, clip=None):
     """The EA after cutting off `cuts` and adding `adds`: (geometry, None), or (None, why it failed).
 
     Only the edge being fixed may change: every other vertex of the EA is kept bit-for-bit, because the
@@ -769,21 +1064,45 @@ def snapped_geometry(geom, cuts, adds, min_area):
     or has such spikes (a vertex almost on another edge), the overlay is redone on a 0.1 mm, 1 mm and 1 cm
     grid, which merges them, and the EA's own vertices are put back afterwards (restore_vertices). The first
     sturdy result (or else the sturdiest) is used.
+
+    Every candidate must also really fix what was selected (fixes_pieces): each added piece covered and each
+    cut piece removed, to within min_area. Without that check a grid result whose restored vertices fall
+    back onto the old outline could undo the fix and still be reported as snapped.
+
+    `clip` (features checked against each other): the neighbours around the added pieces, taken off the
+    added land only, so a snap can never create a new overlap.
     """
     # Clearance = how far a vertex can move before the polygon becomes invalid. The result should not be
     # more fragile than the EA already was, nor below 1 mm.
-    needed = min(10 * GRID_DEG, shapely.minimum_clearance(geom) * 0.999)
+    needed = min(10 * GRID_M, shapely.minimum_clearance(geom) * 0.999)
     reason = "invalid"
     best, best_clearance = None, -1.0
-    cuts = [shapely.snap(c, geom, SNAP_TOL_DEG) for c in cuts]
-    adds = [shapely.snap(a, geom, SNAP_TOL_DEG) for a in adds]
-    for grid in (None, GRID_DEG, 10 * GRID_DEG, 100 * GRID_DEG):
+    raw_cuts, raw_adds = list(cuts), list(adds)
+    if clip is not None and not clip.is_empty:  # what must be covered: the added land the neighbours do not hold
+        raw_adds = [polygons_only(shapely.difference(a, clip)) or shapely.Polygon() for a in raw_adds]
+    nudged = ([shapely.snap(c, geom, SNAP_TOL_M) for c in cuts], [shapely.snap(a, geom, SNAP_TOL_M) for a in adds])
+
+    def merged(pieces, grid):
+        """The pieces as one polygon geometry: rounding a hairline to a grid can collapse it into a line,
+        and an overlay refuses a mix of polygons and lines (\"mixed-dimension\")."""
+        return polygons_only(shapely.union_all(pieces, grid_size=grid)) or shapely.Polygon()
+
+    # The pieces nudged onto the EA first (avoids near-zero-width spikes), then as found: on a very thin
+    # piece the nudge can flatten part of it, so that part would stay behind.
+    attempts = [(c, a, grid) for c, a in (nudged, (raw_cuts, raw_adds))
+                for grid in (None, GRID_M, 10 * GRID_M, 100 * GRID_M)]
+    for cuts, adds, grid in attempts:
         try:
             g = geom
             if cuts:
-                g = shapely.difference(g, shapely.union_all(cuts, grid_size=grid), grid_size=grid)
-            if adds:
-                g = shapely.union(g, shapely.union_all(adds, grid_size=grid), grid_size=grid)
+                g = polygons_only(shapely.difference(g, merged(cuts, grid), grid_size=grid))
+            if adds and g is not None:
+                added = merged(adds, grid)
+                if clip is not None and not clip.is_empty:
+                    # only the added land is trimmed: the EA's own land (e.g. an overlap the neighbour is
+                    # cutting in the same snap) stays, or it would end up in neither feature
+                    added = polygons_only(shapely.difference(added, clip, grid_size=grid)) or shapely.Polygon()
+                g = polygons_only(shapely.union(g, added, grid_size=grid))
         except shapely.errors.GEOSException as e:
             reason = f"invalid ({e})"
             continue
@@ -800,6 +1119,12 @@ def snapped_geometry(geom, cuts, adds, min_area):
         if grid is not None and not g.is_empty:
             g = restore_vertices(g, geom, 1.5 * grid)  # the grid must not move the EA's untouched vertices
         if g.is_valid and not g.is_empty:
+            if not fixes_pieces(g, raw_cuts, raw_adds, min_area):
+                reason = "unchanged (the overlay could not move the edge)"
+                continue
+            if not only_pieces_changed(geom, g, raw_cuts, raw_adds, min_area):
+                reason = "changed outside the selected pieces"
+                continue
             clearance = shapely.minimum_clearance(g)
             if clearance >= needed:
                 return g, None
@@ -813,20 +1138,20 @@ def snapped_geometry(geom, cuts, adds, min_area):
 
 
 def layer_xy(geom, original_latlon, original_layer, convert):
-    """x / y of every vertex of the lat/lon geometry `geom` in the layer's CRS, as an (n, 2) array.
+    """x / y of every vertex of the geometry `geom` (working CRS) in the layer's CRS, as an (n, 2) array.
 
-    A vertex that is one of the feature's own (the lat/lon copy of an original vertex, matched within
-    KEEP_VERTEX_TOL_DEG) gets that original layer coordinate back untouched, so converting lat/lon -> layer CRS
+    A vertex that is one of the feature's own (the working-CRS copy of an original vertex, matched within
+    KEEP_VERTEX_TOL_M) gets that original layer coordinate back untouched, so converting working CRS -> layer CRS
     cannot nudge the edges shared with neighbouring features (the round trip is not exact for datum
     shifts, e.g. PRS92 <-> WGS84). Only new vertices (where the cut / added land meets the outline) are
-    converted, with convert((lon, lat)) -> (x, y).
+    converted, with convert((x, y)) -> layer (x, y).
     """
     xy = shapely.get_coordinates(geom)
     out = np.empty_like(xy)
     done = np.zeros(len(xy), dtype=bool)
     if len(original_latlon) and len(xy):
         tree = shapely.STRtree(shapely.points(original_latlon))
-        hit = tree.query_nearest(shapely.points(xy), max_distance=KEEP_VERTEX_TOL_DEG, return_distance=False,
+        hit = tree.query_nearest(shapely.points(xy), max_distance=KEEP_VERTEX_TOL_M, return_distance=False,
                                  all_matches=False)
         out[hit[0]] = original_layer[hit[1]]
         done[hit[0]] = True
@@ -836,7 +1161,7 @@ def layer_xy(geom, original_latlon, original_layer, convert):
 
 
 def to_layer_geometry(geom, ea_layer, original=None):
-    """Shapely geometry (lat/lon) -> valid QgsGeometry in the EA layer's CRS and geometry type, or (None, why).
+    """Shapely geometry (working CRS) -> valid QgsGeometry in the EA layer's CRS and geometry type, or (None, why).
 
     `original` is the feature's current QgsGeometry in the layer's CRS: its vertices are kept exactly as they
     are (see layer_xy), so only the edge that was fixed changes.
@@ -907,7 +1232,7 @@ class Scan:
     """Everything a scan found, kept so that selected discrepancies can be snapped afterwards."""
 
     def __init__(self, ea, discrepancies, layer, fids, min_area, mode="ea_bgy", self_check=False):
-        self.ea = ea                        # target features as scanned (lat/lon; src_layer = the id of the
+        self.ea = ea                        # target features as scanned (working CRS; src_layer = the id of the
                                             # layer each came from); updated after each snap
         self.discrepancies = discrepancies  # one row per discrepancy; Status updated after each snap
         self.layer = layer                  # in-memory Discrepancies layer, not in the project (None if none)
@@ -915,6 +1240,8 @@ class Scan:
         self.min_area = min_area
         self.mode = mode
         self.self_check = self_check        # True: one layer checked against itself (overlaps / gaps)
+        self.ref = {}                       # reference key -> its geometry (working CRS), when checked against one
+        self.crs = DATA_CRS                 # the working CRS its geometries are in
         self.issues = mode_issues(mode, self_check)
         self.unit = MODES[mode]["unit"]
         self.messages = {}                  # row -> why it failed / what changed
@@ -957,6 +1284,462 @@ def switch_fix(scan, row):
     return code
 
 
+def _ring_with_points(ring_xy, pts, tol, same=SAME_VERTEX_M):
+    """Ring coordinates (closed, (n, 2)) with each point of pts that lies on one of its segments (within
+    tol) inserted into that segment, in order along it. Points already at a vertex (within `same`) are
+    skipped."""
+    a, b = ring_xy[:-1], ring_xy[1:]
+    ab = b - a
+    seg_len2 = (ab ** 2).sum(axis=1)
+    inserts = {}
+    for p in pts:
+        ap = p - a
+        t = np.clip(np.where(seg_len2 > 0, (ap * ab).sum(axis=1) / np.where(seg_len2 > 0, seg_len2, 1), 0), 0, 1)
+        dist2 = ((a + t[:, None] * ab - p) ** 2).sum(axis=1)
+        k = int(dist2.argmin())
+        if dist2[k] > tol * tol or (((ring_xy - p) ** 2).sum(axis=1) <= same * same).any():
+            continue
+        if 0 < t[k] < 1:
+            inserts.setdefault(k, []).append((float(t[k]), p))
+    if not inserts:
+        return ring_xy, 0
+    out, n = [], 0
+    for k in range(len(a)):
+        out.append(a[k])
+        for _t, p in sorted(inserts.get(k, []), key=lambda e: e[0]):
+            out.append(p)
+            n += 1
+    out.append(ring_xy[-1])
+    return np.array(out), n
+
+
+def _vertices_onto(target, source_xy, tol):
+    """`target` (shapely, layer CRS) with every point of source_xy that lies on one of its edges (within
+    tol) but is not one of its vertices inserted there, at exactly that point. Returns (geometry, count).
+
+    Only the outline gains vertices: an edge moves by at most tol to pass through the new point. The result
+    is refused (count 0) if it is not valid or its area moves by more than that allows."""
+    if not len(source_xy):
+        return target, 0
+    pts = shapely.points(source_xy)
+    near = shapely.distance(pts, target.boundary) <= tol
+    if not near.any():
+        return target, 0
+    cand = source_xy[near]
+    polys, total = [], 0
+    for poly in shapely.get_parts(target):
+        rings = []
+        for ring in [poly.exterior, *poly.interiors]:
+            xy = shapely.get_coordinates(ring)
+            close = cand[shapely.distance(shapely.points(cand), ring) <= tol]
+            if len(close):
+                xy, n = _ring_with_points(xy, close, tol)
+                total += n
+            rings.append(xy)
+        polys.append(shapely.Polygon(rings[0], rings[1:]))
+    if not total:
+        return target, 0
+    new = polys[0] if len(polys) == 1 and target.geom_type == "Polygon" else MultiPolygon(polys)
+    if not new.is_valid or abs(new.area - target.area) > tol * target.length:
+        return target, 0
+    return new, total
+
+
+DUPLICATE_M = 2e-3  # vertices closer than this (2 mm) are one vertex (QGIS flags 1e-8 deg, ~1.1 mm)
+
+
+def _clean_ring(xy, tol=DUPLICATE_M):
+    """Closed ring coordinates without consecutive duplicate vertices (within tol) and without spikes (a
+    vertex that goes out and straight back, A-B-A). Returns None if fewer than 3 distinct vertices remain."""
+    pts = [p for p in xy[:-1]]
+    changed = True
+    while changed and len(pts) >= 3:
+        changed = False
+        out = []
+        for p in pts:
+            if out and ((out[-1] - p) ** 2).sum() <= tol * tol:
+                changed = True
+                continue
+            out.append(p)
+        if len(out) > 1 and ((out[0] - out[-1]) ** 2).sum() <= tol * tol:
+            out.pop()
+            changed = True
+        n = len(out)
+        if n >= 3:
+            for i in range(n):  # A-B-A: drop B and the repeated A
+                a, c = out[i - 1], out[(i + 1) % n]
+                if ((a - c) ** 2).sum() <= tol * tol:
+                    keep = [k for k in range(n) if k not in (i, (i + 1) % n)]
+                    out = [out[k] for k in keep]
+                    changed = True
+                    break
+        pts = out
+    if len(pts) < 3:
+        return None
+    return np.vstack([pts, pts[:1]])
+
+
+def clean_vertices(geom, tol=DUPLICATE_M):
+    """`geom` with duplicate vertices and spikes removed from every ring (see _clean_ring). Returns the same
+    object if nothing changed, or if the cleaned shape would be invalid / not the same area."""
+    polys, changed = [], False
+    for poly in shapely.get_parts(geom):
+        rings = []
+        for k, ring in enumerate([poly.exterior, *poly.interiors]):
+            xy = shapely.get_coordinates(ring)
+            new = _clean_ring(xy, tol)
+            if new is None or len(new) != len(xy):
+                changed = True
+            if new is None:
+                if k == 0:
+                    break  # the whole part is a speck
+                continue
+            rings.append(new)
+        if rings:
+            polys.append(shapely.Polygon(rings[0], rings[1:]))
+    if not changed or not polys:
+        return geom
+    new = polys[0] if len(polys) == 1 and geom.geom_type == "Polygon" else MultiPolygon(polys)
+    if not new.is_valid or abs(new.area - geom.area) > tol * geom.length:
+        return geom
+    return new
+
+
+def share_vertices(scan, layer, snapped, undo_geoms):
+    """Give the snapped features and their neighbours (same layer) the same vertices along shared edges.
+
+    The overlay puts new vertices on the snapped feature where its new edge meets the neighbour's (and the
+    neighbour's corners along it): the shapes match, but the neighbour lacks those vertices, which shows as
+    an unmatched vertex in the editor and can leave a hairline after later edits. Each such vertex is put
+    into the other feature too, exactly on its edge, so neither shape changes. Runs inside the snap's edit
+    command, so Undo Last Snap / Edit > Undo takes it back with the snap.
+
+    "On the edge" is tested in the working CRS (straight edges as the map draws them). The vertices are
+    written in the layer's CRS: a shared vertex gets the other feature's own layer coordinate, so both
+    features hold exactly the same point."""
+    from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsFeatureRequest,
+                           QgsGeometry, QgsPointXY, QgsProject, QgsWkbTypes)
+
+    ea = scan.ea
+    layer_id = layer.id()
+    tol = SHARE_TOL_M
+    by_fid = {int(f): i for i, f, l in zip(ea.index, ea["src_fid"], ea["src_layer"]) if l == layer_id}
+    to_work = to_layer = None
+    if layer.crs().isValid() and layer.crs().authid() != DATA_CRS:
+        work = QgsCoordinateReferenceSystem(DATA_CRS)
+        to_work = QgsCoordinateTransform(layer.crs(), work, QgsProject.instance())
+        to_layer = QgsCoordinateTransform(work, layer.crs(), QgsProject.instance())
+    geoms, own = {}, {}  # fid -> shapely geometry in the working CRS; fid -> (working xy, layer xy) of its vertices
+
+    def as_work(q):
+        w = QgsGeometry(q)
+        if to_work is not None:
+            w.transform(to_work)
+        return shapely.from_wkb(bytes(w.asWkb()))
+
+    def current(fid):
+        if fid not in geoms:
+            q = layer.getFeature(fid).geometry()
+            geoms[fid] = as_work(q)
+            lxy = np.array([(p.x(), p.y()) for p in q.vertices()], dtype=float).reshape(-1, 2)
+            own[fid] = (shapely.get_coordinates(geoms[fid]), lxy)
+        return geoms[fid]
+
+    touched = set()
+    pairs = []
+    for idx in snapped:
+        fid = int(ea.at[idx, "src_fid"])
+        current(fid)
+        box = layer.getFeature(fid).geometry().boundingBox()
+        box.grow(max(box.width(), box.height()) * 1e-5)
+        for other in layer.getFeatures(QgsFeatureRequest().setFilterRect(box).setNoAttributes()):
+            ofid = other.id()
+            if ofid != fid and ofid in by_fid and (ofid, fid) not in pairs:
+                pairs.append((fid, ofid))
+    keys = {int(f): k for f, k, l in zip(ea["src_fid"], ea["key"], ea["src_layer"]) if l == layer_id} \
+        if "key" in ea.columns else {}
+    ref_lines = {}
+
+    def on_own_ref(fid, p):
+        """True if the point lies on the feature's own reference outline (checked against one): kept put."""
+        if not scan.ref or fid not in keys:
+            return False
+        if fid not in ref_lines:
+            r = scan.ref.get(keys[fid])
+            ref_lines[fid] = r.boundary if r is not None else None
+        return ref_lines[fid] is not None and shapely.distance(p, ref_lines[fid]) <= SAME_VERTEX_M
+
+    def move_vertex(p, q, near):
+        """Move vertex p to q in every loaded feature that has it (a vertex shared with a third feature moves
+        there too, so that pair stays matched). All or nothing: refused if any result is invalid."""
+        new = {}
+        for f in near:
+            g = geoms[f]
+            xy = shapely.get_coordinates(g)
+            hit = ((xy - p) ** 2).sum(axis=1) <= SAME_VERTEX_M ** 2
+            if hit.any():
+                xy[hit] = q
+                g2 = shapely.set_coordinates(shapely.from_wkb(shapely.to_wkb(g)), xy)
+                if not g2.is_valid or abs(g2.area - g.area) > tol * g.length:
+                    return False
+                new[f] = g2
+        geoms.update(new)
+        touched.update(new)
+        return bool(new)
+
+    def pair(fid, ofid):
+        """Vertices of fid lying within tol of ofid's edge, put onto it. Returns how many."""
+        a, b = current(fid), current(ofid)
+        if shapely.distance(a, b) > tol:
+            return 0
+        done = 0
+        line, bxy = b.boundary, np.unique(shapely.get_coordinates(b), axis=0)
+        bpts = shapely.points(bxy)
+        xy = np.unique(shapely.get_coordinates(a), axis=0)
+        pts = shapely.points(xy)
+        d = shapely.distance(pts, line)
+        for p, pt, dist in zip(xy, pts, d):
+            if dist > tol or shapely.distance(pt, bpts).min() <= SAME_VERTEX_M:
+                continue  # not near the edge, or already one of its vertices
+            if dist > SAME_VERTEX_M and not on_own_ref(fid, pt):
+                # off the edge: move the vertex onto the neighbour's vertex nearby, else onto its edge
+                vd = shapely.distance(pt, bpts)
+                q = bxy[int(vd.argmin())] if vd.min() <= tol else \
+                    np.array(shapely.get_coordinates(shapely.shortest_line(pt, line))[1])
+                if not move_vertex(p, q, [f for f in geoms if shapely.distance(geoms[f], pt) <= tol]):
+                    continue
+                p, pt = q, shapely.points(q)
+                if shapely.distance(pt, bpts).min() <= SAME_VERTEX_M:
+                    done += 1
+                    continue
+            # on the edge (or kept on its own reference line): put it into the neighbour's edge
+            new_b, nb = _vertices_onto(geoms[ofid], np.array([p]), tol)
+            if nb:
+                geoms[ofid] = new_b
+                touched.add(ofid)
+                done += 1
+        return done
+
+    def weld():
+        """Vertices within DUPLICATE_M of each other, in any loaded feature, become one identical point in
+        every feature that has them (one on a feature's own reference line wins, else the most shared one),
+        then exact duplicates and spikes are dropped. Done for all features at once, so a vertex pair
+        between neighbours stays a pair."""
+        fids = list(geoms)
+        arrays = [shapely.get_coordinates(geoms[f]) for f in fids]
+        if not arrays:
+            return
+        xy = np.concatenate(arrays)
+        owner = np.concatenate([np.full(len(a), k) for k, a in enumerate(arrays)])
+        pts = shapely.points(xy)
+        i, j = shapely.STRtree(pts).query(pts, predicate="dwithin", distance=DUPLICATE_M)
+        keep = (i < j) & (((xy[i] - xy[j]) ** 2).sum(axis=1) > SAME_VERTEX_M ** 2)
+        if not keep.any():
+            new_xy = xy
+        else:
+            parent = list(range(len(xy)))
+
+            def root(k):
+                while parent[k] != k:
+                    parent[k] = parent[parent[k]]
+                    k = parent[k]
+                return k
+            for a, b in zip(i[keep], j[keep]):
+                parent[root(a)] = root(b)
+            groups = {}
+            for k in np.unique(np.concatenate([i[keep], j[keep]])):
+                groups.setdefault(root(k), []).append(k)
+            # every vertex at (or within a micron of) a group member belongs to it too
+            new_xy = xy.copy()
+            for members in groups.values():
+                cand = np.array(members)
+                score = []
+                for k in cand:
+                    same = ((xy - xy[k]) ** 2).sum(axis=1) <= SAME_VERTEX_M ** 2
+                    on_ref = any(on_own_ref(fids[o], pts[k]) for o in np.unique(owner[same]))
+                    score.append((on_ref, int(same.sum())))
+                rep = xy[cand[max(range(len(cand)), key=lambda n: score[n])]]
+                for k in cand:
+                    same = ((xy - xy[k]) ** 2).sum(axis=1) <= SAME_VERTEX_M ** 2
+                    new_xy[same] = rep
+        start = 0
+        for f, a in zip(fids, arrays):
+            g = geoms[f]
+            part = new_xy[start:start + len(a)]
+            start += len(a)
+            g2 = g if np.array_equal(part, a) else shapely.set_coordinates(shapely.from_wkb(shapely.to_wkb(g)), part)
+            g2 = clean_vertices(g2, SAME_VERTEX_M)
+            if g2 is g:
+                continue
+            if g2.is_valid and abs(g2.area - g.area) <= tol * g.length:
+                geoms[f] = g2
+                touched.add(f)
+
+    for fid, ofid in pairs:  # load them and their neighbours, so a vertex moved is found in every feature
+        for f in (fid, ofid):  # that has it
+            current(f)
+            box = layer.getFeature(f).geometry().boundingBox()
+            box.grow(max(box.width(), box.height()) * 1e-5)
+            for other in layer.getFeatures(QgsFeatureRequest().setFilterRect(box).setNoAttributes()):
+                if other.id() in by_fid:
+                    current(other.id())
+    weld()  # first, no near-duplicate vertices / spikes (e.g. left by the snap's overlay)
+    for _ in range(3):  # a vertex put in can bring another within reach: repeat until nothing changes
+        added = 0
+        for fid, ofid in pairs:
+            added += pair(fid, ofid) + pair(ofid, fid)
+        if not added:
+            break
+    weld()  # a vertex put in or moved can land next to another: one point again, everywhere
+
+    if not touched:
+        return 0
+    # every known vertex: working xy -> its exact layer xy (a shared vertex takes its owner's coordinate)
+    pool_work = np.concatenate([w for w, _ in own.values()])
+    pool_layer = np.concatenate([l for _, l in own.values()])
+
+    def convert(p):
+        q = to_layer.transform(QgsPointXY(float(p[0]), float(p[1])))
+        return q.x(), q.y()
+
+    for fid in touched:
+        idx = by_fid[fid]
+        geom = geoms[fid]
+        if to_layer is not None:
+            geom = shapely.set_coordinates(geom, layer_xy(geom, pool_work, pool_layer, convert))
+        g = QgsGeometry()
+        g.fromWkb(shapely.to_wkb(geom))
+        if QgsWkbTypes.isMultiType(layer.wkbType()):
+            g.convertToMultiType()
+        if g.isNull() or not g.isGeosValid() or not layer.changeGeometry(fid, g):
+            continue
+        if idx not in undo_geoms:
+            undo_geoms[idx] = ea.at[idx, "geometry"]
+        ea.at[idx, "geometry"] = as_work(layer.getFeature(fid).geometry())
+        ea.at[idx, "src_hash"] = geometry_hash(layer.getFeature(fid).geometry())
+    return len(touched)
+
+
+VERTEX_MARK_M = 0.05  # each unmatched vertex is shown in the list's layer as a 10 cm square around it
+
+
+def neighbour_lists(geoms):
+    """For each geometry, the indexes of the others within SHARE_TOL_M of it."""
+    geoms = list(geoms)
+    out = [[] for _ in geoms]
+    if len(geoms) < 2:
+        return out
+    i, j = shapely.STRtree(geoms).query(geoms, predicate="dwithin", distance=SHARE_TOL_M)
+    for a, b in zip(i, j):
+        if a != b:
+            out[int(a)].append(int(b))
+    return out
+
+
+def vertex_problems(geoms, i, nbrs):
+    """Vertices of geoms[i] (working CRS) that need matching, as an (n, 2) array: within SHARE_TOL_M of a
+    neighbour's edge without the neighbour having a vertex there (within SAME_VERTEX_M), or closer than
+    DUPLICATE_M to the next vertex of the same ring (a duplicate)."""
+    g = geoms[i]
+    if g is None or g.is_empty:
+        return np.empty((0, 2))
+    xy = np.unique(shapely.get_coordinates(g), axis=0)
+    pts = shapely.points(xy)
+    bad = np.zeros(len(xy), dtype=bool)
+    for j in nbrs:
+        b = geoms[j]
+        if b is None or b.is_empty or shapely.distance(g, b) > SHARE_TOL_M:
+            continue
+        near = np.flatnonzero(shapely.distance(pts, b.boundary) <= SHARE_TOL_M)
+        if not len(near):
+            continue
+        bv = shapely.points(np.unique(shapely.get_coordinates(b), axis=0))
+        hit = shapely.STRtree(bv).query_nearest(pts[near], max_distance=SAME_VERTEX_M, return_distance=False,
+                                                all_matches=False)[0]
+        miss = np.ones(len(near), dtype=bool)
+        miss[hit] = False
+        bad[near[miss]] = True
+    dups = []
+    for poly in shapely.get_parts(g):
+        for ring in [poly.exterior, *poly.interiors]:
+            c = shapely.get_coordinates(ring)[:-1]
+            if len(c) < 2:
+                continue
+            step = np.hypot(*(np.roll(c, -1, axis=0) - c).T)
+            dups.extend(c[step <= DUPLICATE_M])
+    out = xy[bad]
+    if dups:
+        out = np.unique(np.vstack([out, np.array(dups)]), axis=0)
+    return out
+
+
+def find_vertex_issues(ea, unit="EA"):
+    """One 'Unmatched vertices' row per feature with vertices to match (see vertex_problems): Snap Selected
+    matches them (share_vertices). The row's shape is a small square around each such vertex."""
+    cols = ["Issue", *TABLE_KEYS, "_ea_idx", "_snappable", "_kind", "_candidates"]
+    geoms = list(ea.geometry.values)
+    nbrs = neighbour_lists(geoms)
+    rows = []
+    codes = ea["EA Geocode"].astype(str).values
+    for k, idx in enumerate(ea.index):
+        pts = vertex_problems(geoms, k, nbrs[k])
+        if not len(pts):
+            continue
+        marks = shapely.union_all(shapely.buffer(shapely.points(pts), VERTEX_MARK_M, cap_style="square"))
+        others = sorted({codes[j] for j in nbrs[k]})
+        admin = {c: (ea.at[idx, f"ea_{c}"] if f"ea_{c}" in ea.columns else ea.at[idx, c] if c in ea.columns else "")
+                 for c in ADMIN}
+        rows.append({
+            "Issue": VERTEX_ISSUE,
+            "EA Geocode": codes[k],
+            **admin,
+            "EA": "" if pd.isna(ea.at[idx, "EA"]) else str(ea.at[idx, "EA"]) if "EA" in ea.columns else "",
+            "Area (sqm)": 0.0,
+            "Fix EA": codes[k],
+            "Status": STATUS_PENDING,
+            "Note": f"{len(pts)} vertex(es) without their partner on a neighbouring {unit} "
+                    f"({', '.join(others[:5])}{'...' if len(others) > 5 else ''}) or duplicated: Snap matches "
+                    "them (moved at most 1 cm; a vertex on its barangay line stays put)",
+            "_ea_idx": int(idx),
+            "_snappable": True,
+            "_kind": "vertex",
+            "_candidates": [int(idx)],
+            "geometry": marks,
+        })
+    if not rows:
+        return gpd.GeoDataFrame({c: [] for c in cols}, geometry=[], crs=DATA_CRS)
+    return gpd.GeoDataFrame(rows, geometry="geometry", crs=DATA_CRS)
+
+
+def match_vertices(scan):
+    """Give every pair of neighbouring features of the scanned layer(s) the same vertices along their shared
+    edges (share_vertices on all of them): a vertex of one within SHARE_TOL_M of the other's edge is put
+    into that edge too. One edit command per layer, recorded like a snap so Undo Last Snap takes it back.
+    Returns the number of features changed."""
+    from qgis.core import QgsProject
+
+    use_crs(scan.crs)
+    ea = scan.ea
+    total, undo_layers, undo_geoms = 0, [], {}
+    for layer_id in dict.fromkeys(ea["src_layer"]):
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if layer is None or (not layer.isEditable() and not layer.startEditing()):
+            continue
+        command = "Match vertices along shared edges"
+        layer.beginEditCommand(command)
+        try:
+            n = share_vertices(scan, layer, list(ea.index[ea["src_layer"] == layer_id]), undo_geoms)
+        finally:
+            layer.endEditCommand()
+            layer.triggerRepaint()
+        if n:
+            total += n
+            undo_layers.append((layer_id, command, layer.undoStack().index()))
+    if undo_layers:
+        scan.history.append({"layers": undo_layers, "rows": {}, "geoms": undo_geoms})
+    return total
+
+
 def snap_rows(scan, rows):
     """Snap the selected discrepancy rows. Returns {row: (status, message)} for the rows it handled.
 
@@ -965,6 +1748,7 @@ def snap_rows(scan, rows):
     """
     from qgis.core import QgsProject, QgsWkbTypes
 
+    use_crs(scan.crs)
     d, ea, unit = scan.discrepancies, scan.ea, scan.unit
     Unit = unit[0].upper() + unit[1:]
     outcome, todo = {}, {}
@@ -979,6 +1763,7 @@ def snap_rows(scan, rows):
             todo.setdefault(int(d.at[r, "_ea_idx"]), []).append(r)
 
     edits = {}  # layer id -> the edits to make in that layer
+    vertex_todo = {}  # layer id -> [(feature, its Unmatched vertices rows)]
     undo_layers, undo_geoms = [], {}  # for undo_last_snap: (layer id, edit command), feature -> old geometry
     for idx, ea_rows in todo.items():
         code = ea.at[idx, "EA Geocode"]
@@ -1000,11 +1785,17 @@ def snap_rows(scan, rows):
             fail("it was edited after the scan. Scan again")
             continue
 
+        vtx_rows = [r for r in ea_rows if d.at[r, "_kind"] == "vertex"]
+        if vtx_rows:  # Unmatched vertices: matched in the layer's edit command below (share_vertices)
+            vertex_todo.setdefault(layer_id, []).append((idx, vtx_rows))
+            ea_rows = [r for r in ea_rows if d.at[r, "_kind"] != "vertex"]
+            if not ea_rows:
+                continue
         cut_rows = [r for r in ea_rows if d.at[r, "_kind"] == "cut"]
         add_rows = [r for r in ea_rows if d.at[r, "_kind"] == "add"]
         old = ea.geometry[idx]
-        new, why = snapped_geometry(old, [d.geometry[r] for r in cut_rows], [d.geometry[r] for r in add_rows],
-                                    scan.min_area)
+        cuts, adds, clip = snap_inputs(scan, idx, ea_rows)
+        new, why = snapped_geometry(old, cuts, adds, scan.min_area, clip=clip)
         if new is None:
             fail(f"the result would be {why}")
             continue
@@ -1031,13 +1822,14 @@ def snap_rows(scan, rows):
 
     what = "overlaps / gaps" if scan.self_check else f"{MODES[scan.mode]['ref_unit']} boundaries"
     try:
-        for layer_id, layer_edits in edits.items():
+        for layer_id in dict.fromkeys([*edits, *vertex_todo]):
+            layer_edits, vtx = edits.get(layer_id, []), vertex_todo.get(layer_id, [])
             ea_layer = QgsProject.instance().mapLayer(layer_id)
             if not ea_layer.isEditable() and not ea_layer.startEditing():
-                for _, ea_rows, *_ in layer_edits:
+                for _, ea_rows, *_ in [*layer_edits, *vtx]:
                     outcome.update({r: (STATUS_FAILED, f"'{ea_layer.name()}' cannot be edited") for r in ea_rows})
                 continue
-            command = f"Snap {len(layer_edits)} {unit}(s) to {what}"
+            command = f"Snap {len(layer_edits)} {unit}(s) to {what}" if layer_edits else                 f"Match the vertices of {len(vtx)} {unit}(s)"
             ea_layer.beginEditCommand(command)
             changed = False
             try:
@@ -1054,6 +1846,22 @@ def snap_rows(scan, rows):
                     else:
                         outcome.update({r: (STATUS_FAILED, f"{Unit} {code} not changed: the layer refused the edit")
                                         for r in ea_rows})
+                snapped = [idx for idx, *_ in layer_edits if idx in undo_geoms] + [idx for idx, _ in vtx]
+                if snapped and share_vertices(scan, ea_layer, snapped, undo_geoms):
+                    changed = True
+                if vtx:  # each Unmatched vertices row: done only if nothing is left to match on its feature
+                    geoms = list(ea.geometry.values)
+                    nbrs = neighbour_lists(geoms)
+                    pos = {i: k for k, i in enumerate(ea.index)}
+                    for idx, rs in vtx:
+                        left = len(vertex_problems(geoms, pos[idx], nbrs[pos[idx]]))
+                        code = ea.at[idx, "EA Geocode"]
+                        outcome.update({r: (STATUS_DONE, f"{Unit} {code}: vertices matched") if not left else
+                                        (STATUS_FAILED, f"{Unit} {code}: {left} vertex(es) could not be matched: "
+                                         "more than 1 cm off, the edit would make it invalid, or (checked against "
+                                         "barangays) both vertices lie on their own barangay lines, which differ "
+                                         "there by a hair. Match them in EA vs EA (no barangay line is kept "
+                                         "there), or by hand") for r in rs})
             finally:
                 ea_layer.endEditCommand()  # never leave the layer inside an open edit command
                 ea_layer.triggerRepaint()
@@ -1302,6 +2110,8 @@ def run_check(bgy_layers, ea_layers, min_area, step=print, mode="ea_bgy"):
         raise ValueError(f"{m['label']} needs a {m['ref_unit']} layer")
     if not ea_layers:
         raise ValueError(f"No {unit} layer to check")
+    use_crs(choose_work_crs(ea_layers + bgy_layers))
+    step(f"Working CRS: {DATA_CRS} (edges straight as the map draws them)")
     ea = _load_targets(ea_layers, mode, step)
     if self_check:
         step(f"Checking the {unit}s against each other (overlaps and gaps)...")
@@ -1317,12 +2127,23 @@ def run_check(bgy_layers, ea_layers, min_area, step=print, mode="ea_bgy"):
             warn(f"{len(no_ea):,} {m['ref_unit']}(s) have no {unit}, so they are not in the output: "
                  f"{', '.join(names)}{more}")
 
+    step(f"Checking the vertices along shared edges of the {unit}s...")
+    vertex_rows = find_vertex_issues(ea, unit)
+    if len(vertex_rows):
+        discrepancies = gpd.GeoDataFrame(pd.concat([discrepancies, vertex_rows], ignore_index=True),
+                                         geometry="geometry", crs=DATA_CRS) if len(discrepancies) else \
+            vertex_rows.reset_index(drop=True)
+
     layer, fids = None, []
     if len(discrepancies):
         step("Creating the output layer...")
         layer, fids = to_memory_layer(discrepancies, f"Discrepancies {datetime.now():%Y-%m-%d %H:%M:%S}",
                                       mode_issues(mode, self_check))
-    return Scan(ea, discrepancies, layer, fids, min_area, mode, self_check)
+    scan = Scan(ea, discrepancies, layer, fids, min_area, mode, self_check)
+    scan.crs = DATA_CRS
+    if not self_check:
+        scan.ref = {k: g for k, g in zip(bgy["key"], bgy.geometry.values) if g is not None}
+    return scan
 
 
 # ================= RESULT TEXT =================
@@ -1363,10 +2184,10 @@ GRP_STYLE = ("QGroupBox { font-weight:600; margin-top:6px; } "
 LEFT_WIDTH = 315
 # Map highlight on double-click / Zoom to Selected: dotted outline + circle on the discrepancy (by what a
 # snap does) and a dotted green outline of the Fix feature as it will be after Snap Selected.
-HIGHLIGHT_COLOURS = {"cut": "#ff6d00", "add": "#d50000", "none": "#616161", "after": "#00c853"}
+HIGHLIGHT_COLOURS = {"cut": "#ff6d00", "add": "#d50000", "none": "#616161", "after": "#00c853", "vertex": "#00acc1"}
 BLINKS = 6           # on/off steps of 300 ms, then the outlines stay drawn
 MAX_PREVIEWS = 50    # most "after snap" outlines drawn at once
-MIN_ZOOM_DEG = 0.0005  # ~55 m: zooming to a tiny piece (e.g. 1 sqm) still shows its surroundings
+MIN_ZOOM_M = 55.0  # 55 m: zooming to a tiny piece (e.g. 1 sqm) still shows its surroundings
 
 NO_RESULTS = "No scan yet. Choose a check mode and tick the layers on the left, then click Scan."
 
@@ -1511,7 +2332,8 @@ HELP_HTML = f"""
         <b>Select All</b> in each list. All ticked layers are scanned together.</li>
     <li>Click <b>Scan</b>. Progress and warnings appear in the Log.</li>
     <li>Review the <b>Discrepancies</b> list: click a row to flash it on the map, double-click to zoom. The zoom
-        blinks a <b>dotted outline with a circle</b> on the discrepancy (orange = cut off, red = added, grey = fix by hand) and a
+        blinks a <b>dotted outline</b> on the discrepancy, with a <b>circle on each vertex of the Fix feature that is out of
+        place</b> (not yet on its neighbour's edge), in orange = cut off, red = added, grey = fix by hand, and a
         <b>dotted green outline</b> of the Fix feature as it will be after <b>Snap Selected</b>, so even a
         1 sqm piece is easy to see and check before snapping. <b>Zoom to Selected</b> does the same for
         several rows. Untick <b>Blinking dotted outline and snap preview on zoom</b> (Snap panel) for the plain
@@ -1582,6 +2404,10 @@ HELP_HTML = f"""
                      "because no feature had most of its border, or a detached piece such as an island "
                      "(the features of its reference area, nearest first)."),
       ("Snap Selected", "Changes the features named in Fix for the selected rows. Unsaved, undoable edits."),
+      ("Match Vertices", "Pairs the vertices along every shared edge of the checked layer: a vertex within 1 cm "
+                         "of a neighbour's edge is moved onto it and added to the neighbour, so both hold the same "
+                         "point. In EA vs BGY a vertex on its barangay line is never moved. <b>Undo Last Snap</b> "
+                         "takes it back."),
       ("Undo Last Snap", "Takes back the last <b>Snap Selected</b>: the features return to their shape before it and "
                          "its rows to the status they had before it (normally <i>Not snapped</i>). Press again to "
                          "undo the snap before that. It is refused (nothing changes) if you edited those layers or "
@@ -1607,7 +2433,32 @@ HELP_HTML = f"""
         Selected).</li>
     <li>Only the geometry changes; attributes such as household counts stay as they are.</li>
     <li>Before a feature is changed, the new shape is checked (valid, not empty, expected area, fits the layer)
-        and the feature must not have been edited since the scan. Otherwise the row is marked Failed.</li>
+        and the feature must not have been edited since the scan. It must also really fix what was selected
+        (cut pieces gone, gaps covered), so a row marked Snapped does not come back on the next scan.
+        Otherwise the row is marked Failed.</li>
+    <li>After a snap, the snapped feature and its neighbours get the <b>same vertices</b> along their shared
+        edge: a vertex of one within 1 cm of the other's edge is moved onto it (onto the neighbour's vertex if
+        one is that close) and added to the neighbour too. Checked against a barangay layer, a vertex on its
+        barangay line is never moved.</li>
+    <li>Every scan also lists <b>Unmatched vertices</b> (teal): one row per feature that has a vertex within
+        1 cm of a neighbour's edge with no partner vertex there, or two vertices within 2 mm (a duplicate).
+        Zoom to see circles on those vertices; <b>Snap Selected</b> matches them and marks the row Snapped
+        once nothing is left. A vertex lying on its own barangay line is never moved in EA vs BGY: if both
+        vertices of a pair lie on their own (slightly different) barangay lines, the row is Failed: match it in
+        EA vs EA instead.</li>
+    <li><b>Match Vertices</b> does the same for every shared edge of the checked layer, also where nothing was
+        snapped (e.g. vertices already a hair off in the data). Vertices within 2 mm of each other become one
+        point (no duplicate vertices or spikes are left). Undo Last Snap takes it back. Best run last,
+        from an EA vs BGY scan, then Scan again to confirm.</li>
+    <li>Checks and snaps run in a projected CRS in metres, so an edge is straight exactly as the map draws
+        it: the layers' own CRS when projected, else the map's CRS, else the UTM zone of the data (the Log
+        names it). A snapped edge then lies on the barangay line at any zoom, also along km-long edges.</li>
+    <li>Recommended order: <b>EA vs EA</b> first, then <b>EA vs BGY</b>, then EA vs EA again to confirm. A long
+        hairline strip may need a second Scan and Snap in EA vs BGY. A gap EA vs EA still finds after that
+        is land in no barangay: check the barangay layer there.</li>
+    <li>Features checked against each other: an overlap is cut along the kept feature's own outline and an
+        added gap is clipped by the features around it, so the fixed edge lands exactly on the neighbour's
+        edge. Every other vertex of the feature stays where it was.</li>
   </ul>
 
   <h3 style="color:#111827; margin:12px 0 4px 0;">Troubleshooting</h3>
@@ -2051,10 +2902,18 @@ def make_dialog_class():
                 "before that. Refused if you edited those layers or used Edit > Undo afterwards; not\n"
                 "possible once their edits were saved or discarded.")
             self.undo_btn.clicked.connect(self.undo_snap)
+            self.match_btn = button("Match Vertices", 32, "/mActionVertexTool.svg")
+            self.match_btn.setToolTip(
+                "Pair the vertices along every shared edge of the checked layer: a vertex of one feature\n"
+                "within 1 cm of a neighbour's edge is moved onto it (onto the neighbour's vertex if one is that\n"
+                "close) and put into the neighbour too, so both hold the same point. Checked against a\n"
+                "barangay layer, a vertex on its barangay line is never moved. Undo Last Snap takes it back.")
+            self.match_btn.clicked.connect(self.match_all)
             arow.addWidget(self.select_btn, 1)
             arow.addWidget(self.zoom_button, 1)
             arow.addWidget(self.switch_btn, 1)
             arow.addWidget(self.snap_button, 2)
+            arow.addWidget(self.match_btn, 1)
             arow.addWidget(self.undo_btn, 1)
             gf.addLayout(arow)
             self.highlight_chk = QtWidgets.QCheckBox("Blinking dotted outline and snap preview on zoom")
@@ -2847,11 +3706,12 @@ def make_dialog_class():
             has_rows = self.table.rowCount() > 0
             idle = not self.running
             self.scan_button.setEnabled(self._inputs_ok and idle)
-            self.snap_group.setEnabled(has_rows and idle)
+            self.snap_group.setEnabled((has_rows or self.scan_result is not None) and idle)
             self.zoom_btn.setEnabled(bool(rows) and idle)
             self.zoom_button.setEnabled(bool(rows) and idle)
             self.snap_button.setEnabled(bool(statuses & snappable) and idle)
             self.undo_btn.setEnabled(idle and self.scan_result is not None and bool(self.scan_result.history))
+            self.match_btn.setEnabled(idle and self.scan_result is not None)
             self.select_btn.setEnabled(has_rows and idle)
             self.switch_btn.setEnabled(idle and self.scan_result is not None
                                        and any(self.can_switch(r) for r in rows))
@@ -3032,8 +3892,8 @@ def make_dialog_class():
                     extent.combineExtentWith(box)
             if extent is None:
                 return
-            if max(extent.width(), extent.height()) < MIN_ZOOM_DEG:  # e.g. a 1 sqm piece: keep some context
-                c, h = extent.center(), MIN_ZOOM_DEG / 2
+            if max(extent.width(), extent.height()) < MIN_ZOOM_M:  # e.g. a 1 sqm piece: keep some context
+                c, h = extent.center(), MIN_ZOOM_M / 2
                 extent = QgsRectangle(c.x() - h, c.y() - h, c.x() + h, c.y() + h)
             canvas = self.iface.mapCanvas()
             to_canvas = QgsCoordinateTransform(layer.crs(), canvas.mapSettings().destinationCrs(), QgsProject.instance())
@@ -3074,7 +3934,7 @@ def make_dialog_class():
             from qgis.gui import QgsRubberBand
 
             canvas = self.iface.mapCanvas()
-            to_canvas = QgsCoordinateTransform(QgsCoordinateReferenceSystem(DATA_CRS),
+            to_canvas = QgsCoordinateTransform(QgsCoordinateReferenceSystem(self.scan_result.crs),
                                                canvas.mapSettings().destinationCrs(), QgsProject.instance())
 
             def band(geom, colour, style, width, kind=QgsWkbTypes.PolygonGeometry, alpha=70):
@@ -3091,7 +3951,7 @@ def make_dialog_class():
                 b.setLineStyle(style)
                 if kind == QgsWkbTypes.PointGeometry:
                     b.setIcon(QgsRubberBand.ICON_CIRCLE)
-                    b.setIconSize(22)
+                    b.setIconSize(16)
                 self.bands.append(b)
 
             d, ea = self.scan_result.discrepancies, self.scan_result.ea
@@ -3100,15 +3960,14 @@ def make_dialog_class():
             for r in df_rows:
                 colour = HIGHLIGHT_COLOURS.get(d.at[r, "_kind"], HIGHLIGHT_COLOURS["none"])
                 band(d.geometry[r], colour, Qt.DashLine, 3)
-                band(d.geometry[r].representative_point(), colour, Qt.SolidLine, 3, QgsWkbTypes.PointGeometry, 0)
-                if d.at[r, "Status"] != STATUS_DONE and bool(d.at[r, "_snappable"]):
+                # circles on the Fix feature's vertices that are out of place (not at a random inside point)
+                band(unsnapped_vertices(self.scan_result, r), colour, Qt.SolidLine, 2, QgsWkbTypes.PointGeometry, 0)
+                if d.at[r, "Status"] != STATUS_DONE and bool(d.at[r, "_snappable"]) and d.at[r, "_kind"] != "vertex":
                     todo.setdefault(int(d.at[r, "_ea_idx"]), []).append(r)
             previews = 0
             for idx, rs in list(todo.items())[:MAX_PREVIEWS]:
-                new, _why = snapped_geometry(ea.geometry[idx],
-                                             [d.geometry[r] for r in rs if d.at[r, "_kind"] == "cut"],
-                                             [d.geometry[r] for r in rs if d.at[r, "_kind"] == "add"],
-                                             self.scan_result.min_area)
+                cuts, adds, clip = snap_inputs(self.scan_result, idx, rs)
+                new, _why = snapped_geometry(ea.geometry[idx], cuts, adds, self.scan_result.min_area, clip=clip)
                 if new is not None:
                     band(new, HIGHLIGHT_COLOURS["after"], Qt.DotLine, 3, alpha=35)
                     previews += 1
@@ -3242,6 +4101,24 @@ def make_dialog_class():
                 finally:
                     self.set_busy(False)
             return outcome
+
+        def match_all(self):
+            """Match Vertices: pair the vertices along all shared edges of the scanned layer(s)."""
+            if self.running or self.scan_result is None:
+                return
+            self.clear_highlight()
+            try:
+                n = match_vertices(self.scan_result)
+            except Exception as e:
+                self.log(f"Match Vertices failed: {e}")
+                self.update_buttons()
+                return
+            if n:
+                self.log(f"Matched the vertices along shared edges: {n:,} feature(s) changed (unsaved edits; "
+                         "Undo Last Snap takes it back). Scan again to confirm.")
+            else:
+                self.log("Match Vertices: every vertex along a shared edge already has its pair.")
+            self.update_buttons()
 
         def undo_snap(self):
             """Undo Last Snap: takes back the last Snap Selected and gives its rows their earlier status."""
