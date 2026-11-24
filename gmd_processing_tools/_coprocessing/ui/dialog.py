@@ -82,8 +82,8 @@ try:
         to_whole_number_str,
     )
     from ..db.database import (
-        POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder,
-        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT
+        POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder, find_popcen_files_in_folder,
+        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, is_valid_mun_name, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
     )
 except (ImportError, ValueError):
     from algorithm import (
@@ -96,8 +96,8 @@ except (ImportError, ValueError):
         to_whole_number_str,
     )
     from database import (
-        POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder,
-        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT
+        POPCENDatabase, find_earf_files_in_folder, find_gpkg_files_in_folder, find_popcen_files_in_folder,
+        get_gpkg_polygon_layer_info, validate_gpkg_columns, REQUIRED_GPKG_COLUMNS, compute_recoded_enumeration_areas, audit_matched_flags, export_output_summary_to_excel, is_summary_header_record, is_valid_mun_name, DEFAULT_FINAL_EXPORT_ROOT, DEFAULT_GPKG_ROOT, DEFAULT_EARF_ROOT, DEFAULT_POPCEN_ROOT
     )
 
 if "DEFAULT_GPKG_ROOT" not in globals():
@@ -105,6 +105,9 @@ if "DEFAULT_GPKG_ROOT" not in globals():
 
 if "DEFAULT_EARF_ROOT" not in globals():
     DEFAULT_EARF_ROOT = r"D:\PSA-GIS\Camarines Sur\Project 1MAP\3_EA Delineation and Merging\1_Downloaded Files\Output\2_output_files"
+
+if "DEFAULT_POPCEN_ROOT" not in globals():
+    DEFAULT_POPCEN_ROOT = r"Y:\geotags-uploads\ea-delineation"
 
 
 try:
@@ -139,6 +142,24 @@ except NameError:
         except (ValueError, TypeError):
             pass
         return s
+
+
+def format_time_duration(seconds: float) -> str:
+    """Formats a duration in seconds into a friendly human-readable string (e.g. 45s, 2m 15s, 1h 05m 20s)."""
+    if seconds is None or seconds < 0:
+        return "0s"
+    total_sec = int(round(seconds))
+    if total_sec < 60:
+        return f"{total_sec}s"
+    elif total_sec < 3600:
+        mins = total_sec // 60
+        secs = total_sec % 60
+        return f"{mins}m {secs:02d}s"
+    else:
+        hours = total_sec // 3600
+        mins = (total_sec % 3600) // 60
+        secs = total_sec % 60
+        return f"{hours}h {mins:02d}m {secs:02d}s"
 
 
 # --------------------------------------------------------------------------
@@ -920,6 +941,57 @@ class ExecutionWorker(QThread):
 
 
 # --------------------------------------------------------------------------
+# Background Worker for 2024 POPCEN Folder Consolidation
+# --------------------------------------------------------------------------
+class PopcenConsolidationWorker(QThread):
+    progress_signal = pyqtSignal(int, str)
+    finished_signal = pyqtSignal(int, int, str)
+
+    def __init__(self, db, folder_path=None, recursive=True, sheet_name=0, file_list=None, replace=True):
+        super().__init__()
+        self.db = db
+        self.folder_path = folder_path
+        self.recursive = recursive
+        self.sheet_name = sheet_name
+        self.file_list = file_list
+        self.replace = replace
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        def _cb(pct, msg):
+            if self._is_cancelled:
+                return False
+            self.progress_signal.emit(pct, msg)
+            return True
+
+        try:
+            if self.file_list is not None:
+                recs, files = self.db.import_popcen_from_files(
+                    self.file_list,
+                    sheet_name=self.sheet_name,
+                    replace=self.replace,
+                    progress_callback=_cb,
+                )
+            else:
+                recs, files = self.db.import_popcen_from_folder(
+                    self.folder_path,
+                    recursive=self.recursive,
+                    sheet_name=self.sheet_name,
+                    replace=self.replace,
+                    progress_callback=_cb,
+                )
+            if self._is_cancelled:
+                self.finished_signal.emit(0, 0, "Cancelled")
+            else:
+                self.finished_signal.emit(recs, files, "")
+        except Exception as e:
+            self.finished_signal.emit(0, 0, str(e))
+
+
+# --------------------------------------------------------------------------
 # Background Worker for Database Import (POPCEN)
 # --------------------------------------------------------------------------
 class DbImportWorker(QThread):
@@ -1689,6 +1761,9 @@ class DeliverablesExportWorker(QThread):
 
             c_code = task.get("city_mun", "")
             m_name = task.get("mun_name", c_code)
+            if not is_valid_mun_name(m_name):
+                h = self.db.get_citymun_hierarchy(c_code)
+                m_name = h.get("city_mun") or f"City/Mun {c_code}"
             out_gpkg = task.get("out_gpkg_path", "")
             out_excel = task.get("out_excel_path", "")
             out_mis = task.get("out_mis_path", "")
@@ -1706,8 +1781,16 @@ class DeliverablesExportWorker(QThread):
                 if self._is_cancelled:
                     return False
                 overall = int(base_pct + (sub_pct / 100.0) * (task_slice * 0.40))
-                self.progress_signal.emit(min(overall, 99), f"[{t_idx+1}/{total_tasks}] {m_name}: {msg}")
+                self.progress_signal.emit(
+                    min(overall, 99),
+                    f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): {msg}"
+                )
                 return True
+
+            exp_gpkg = task.get("export_gpkg", True)
+            exp_earf = task.get("export_earf", True)
+            exp_mis = task.get("export_mis", True)
+            exp_pcd = task.get("export_pcd", True)
 
             task_res = {
                 "city_mun": c_code,
@@ -1715,30 +1798,44 @@ class DeliverablesExportWorker(QThread):
                 "clean_cm": layer_name,
                 "count": 0,
                 "geom_count": 0,
-                "gpkg_path": out_gpkg,
-                "excel_path": out_excel,
-                "mis_path": out_mis,
-                "pcd_path": out_pcd,
+                "gpkg_path": out_gpkg if exp_gpkg else None,
+                "excel_path": out_excel if exp_earf else None,
+                "mis_path": out_mis if exp_mis else None,
+                "pcd_path": out_pcd if exp_pcd else None,
                 "success": False,
                 "error": None
             }
 
             try:
-                # 1. GeoPackage Export (40% of slice)
-                self.progress_signal.emit(
-                    max(base_pct, 1),
-                    f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): Generating GeoPackage..."
-                )
-                cnt, geom_cnt = self.db.export_matched_to_gpkg(
-                    out_gpkg_path=out_gpkg,
-                    search=search,
-                    status=status,
-                    ea_lifecycle=ea_lifecycle,
-                    city_mun=c_code,
-                    geometry_sources=geometry_sources,
-                    layer_name=layer_name,
-                    progress_callback=_gpkg_cb,
-                )
+                cnt = 0
+                geom_cnt = 0
+
+                # 1. GeoPackage Export (40% of slice if enabled)
+                if exp_gpkg:
+                    self.progress_signal.emit(
+                        max(base_pct, 1),
+                        f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): Generating GeoPackage..."
+                    )
+                    cnt, geom_cnt = self.db.export_matched_to_gpkg(
+                        out_gpkg_path=out_gpkg,
+                        search=search,
+                        status=status,
+                        ea_lifecycle=ea_lifecycle,
+                        city_mun=c_code,
+                        geometry_sources=geometry_sources,
+                        layer_name=layer_name,
+                        progress_callback=_gpkg_cb,
+                    )
+                else:
+                    _, cnt = self.db.query_matched_records(
+                        search=search,
+                        status=status,
+                        ea_lifecycle=ea_lifecycle,
+                        city_mun=c_code,
+                        limit=1,
+                        offset=0,
+                    )
+                    geom_cnt = 0
 
                 if self._is_cancelled:
                     break
@@ -1748,41 +1845,43 @@ class DeliverablesExportWorker(QThread):
 
                 if cnt > 0:
                     # 2. Final EARF Excel Export (25% of slice)
-                    earf_pct = int(base_pct + task_slice * 0.40)
-                    self.progress_signal.emit(
-                        min(earf_pct, 99),
-                        f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): Writing Final EARF Excel..."
-                    )
-                    self.db.export_filtered_matched_to_csv(
-                        out_csv=out_excel,
-                        search=search,
-                        status=status,
-                        ea_lifecycle=ea_lifecycle,
-                        city_mun=c_code,
-                    )
+                    if exp_earf:
+                        earf_pct = int(base_pct + task_slice * 0.40)
+                        self.progress_signal.emit(
+                            min(earf_pct, 99),
+                            f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): Writing Final EARF Excel..."
+                        )
+                        self.db.export_filtered_matched_to_csv(
+                            out_csv=out_excel,
+                            search=search,
+                            status=status,
+                            ea_lifecycle=ea_lifecycle,
+                            city_mun=c_code,
+                        )
 
                     if self._is_cancelled:
                         break
 
                     # 3. Final MIS Excel Export (20% of slice)
-                    mis_pct = int(base_pct + task_slice * 0.65)
-                    self.progress_signal.emit(
-                        min(mis_pct, 99),
-                        f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): Writing Final MIS Excel..."
-                    )
-                    self.db.export_filtered_matched_to_mis_excel(
-                        out_excel=out_mis,
-                        search=search,
-                        status=status,
-                        ea_lifecycle=ea_lifecycle,
-                        city_mun=c_code,
-                    )
+                    if exp_mis:
+                        mis_pct = int(base_pct + task_slice * 0.65)
+                        self.progress_signal.emit(
+                            min(mis_pct, 99),
+                            f"[{t_idx+1}/{total_tasks}] Exporting {m_name} ({c_code}): Writing Final MIS Excel..."
+                        )
+                        self.db.export_filtered_matched_to_mis_excel(
+                            out_excel=out_mis,
+                            search=search,
+                            status=status,
+                            ea_lifecycle=ea_lifecycle,
+                            city_mun=c_code,
+                        )
 
                     if self._is_cancelled:
                         break
 
                     # 4. PCD EARF Excel Export (15% of slice)
-                    if out_pcd:
+                    if exp_pcd and out_pcd:
                         pcd_pct = int(base_pct + task_slice * 0.85)
                         self.progress_signal.emit(
                             min(pcd_pct, 99),
@@ -1794,7 +1893,7 @@ class DeliverablesExportWorker(QThread):
                             status=status,
                             ea_lifecycle=ea_lifecycle,
                             city_mun=c_code,
-                            out_gpkg_path=out_gpkg,
+                            out_gpkg_path=out_gpkg if (exp_gpkg and os.path.exists(out_gpkg)) else None,
                         )
 
                     task_res["success"] = True
@@ -1813,7 +1912,11 @@ class DeliverablesExportWorker(QThread):
             "total_exported": total_exported,
             "total_features": total_features,
             "results": results,
-            "cancelled": self._is_cancelled
+            "cancelled": self._is_cancelled,
+            "export_gpkg": any(t.get("export_gpkg", True) for t in self.tasks),
+            "export_earf": any(t.get("export_earf", True) for t in self.tasks),
+            "export_mis": any(t.get("export_mis", True) for t in self.tasks),
+            "export_pcd": any(t.get("export_pcd", True) for t in self.tasks),
         }
 
         if self._is_cancelled:
@@ -2348,6 +2451,36 @@ class COProcessingDialog(QDialog):
 
         layout.addLayout(export_bar)
 
+        deliverables_bar = QHBoxLayout()
+        deliverables_bar.setContentsMargins(0, 2, 0, 4)
+        deliverables_bar.setSpacing(14)
+        lbl_export_files = QLabel("Export Files:")
+        lbl_export_files.setStyleSheet("font-weight: bold; color: #334155;")
+        deliverables_bar.addWidget(lbl_export_files)
+
+        self.chk_export_gpkg = QCheckBox("Final GeoPackage (.gpkg)")
+        self.chk_export_gpkg.setChecked(True)
+        self.chk_export_gpkg.setToolTip("Generate <pppmm>_ea2026.gpkg")
+        deliverables_bar.addWidget(self.chk_export_gpkg)
+
+        self.chk_export_earf = QCheckBox("Final EARF (.xlsx)")
+        self.chk_export_earf.setChecked(True)
+        self.chk_export_earf.setToolTip("Generate <pppmm>_final_earf_<citymun>.xlsx")
+        deliverables_bar.addWidget(self.chk_export_earf)
+
+        self.chk_export_mis = QCheckBox("Final MIS (.xlsx)")
+        self.chk_export_mis.setChecked(True)
+        self.chk_export_mis.setToolTip("Generate <pppmm>_MIS_<citymun>.xlsx")
+        deliverables_bar.addWidget(self.chk_export_mis)
+
+        self.chk_export_pcd = QCheckBox("PCD EARF (.xlsx)")
+        self.chk_export_pcd.setChecked(True)
+        self.chk_export_pcd.setToolTip("Generate <pppmm>_earf2026_PCD.xlsx")
+        deliverables_bar.addWidget(self.chk_export_pcd)
+
+        deliverables_bar.addStretch()
+        layout.addLayout(deliverables_bar)
+
         # 4. Reconciled Data Grid Table with Multi-Tier Grouped Headers
         self.table_matching = QTableWidget()
         self.table_matching.setObjectName("matchingTable")
@@ -2475,9 +2608,14 @@ class COProcessingDialog(QDialog):
 
         if selected_cm:
             subfolder, hier = self.db.resolve_final_export_subfolder(root_dir, selected_cm)
-            if subfolder:
+            if subfolder and os.path.exists(subfolder):
                 self.txt_match_export_dir.setText(subfolder)
-                self.txt_match_export_dir.setToolTip(f"Export Folder: {hier.get('city_mun')}, {hier.get('province')} ({hier.get('region')})")
+                self.txt_match_export_dir.setToolTip(f"Export Folder: {hier.get('city_mun')}, {hier.get('province')} ({hier.get('region')})\n{subfolder}")
+            else:
+                self.txt_match_export_dir.setText("")
+                mun_name = hier.get("city_mun") or selected_cm
+                self.txt_match_export_dir.setPlaceholderText(f"Subfolder for '{mun_name}' not found under root directory")
+                self.txt_match_export_dir.setToolTip(f"No existing subfolder matching '{mun_name}' was found in:\n{root_dir}")
         else:
             if os.path.exists(root_dir):
                 self.txt_match_export_dir.setText(root_dir)
@@ -3448,7 +3586,29 @@ class COProcessingDialog(QDialog):
         """Handles live progress updates from DeliverablesExportWorker."""
         if hasattr(self, "export_progress_dlg") and self.export_progress_dlg:
             self.export_progress_dlg.setValue(pct)
-            self.export_progress_dlg.setLabelText(msg)
+
+            # Compute time elapsed and estimated time remaining (ETA)
+            start_time = getattr(self, "_export_start_time", None)
+            if start_time:
+                elapsed = max(0.0, time.time() - start_time)
+                elapsed_str = format_time_duration(elapsed)
+                if pct > 0:
+                    total_est = elapsed / (pct / 100.0)
+                    rem = max(0.0, total_est - elapsed)
+                    rem_str = format_time_duration(rem)
+                    time_line = f"Estimated Time Remaining: ~{rem_str}  (Elapsed: {elapsed_str})"
+                else:
+                    time_line = f"Estimated Time Remaining: Estimating...  (Elapsed: {elapsed_str})"
+            else:
+                time_line = ""
+
+            display_text = f"{msg}\n{time_line}" if time_line else msg
+            self.export_progress_dlg.setLabelText(display_text)
+
+            # Dynamically state the City/Municipality in the progress dialog window title
+            if "Exporting " in msg and ":" in msg:
+                cm_title = msg.split(":")[0].strip()
+                self.export_progress_dlg.setWindowTitle(f"Exporting Final Deliverables - {cm_title}")
         if hasattr(self, "btn_export_match_gpkg") and self.btn_export_match_gpkg:
             self.btn_export_match_gpkg.setText(f"Exporting {pct}%...")
 
@@ -3491,18 +3651,29 @@ class COProcessingDialog(QDialog):
         total_exported = summary.get("total_exported", 0)
         total_features = summary.get("total_features", 0)
 
+        start_time = getattr(self, "_export_start_time", None)
+        duration_note = f"\n\nTotal Processing Time: {format_time_duration(time.time() - start_time)}" if start_time else ""
+
         # Batch Export feedback
         if is_batch:
             root_dir = getattr(self, "_final_export_root_dir", None) or DEFAULT_FINAL_EXPORT_ROOT
+            file_bullets = []
+            if summary.get("export_gpkg", True):
+                file_bullets.append("• Final GeoPackage (<pppmm>_ea2026.gpkg)")
+            if summary.get("export_earf", True):
+                file_bullets.append("• Final EARF Excel (<pppmm>_final_earf_<citymun>.xlsx)")
+            if summary.get("export_mis", True):
+                file_bullets.append("• Final MIS Excel (<pppmm>_MIS_<citymun>.xlsx)")
+            if summary.get("export_pcd", True):
+                file_bullets.append("• PCD EARF Excel (<pppmm>_earf2026_PCD.xlsx)")
+            bullets_str = "\n".join(file_bullets) if file_bullets else "• (None)"
             QMessageBox.information(
                 self,
                 "Batch Export Complete",
                 f"Successfully exported {total_exported:,} processed City/Municipalities ({total_features:,} total features) into their respective Region/Province/CityMun subfolders under:\n{root_dir}\n\n"
                 f"Final deliverables generated per City/Municipality:\n"
-                f"• Final GeoPackage (<pppmm>_ea2026.gpkg)\n"
-                f"• Final EARF Excel (<pppmm>_final_earf_<citymun>.xlsx)\n"
-                f"• Final MIS Excel (<pppmm>_MIS_<citymun>.xlsx)\n"
-                f"• PCD EARF Excel (<pppmm>_earf2026_PCD.xlsx)"
+                f"{bullets_str}"
+                f"{duration_note}"
             )
             return
 
@@ -3514,25 +3685,39 @@ class COProcessingDialog(QDialog):
                 c_code = res.get("city_mun", "")
                 pppmm = c_code[:5] if len(c_code) >= 5 else c_code
                 clean_cm = res.get("clean_cm", "ea2026")
-                target_folder = os.path.dirname(res["gpkg_path"])
-                out_filename = os.path.basename(res["gpkg_path"])
-                out_excel_filename = os.path.basename(res["excel_path"])
-                out_mis_filename = os.path.basename(res["mis_path"])
-                out_pcd_filename = os.path.basename(res.get("pcd_path") or f"{pppmm}_earf2026_PCD.xlsx")
+
+                target_folder = ""
+                for p in (res.get("gpkg_path"), res.get("excel_path"), res.get("mis_path"), res.get("pcd_path")):
+                    if p:
+                        target_folder = os.path.dirname(p)
+                        break
+
+                exported_file_lines = []
+                if res.get("gpkg_path"):
+                    exported_file_lines.append(f"• Final GeoPackage: {os.path.basename(res['gpkg_path'])}")
+                if res.get("excel_path"):
+                    exported_file_lines.append(f"• Final EARF Excel: {os.path.basename(res['excel_path'])}")
+                if res.get("mis_path"):
+                    exported_file_lines.append(f"• Final MIS Excel: {os.path.basename(res['mis_path'])}")
+                if res.get("pcd_path"):
+                    exported_file_lines.append(f"• PCD EARF Excel: {os.path.basename(res['pcd_path'])}")
+
+                files_msg = "\n".join(exported_file_lines) if exported_file_lines else "No files generated."
                 geom_count = res.get("geom_count", 0)
                 count = res.get("count", 0)
 
-                self._last_exported_gpkg_path = res["gpkg_path"]
-                self._last_exported_layer_display_name = f"{pppmm}_ea2026 - {clean_cm}"
+                has_gpkg = bool(res.get("gpkg_path") and os.path.exists(res["gpkg_path"]))
+                if has_gpkg:
+                    self._last_exported_gpkg_path = res["gpkg_path"]
+                    self._last_exported_layer_display_name = f"{pppmm}_ea2026 - {clean_cm}"
+                else:
+                    self._last_exported_gpkg_path = None
 
-                if post_action_ask_canvas:
+                if post_action_ask_canvas and has_gpkg:
                     msg = (
                         f"Successfully exported final deliverables for {mun_name}!\n\n"
                         f"Folder: {target_folder}\n"
-                        f"• Final GeoPackage: {out_filename}\n"
-                        f"• Final EARF Excel: {out_excel_filename}\n"
-                        f"• Final MIS Excel: {out_mis_filename}\n"
-                        f"• PCD EARF Excel: {out_pcd_filename}\n\n"
+                        f"{files_msg}\n\n"
                         f"GeoPackage Features: {geom_count:,} (Retained as delineated in GeoPackage)\n\n"
                         f"Would you like to add the GeoPackage layer to the QGIS map canvas?"
                     )
@@ -3545,16 +3730,14 @@ class COProcessingDialog(QDialog):
                         if vlayer.isValid():
                             QgsProject.instance().addMapLayer(vlayer)
                 else:
+                    geom_info = f"\n\nTotal Features: {count:,} (with Geometry: {geom_count:,})" if has_gpkg else f"\n\nTotal Features: {count:,}"
                     QMessageBox.information(
                         self,
                         "Export Complete",
                         f"Successfully generated deliverables for {c_code} ({mun_name})!\n\n"
                         f"Folder: {target_folder}\n"
-                        f"• Final GeoPackage: {out_filename}\n"
-                        f"• Final EARF Excel: {out_excel_filename}\n"
-                        f"• Final MIS Excel: {out_mis_filename}\n"
-                        f"• PCD EARF Excel: {out_pcd_filename}\n\n"
-                        f"Total Features: {count:,} (with Geometry: {geom_count:,})"
+                        f"{files_msg}"
+                        f"{geom_info}"
                     )
             elif res.get("error"):
                 QMessageBox.warning(
@@ -3588,17 +3771,36 @@ class COProcessingDialog(QDialog):
         if hasattr(self, "btn_mon_export_now") and self.btn_mon_export_now:
             self.btn_mon_export_now.setEnabled(False)
 
+        # Determine initial title / label stating the specific City/Municipality being exported
+        first_task = tasks[0]
+        first_code = first_task.get("city_mun", "")
+        first_mun = first_task.get("mun_name") or first_code or "City/Municipality"
+        if not is_valid_mun_name(first_mun):
+            h = self.db.get_citymun_hierarchy(first_code)
+            first_mun = h.get("city_mun") or f"City/Mun {first_code}"
+
+        # Record start time for ETA calculations
+        self._export_start_time = time.time()
+
+        if len(tasks) == 1:
+            init_title = f"Exporting Final Deliverables - {first_mun} ({first_code})" if first_code else f"Exporting Final Deliverables - {first_mun}"
+            init_label = f"Exporting {first_mun} ({first_code}): Initializing deliverables export...\nEstimated Time Remaining: Estimating..."
+        else:
+            init_title = f"Exporting Final Deliverables [{len(tasks)} City/Municipalities]"
+            init_label = f"[1/{len(tasks)}] Exporting {first_mun} ({first_code}): Initializing deliverables export...\nEstimated Time Remaining: Estimating..."
+
         # Create responsive progress dialog
         self.export_progress_dlg = QProgressDialog(
-            "Initializing deliverables export...",
+            init_label,
             "Cancel",
             0,
             100,
             self
         )
-        self.export_progress_dlg.setWindowTitle("Exporting Final Deliverables")
+        self.export_progress_dlg.setWindowTitle(init_title)
         self.export_progress_dlg.setWindowModality(Qt.WindowModal)
         self.export_progress_dlg.setMinimumDuration(0)
+        self.export_progress_dlg.setMinimumWidth(520)
         self.export_progress_dlg.setValue(0)
         self.export_progress_dlg.setAutoClose(False)
         self.export_progress_dlg.setAutoReset(False)
@@ -3618,6 +3820,19 @@ class COProcessingDialog(QDialog):
         self.deliverables_worker.start()
 
     def _export_matching_gpkg(self):
+        exp_gpkg = getattr(self, "chk_export_gpkg", None) is None or self.chk_export_gpkg.isChecked()
+        exp_earf = getattr(self, "chk_export_earf", None) is None or self.chk_export_earf.isChecked()
+        exp_mis = getattr(self, "chk_export_mis", None) is None or self.chk_export_mis.isChecked()
+        exp_pcd = getattr(self, "chk_export_pcd", None) is None or self.chk_export_pcd.isChecked()
+
+        if not (exp_gpkg or exp_earf or exp_mis or exp_pcd):
+            QMessageBox.warning(
+                self,
+                "No Deliverables Selected",
+                "Please select at least one deliverable file to export (GeoPackage, Final EARF, Final MIS, or PCD EARF)."
+            )
+            return
+
         export_dir = self.txt_match_export_dir.text().strip()
         root_dir = getattr(self, "_final_export_root_dir", None) or DEFAULT_FINAL_EXPORT_ROOT
         if not os.path.exists(root_dir):
@@ -3652,12 +3867,31 @@ class COProcessingDialog(QDialog):
         # Case 1: A specific City/Mun is selected in the filter
         if selected_cm:
             target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, selected_cm)
-            if not target_folder:
-                target_folder = export_dir if os.path.exists(export_dir) else root_dir
-            os.makedirs(target_folder, exist_ok=True)
-            self.txt_match_export_dir.setText(target_folder)
+            mun_name = hier.get("city_mun")
+            if not is_valid_mun_name(mun_name):
+                cm_txt = cm.currentText()
+                if " - " in cm_txt:
+                    cm_txt = cm_txt.split(" - ", 1)[1]
+                if is_valid_mun_name(cm_txt):
+                    mun_name = cm_txt
+                else:
+                    mun_name = f"City/Mun {selected_cm}"
 
-            mun_name = hier.get("city_mun") or cm.currentText()
+            # Check if typed export_dir points to an existing directory matching this municipality
+            if (not target_folder or not os.path.exists(target_folder)) and export_dir and os.path.exists(export_dir) and os.path.isdir(export_dir):
+                if _match_hier_names(os.path.basename(export_dir), mun_name) or selected_cm[:5] in os.path.basename(export_dir):
+                    target_folder = export_dir
+
+            if not target_folder or not os.path.exists(target_folder):
+                QMessageBox.warning(
+                    self,
+                    "Subfolder Not Found",
+                    f"No existing subfolder found matching '{mun_name}' ({selected_cm}) in root directory:\n{root_dir}\n\n"
+                    "Please ensure the municipality subfolder exists in the root directory before exporting."
+                )
+                return
+
+            self.txt_match_export_dir.setText(target_folder)
             clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
             clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
             if not clean_cm:
@@ -3672,8 +3906,18 @@ class COProcessingDialog(QDialog):
             out_mis_path = os.path.join(target_folder, out_mis_filename)
             out_pcd_path = os.path.join(target_folder, out_pcd_filename)
 
-            if os.path.exists(out_path) or os.path.exists(out_excel_path) or os.path.exists(out_mis_path) or os.path.exists(out_pcd_path):
-                existing_files = [f for f in (out_filename, out_excel_filename, out_mis_filename, out_pcd_filename) if os.path.exists(os.path.join(target_folder, f))]
+            existing_candidates = []
+            if exp_gpkg:
+                existing_candidates.append(out_filename)
+            if exp_earf:
+                existing_candidates.append(out_excel_filename)
+            if exp_mis:
+                existing_candidates.append(out_mis_filename)
+            if exp_pcd:
+                existing_candidates.append(out_pcd_filename)
+
+            existing_files = [f for f in existing_candidates if os.path.exists(os.path.join(target_folder, f))]
+            if existing_files:
                 reply = QMessageBox.question(
                     self,
                     "Confirm Overwrite",
@@ -3693,6 +3937,10 @@ class COProcessingDialog(QDialog):
                 "out_excel_path": out_excel_path,
                 "out_mis_path": out_mis_path,
                 "out_pcd_path": out_pcd_path,
+                "export_gpkg": exp_gpkg,
+                "export_earf": exp_earf,
+                "export_mis": exp_mis,
+                "export_pcd": exp_pcd,
                 "search": self.search_match.text().strip(),
                 "status": self.cmb_match_status_filter.currentText(),
                 "ea_lifecycle": self.cmb_match_lifecycle_filter.currentText(),
@@ -3713,17 +3961,24 @@ class COProcessingDialog(QDialog):
                 )
                 return
 
+            file_bullets = []
+            if exp_gpkg:
+                file_bullets.append("  • Final GeoPackage: <pppmm>_ea2026.gpkg")
+            if exp_earf:
+                file_bullets.append("  • Final EARF Excel: <pppmm>_final_earf_<citymun>.xlsx")
+            if exp_mis:
+                file_bullets.append("  • Final MIS Excel: <pppmm>_MIS_<citymun>.xlsx")
+            if exp_pcd:
+                file_bullets.append("  • PCD EARF Excel: <pppmm>_earf2026_PCD.xlsx")
+
             reply = QMessageBox.question(
                 self,
                 "Export All Processed City/Municipalities",
                 f"No specific City/Municipality is selected.\n\n"
-                f"Would you like to export all {len(processed_citymuns)} processed City/Municipalities into their respective subfolders under:\n"
+                f"Would you like to export all {len(processed_citymuns)} processed City/Municipalities into their existing subfolders under:\n"
                 f"{root_dir}?\n\n"
                 f"Each City/Municipality will generate:\n"
-                f"  • Final GeoPackage: <pppmm>_ea2026.gpkg\n"
-                f"  • Final EARF Excel: <pppmm>_final_earf_<citymun>.xlsx\n"
-                f"  • Final MIS Excel: <pppmm>_MIS_<citymun>.xlsx\n"
-                f"  • PCD EARF Excel: <pppmm>_earf2026_PCD.xlsx",
+                + "\n".join(file_bullets),
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.Yes
             )
@@ -3731,13 +3986,18 @@ class COProcessingDialog(QDialog):
                 return
 
             tasks = []
+            skipped_muns = []
             for cm_item in processed_citymuns:
                 c_code = cm_item["code"]
                 target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, c_code)
-                if not target_folder:
-                    target_folder = export_dir if os.path.exists(export_dir) else root_dir
-                os.makedirs(target_folder, exist_ok=True)
-                m_name = hier.get("city_mun") or cm_item["name"]
+                if not target_folder or not os.path.exists(target_folder):
+                    m_label = hier.get("city_mun") or cm_item.get("name") or c_code
+                    skipped_muns.append(f"{m_label} ({c_code})")
+                    continue
+
+                m_name = hier.get("city_mun") or cm_item.get("name")
+                if not is_valid_mun_name(m_name):
+                    m_name = f"City/Mun {c_code}"
                 clean_cm = re.sub(r'\s*\([^)]*\)', '', m_name)
                 clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
                 if not clean_cm:
@@ -3756,12 +4016,41 @@ class COProcessingDialog(QDialog):
                     "out_excel_path": os.path.join(target_folder, c_out_excel_filename),
                     "out_mis_path": os.path.join(target_folder, c_out_mis_filename),
                     "out_pcd_path": os.path.join(target_folder, c_out_pcd_filename),
+                    "export_gpkg": exp_gpkg,
+                    "export_earf": exp_earf,
+                    "export_mis": exp_mis,
+                    "export_pcd": exp_pcd,
                     "search": self.search_match.text().strip(),
                     "status": self.cmb_match_status_filter.currentText(),
                     "ea_lifecycle": self.cmb_match_lifecycle_filter.currentText(),
                     "geometry_sources": geom_sources,
                     "layer_name": clean_cm,
                 })
+
+            if skipped_muns:
+                if not tasks:
+                    QMessageBox.warning(
+                        self,
+                        "Subfolders Not Found",
+                        f"None of the {len(skipped_muns)} processed City/Municipalities have an existing subfolder in:\n{root_dir}\n\n"
+                        "No files were exported."
+                    )
+                    return
+                else:
+                    preview_skip = "\n".join(f"• {m}" for m in skipped_muns[:8])
+                    if len(skipped_muns) > 8:
+                        preview_skip += f"\n... and {len(skipped_muns) - 8} more"
+                    reply_cont = QMessageBox.question(
+                        self,
+                        "Some Subfolders Not Found",
+                        f"{len(skipped_muns)} City/Municipality subfolder(s) were not found in:\n{root_dir}\n\n"
+                        f"{preview_skip}\n\n"
+                        f"Would you like to proceed with exporting the remaining {len(tasks)} municipality(ies) that have existing subfolders?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes
+                    )
+                    if reply_cont != QMessageBox.Yes:
+                        return
 
             self._start_deliverables_export(tasks, is_batch=True, post_action_ask_canvas=False)
 
@@ -3783,11 +4072,29 @@ class COProcessingDialog(QDialog):
         # Case 1: A specific City/Municipality is selected in the filter
         if selected_cm:
             target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, selected_cm)
-            if not target_folder:
-                target_folder = export_dir if (export_dir and os.path.exists(export_dir)) else root_dir
-            os.makedirs(target_folder, exist_ok=True)
+            mun_name = hier.get("city_mun")
+            if not is_valid_mun_name(mun_name):
+                cm_txt = cm.currentText()
+                if " - " in cm_txt:
+                    cm_txt = cm_txt.split(" - ", 1)[1]
+                if is_valid_mun_name(cm_txt):
+                    mun_name = cm_txt
+                else:
+                    mun_name = f"City/Mun {selected_cm}"
 
-            mun_name = hier.get("city_mun") or cm.currentText()
+            if (not target_folder or not os.path.exists(target_folder)) and export_dir and os.path.exists(export_dir) and os.path.isdir(export_dir):
+                if _match_hier_names(os.path.basename(export_dir), mun_name) or selected_cm[:5] in os.path.basename(export_dir):
+                    target_folder = export_dir
+
+            if not target_folder or not os.path.exists(target_folder):
+                QMessageBox.warning(
+                    self,
+                    "Subfolder Not Found",
+                    f"No existing subfolder found matching '{mun_name}' ({selected_cm}) in root directory:\n{root_dir}\n\n"
+                    "Please ensure the municipality subfolder exists in the root directory before exporting."
+                )
+                return
+
             clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
             clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
             if not clean_cm:
@@ -3863,14 +4170,18 @@ class COProcessingDialog(QDialog):
 
             exported_files = []
             errors = []
+            skipped_muns = []
             for cm_item in processed_citymuns:
                 c_code = cm_item["code"]
                 target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, c_code)
-                if not target_folder:
-                    target_folder = export_dir if (export_dir and os.path.exists(export_dir)) else root_dir
-                os.makedirs(target_folder, exist_ok=True)
+                if not target_folder or not os.path.exists(target_folder):
+                    m_label = hier.get("city_mun") or cm_item.get("name") or c_code
+                    skipped_muns.append(f"{m_label} ({c_code})")
+                    continue
 
-                m_name = hier.get("city_mun") or cm_item["name"]
+                m_name = hier.get("city_mun") or cm_item.get("name")
+                if not is_valid_mun_name(m_name):
+                    m_name = f"City/Mun {c_code}"
                 clean_cm = re.sub(r'\s*\([^)]*\)', '', m_name)
                 clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
                 if not clean_cm:
@@ -4007,14 +4318,14 @@ class COProcessingDialog(QDialog):
 
         top_bar.addStretch()
 
-        self.btn_import_db = QPushButton("Import Excel into Local DB...")
-        self.btn_import_db.setToolTip("Load and persist a POPCEN Excel/CSV file into the local SQLite database for instant future access")
+        self.btn_import_db = QPushButton("Import Single File to DB...")
+        self.btn_import_db.setToolTip("Load and persist a single POPCEN Excel/CSV file into the local SQLite database")
         self.btn_import_db.clicked.connect(self._import_into_database_prompt)
         top_bar.addWidget(self.btn_import_db)
 
         self.btn_popcen_stop = QPushButton("Stop")
         self.btn_popcen_stop.setObjectName("stopBtn")
-        self.btn_popcen_stop.setToolTip("Stop active POPCEN database import immediately")
+        self.btn_popcen_stop.setToolTip("Stop active POPCEN database import or folder consolidation immediately")
         self.btn_popcen_stop.setEnabled(False)
         self.btn_popcen_stop.clicked.connect(self._stop_popcen_import)
         top_bar.addWidget(self.btn_popcen_stop)
@@ -4026,18 +4337,50 @@ class COProcessingDialog(QDialog):
 
         layout.addLayout(top_bar)
 
+        # 2. Folder Consolidation Bar (Visible in Database Mode)
+        self.popcen_folder_bar = QWidget()
+        folder_layout = QHBoxLayout(self.popcen_folder_bar)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        folder_layout.addWidget(QLabel("<b>POPCEN Folder:</b>"))
+
+        self.txt_popcen_folder = QLineEdit()
+        self.txt_popcen_folder.setPlaceholderText("Select directory containing 2024 POPCEN Excel files (*.xlsx, *.xls, *.csv)...")
+        self.txt_popcen_folder.setText(DEFAULT_POPCEN_ROOT if os.path.exists(DEFAULT_POPCEN_ROOT) else "")
+        folder_layout.addWidget(self.txt_popcen_folder, 1)
+
+        btn_browse_folder = QPushButton("Browse Folder...")
+        btn_browse_folder.clicked.connect(self._browse_popcen_folder)
+        folder_layout.addWidget(btn_browse_folder)
+
+        self.chk_popcen_recursive = QCheckBox("Subfolders")
+        self.chk_popcen_recursive.setChecked(True)
+        self.chk_popcen_recursive.setToolTip("Recursively scan nested subdirectories for Excel/CSV files")
+        folder_layout.addWidget(self.chk_popcen_recursive)
+
+        self.btn_consolidate_popcen = QPushButton("Consolidate Folder to DB...")
+        self.btn_consolidate_popcen.setObjectName("actionBtn")
+        self.btn_consolidate_popcen.setToolTip("Scan folder, parse all 2024 POPCEN Excel/CSV files, and save into local SQLite database (popcen_records)")
+        self.btn_consolidate_popcen.clicked.connect(self._consolidate_popcen_folder_prompt)
+        folder_layout.addWidget(self.btn_consolidate_popcen)
+
+        layout.addWidget(self.popcen_folder_bar)
+
         # File selection bar (visible when Custom File mode is selected)
         self.file_bar = QWidget()
         file_layout = QHBoxLayout(self.file_bar)
         file_layout.setContentsMargins(0, 0, 0, 0)
-        file_layout.addWidget(QLabel("POPCEN File:"))
+        file_layout.addWidget(QLabel("POPCEN File / Folder:"))
         self.txt_popcen_quick = QLineEdit()
-        self.txt_popcen_quick.setPlaceholderText("Select custom POPCEN Excel file (.xlsx)...")
+        self.txt_popcen_quick.setPlaceholderText("Select custom POPCEN Excel file (.xlsx, .xls, .csv) or folder...")
         file_layout.addWidget(self.txt_popcen_quick, 1)
 
-        btn_browse_quick = QPushButton("Browse...")
+        btn_browse_quick = QPushButton("Browse File...")
         btn_browse_quick.clicked.connect(self._browse_popcen_file)
         file_layout.addWidget(btn_browse_quick)
+
+        btn_browse_quick_folder = QPushButton("Browse Folder...")
+        btn_browse_quick_folder.clicked.connect(self._browse_popcen_folder_preview)
+        file_layout.addWidget(btn_browse_quick_folder)
 
         file_layout.addWidget(QLabel("Sheet:"))
         self.txt_sheet_quick = QLineEdit()
@@ -4775,9 +5118,13 @@ class COProcessingDialog(QDialog):
         self._reset_popcen_selection()
         mode = self.cmb_source_mode.currentIndex()
         if mode == 0:  # Local Database
+            if hasattr(self, "popcen_folder_bar"):
+                self.popcen_folder_bar.setVisible(True)
             self.file_bar.setVisible(False)
             self._check_and_load_initial_data()
         else:  # Custom File
+            if hasattr(self, "popcen_folder_bar"):
+                self.popcen_folder_bar.setVisible(False)
             self.file_bar.setVisible(True)
             if not self.popcen_df.empty:
                 self._apply_file_filters()
@@ -5174,6 +5521,12 @@ class COProcessingDialog(QDialog):
 
     def _get_table_row_geocode(self, table: QTableWidget, row_idx: int) -> str:
         """Helper to find the geocode string for a given row in any table widget."""
+        for c in range(table.columnCount()):
+            header = table.horizontalHeaderItem(c)
+            if header and header.text().strip().lower() == "geocode":
+                cell = table.item(row_idx, c)
+                if cell and cell.text().strip():
+                    return cell.text().strip()
         for c in range(table.columnCount()):
             header = table.horizontalHeaderItem(c)
             if header and "geocode" in header.text().lower():
@@ -5695,6 +6048,135 @@ class COProcessingDialog(QDialog):
     # ----------------------------------------------------------------------
     # POPCEN Import / File Actions
     # ----------------------------------------------------------------------
+    def _get_initial_popcen_dir(self):
+        # 1. Preview / quick inputs
+        for field in (getattr(self, "txt_popcen_quick", None), getattr(self, "txt_popcen_file", None)):
+            if field:
+                cur_text = field.text().strip()
+                if cur_text:
+                    first_path = cur_text.split(";")[0].strip().strip('"').strip("'")
+                    if os.path.isdir(first_path):
+                        return first_path
+                    elif os.path.isfile(first_path) or os.path.exists(first_path):
+                        return os.path.dirname(first_path)
+
+        # 2. POPCEN folder input
+        folder_field = getattr(self, "txt_popcen_folder", None)
+        if folder_field:
+            cur_folder = folder_field.text().strip().strip('"').strip("'")
+            if os.path.isdir(cur_folder):
+                return cur_folder
+            elif os.path.isfile(cur_folder) or os.path.exists(cur_folder):
+                return os.path.dirname(cur_folder)
+            elif cur_folder:
+                return cur_folder
+
+        # 3. Fallback to default POPCEN root directory
+        return DEFAULT_POPCEN_ROOT
+
+    def _browse_popcen_folder(self):
+        start_dir = self.txt_popcen_folder.text().strip() or self._get_initial_popcen_dir() or DEFAULT_POPCEN_ROOT
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder Containing 2024 POPCEN Files", start_dir)
+        if folder:
+            self.txt_popcen_folder.setText(folder)
+            recursive = self.chk_popcen_recursive.isChecked() if hasattr(self, "chk_popcen_recursive") else False
+            found = find_popcen_files_in_folder(folder, recursive=recursive)
+
+            # If non-recursive found no files, check if subfolders have files
+            if not found and not recursive:
+                sub_found = find_popcen_files_in_folder(folder, recursive=True)
+                if sub_found:
+                    recursive = True
+                    if hasattr(self, "chk_popcen_recursive"):
+                        self.chk_popcen_recursive.setChecked(True)
+                    found = sub_found
+
+            if hasattr(self, "lbl_table_info"):
+                if found:
+                    self.lbl_table_info.setText(f"Found {len(found):,} POPCEN file(s) (*.xlsx/*.xls/*.csv). Ready to consolidate.")
+                else:
+                    self.lbl_table_info.setText("Warning: No Excel/CSV files found in selected folder.")
+
+    def _consolidate_popcen_folder_prompt(self):
+        folder = self.txt_popcen_folder.text().strip()
+        if not folder or not os.path.exists(folder):
+            QMessageBox.warning(self, "Select Folder", "Please select a valid folder containing 2024 POPCEN Excel or CSV files first.")
+            return
+
+        recursive = self.chk_popcen_recursive.isChecked() if hasattr(self, "chk_popcen_recursive") else False
+        popcen_files = find_popcen_files_in_folder(folder, recursive=recursive)
+        if not popcen_files and not recursive:
+            sub_files = find_popcen_files_in_folder(folder, recursive=True)
+            if sub_files:
+                recursive = True
+                if hasattr(self, "chk_popcen_recursive"):
+                    self.chk_popcen_recursive.setChecked(True)
+                popcen_files = sub_files
+
+        if not popcen_files:
+            QMessageBox.warning(
+                self,
+                "No POPCEN Files Found",
+                f"No Excel or CSV files were found in:\n{folder}\n\n"
+                f"(Recursive subfolders: {'Yes' if recursive else 'No'})\n\n"
+                "Please verify that the folder contains .xlsx, .xls, or .csv files.",
+            )
+            return
+
+        ret = QMessageBox.question(
+            self,
+            "Consolidation Confirmation",
+            f"Found {len(popcen_files):,} 2024 POPCEN file(s) in:\n{folder}\n\n"
+            f"(Recursive subfolders: {'Yes' if recursive else 'No'})\n\n"
+            "This will parse all matching files and save them into the local database (popcen_records). Proceed?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+
+        self.btn_consolidate_popcen.setEnabled(False)
+        self.btn_import_db.setEnabled(False)
+        if hasattr(self, "btn_popcen_stop"):
+            self.btn_popcen_stop.setEnabled(True)
+        if self.progress_bar:
+            self.progress_bar.setValue(0)
+        self.lbl_table_info.setText(f"Scanning and consolidating {len(popcen_files):,} POPCEN files...")
+
+        self.popcen_consolidation_worker = PopcenConsolidationWorker(
+            self.db, folder, recursive=recursive, sheet_name=0, file_list=popcen_files, replace=True
+        )
+        self.popcen_consolidation_worker.progress_signal.connect(
+            lambda p, m: ((self.progress_bar.setValue(p) if self.progress_bar else None), self.lbl_table_info.setText(m))
+        )
+        self.popcen_consolidation_worker.finished_signal.connect(self._popcen_consolidation_finished)
+        self.popcen_consolidation_worker.start()
+
+    def _popcen_consolidation_finished(self, recs, files, err):
+        self.btn_consolidate_popcen.setEnabled(True)
+        self.btn_import_db.setEnabled(True)
+        if hasattr(self, "btn_popcen_stop"):
+            self.btn_popcen_stop.setEnabled(False)
+        if self.progress_bar:
+            self.progress_bar.setValue(100)
+
+        if err and err != "Cancelled":
+            QMessageBox.critical(self, "Consolidation Error", f"Failed to consolidate POPCEN files:\n{err}")
+            self.lbl_table_info.setText(f"Error: {err}")
+            return
+        elif err == "Cancelled":
+            self.lbl_table_info.setText("POPCEN consolidation cancelled by user.")
+            return
+
+        QMessageBox.information(
+            self,
+            "Consolidation Successful",
+            f"Successfully consolidated {recs:,} POPCEN records across {files} file(s) into the local database!",
+        )
+
+        # Refresh database view
+        self.cmb_source_mode.setCurrentIndex(0)
+        self._check_and_load_initial_data()
+
     def _import_into_database_prompt(self):
         f, _ = QFileDialog.getOpenFileName(
             self, "Select POPCEN File to Import into Local Database", "", "Excel Files (*.xlsx *.xls);;CSV Files (*.csv)"
@@ -5715,6 +6197,8 @@ class COProcessingDialog(QDialog):
             self.progress_bar.setValue(0)
         self.lbl_table_info.setText("Importing records into local database...")
         self.btn_import_db.setEnabled(False)
+        if hasattr(self, "btn_consolidate_popcen"):
+            self.btn_consolidate_popcen.setEnabled(False)
         if hasattr(self, "btn_popcen_stop"):
             self.btn_popcen_stop.setEnabled(True)
 
@@ -5724,16 +6208,26 @@ class COProcessingDialog(QDialog):
         self.import_worker.start()
 
     def _stop_popcen_import(self):
-        """Immediately cancels running POPCEN database import."""
+        """Immediately cancels running POPCEN database import or consolidation."""
+        stopped = False
         if hasattr(self, "import_worker") and self.import_worker and self.import_worker.isRunning():
             self.import_worker.cancel()
+            stopped = True
+        if hasattr(self, "popcen_consolidation_worker") and self.popcen_consolidation_worker and self.popcen_consolidation_worker.isRunning():
+            self.popcen_consolidation_worker.cancel()
+            stopped = True
         if hasattr(self, "btn_popcen_stop"):
             self.btn_popcen_stop.setEnabled(False)
         self.btn_import_db.setEnabled(True)
-        self.lbl_table_info.setText("POPCEN import stopped by user.")
+        if hasattr(self, "btn_consolidate_popcen"):
+            self.btn_consolidate_popcen.setEnabled(True)
+        if stopped:
+            self.lbl_table_info.setText("POPCEN import/consolidation stopped by user.")
 
     def _import_finished(self, count, err_msg):
         self.btn_import_db.setEnabled(True)
+        if hasattr(self, "btn_consolidate_popcen"):
+            self.btn_consolidate_popcen.setEnabled(True)
         if hasattr(self, "btn_popcen_stop"):
             self.btn_popcen_stop.setEnabled(False)
         if self.progress_bar:
@@ -5760,25 +6254,56 @@ class COProcessingDialog(QDialog):
             self.cmb_source_mode.setCurrentIndex(1)
             self._load_file_preview()
 
+    def _browse_popcen_folder_preview(self):
+        start_dir = self._get_initial_popcen_dir() or DEFAULT_POPCEN_ROOT
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder Containing 2024 POPCEN Files", start_dir)
+        if folder:
+            self.txt_popcen_quick.setText(folder)
+            if hasattr(self, "txt_popcen_file"):
+                self.txt_popcen_file.setText(folder)
+            self.cmb_source_mode.setCurrentIndex(1)
+            self._load_file_preview()
+
     def _load_file_preview(self):
         file_path = self.txt_popcen_quick.text().strip() or self.txt_popcen_file.text().strip()
         if not file_path or not os.path.exists(file_path):
-            QMessageBox.warning(self, "Select File", "Please select a valid POPCEN Excel or CSV file first.")
+            QMessageBox.warning(self, "Select File or Folder", "Please select a valid POPCEN Excel/CSV file or folder first.")
             return
 
         sheet_name = self.txt_sheet_quick.text().strip()
-        self.lbl_table_info.setText("Loading and parsing POPCEN file...")
+        self.lbl_table_info.setText("Loading and parsing POPCEN data...")
         QApplication.processEvents()
 
         try:
-            self.popcen_df = load_popcen_data(file_path, sheet_name=sheet_name)
+            if os.path.isdir(file_path):
+                popcen_files = find_popcen_files_in_folder(file_path, recursive=True)
+                if not popcen_files:
+                    QMessageBox.warning(self, "No Files Found", f"No Excel or CSV files were found in:\n{file_path}")
+                    self.lbl_table_info.setText("No POPCEN files found in folder.")
+                    return
+                dfs = []
+                for f in popcen_files:
+                    try:
+                        df_i = load_popcen_data(f, sheet_name=sheet_name)
+                        if not df_i.empty:
+                            df_i["source_file"] = os.path.basename(f)
+                            dfs.append(df_i)
+                    except Exception:
+                        pass
+                if dfs:
+                    import pandas as pd
+                    self.popcen_df = pd.concat(dfs, ignore_index=True)
+                else:
+                    self.popcen_df = pd.DataFrame()
+            else:
+                self.popcen_df = load_popcen_data(file_path, sheet_name=sheet_name)
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Failed to load POPCEN worksheet:\n{e}")
             self.lbl_table_info.setText(f"Error loading table: {e}")
             return
 
         if self.popcen_df.empty:
-            self.lbl_table_info.setText("File loaded, but no data records were found.")
+            self.lbl_table_info.setText("Data loaded, but no data records were found.")
             return
 
         self._update_file_kpis()
@@ -6470,6 +6995,40 @@ class COProcessingDialog(QDialog):
 
         df = df.copy()
 
+        new_ea_identified = find_new_ea_code_col(df)
+        def _build_earf_new_gc(row):
+            curr_ngc = str(row.get("new_geocode") or "").strip()
+            if curr_ngc and curr_ngc.lower() not in ("nan", "none", "null", "-", ""):
+                return curr_ngc
+
+            nean = str(row.get(new_ea_identified) if new_ea_identified else (row.get("new_enumeration_area_code") or row.get("new_ean") or row.get("new_ea_code") or "")).strip()
+            if nean.endswith(".0"):
+                nean = nean[:-2].strip()
+            if not nean or nean.lower() in ("nan", "none", "null", "-", ""):
+                return ""
+            if nean.isdigit() and len(nean) < 6:
+                nean = nean.zfill(6)
+
+            p = str(row.get("prov") or "").strip()
+            m = str(row.get("mun") or "").strip()
+            b = str(row.get("brgy") or "").strip()
+
+            if not (p and m and b):
+                gc = str(row.get("geocode") or "").strip()
+                if len(gc) >= 8:
+                    if not p: p = gc[:3]
+                    if not m: m = gc[3:5]
+                    if not b: b = gc[5:8]
+
+            if p and m and b:
+                p = p.zfill(3) if p.isdigit() else p
+                m = m.zfill(2) if m.isdigit() else m
+                b = b.zfill(3) if b.isdigit() else b
+                return f"{p}{m}{b}{nean}"
+            return ""
+
+        df["new_geocode"] = df.apply(_build_earf_new_gc, axis=1)
+
         preferred_order = [
             "geocode",
             "consistency_status",
@@ -6482,6 +7041,7 @@ class COProcessingDialog(QDialog):
             "number_of_households",
             "number_of_buildings",
             "new_enumeration_area_code",
+            "new_geocode",
             "household_count",
             "building_count",
             "ea_type",
@@ -6525,6 +7085,9 @@ class COProcessingDialog(QDialog):
             "new_ea_code": "New EA Code (2026)",
             "new_ea": "New EA Code (2026)",
             "new_ean": "New EA Code (2026)",
+            "new_geocode": "New Geocode",
+            "new geocode": "New Geocode",
+            "new geocode (2026)": "New Geocode",
             "household_count": "Household Count (2026)",
             "building_count": "Building Count (2026)",
             "ea_type": "EA Type",
@@ -6590,7 +7153,15 @@ class COProcessingDialog(QDialog):
                     item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
 
                 # Badges & Styling
-                if "geocode" in col_low:
+                if col_low == "new_geocode":
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#047857"))  # emerald green
+                    if val:
+                        item.setBackground(QColor("#ecfdf5"))
+
+                elif "geocode" in col_low:
                     font = item.font()
                     font.setBold(True)
                     item.setFont(font)
@@ -8839,12 +9410,13 @@ class COProcessingDialog(QDialog):
 
         self.kpi_mon_total = self._create_kpi_card("Total Cities/Municipalities", "1,655", "#0284c7")
         self.kpi_mon_total.setToolTip("Fixed Benchmark: 1,655 Official Philippine Cities & Municipalities (POPCEN)")
-        self.kpi_mon_complete = self._create_kpi_card("Fully Complete (3/3)", "0", "#16a34a")
+        self.kpi_mon_complete = self._create_kpi_card("Fully Complete (4/4)", "0", "#16a34a")
         self.kpi_mon_percent = self._create_kpi_card("Percent Completed", "0.0%", "#0d9488")
-        self.kpi_mon_percent.setToolTip("Percent Completed: Total Fully Complete (3/3) / 1,655 Cities/Municipalities")
+        self.kpi_mon_percent.setToolTip("Percent Completed: Total Fully Complete (4/4) / 1,655 Cities/Municipalities")
         self.kpi_mon_gpkg = self._create_kpi_card("Output GPKG Ready", "0", "#0ea5e9")
         self.kpi_mon_final_earf = self._create_kpi_card("Final EARF Ready", "0", "#059669")
         self.kpi_mon_mis_earf = self._create_kpi_card("MIS EARF Ready", "0", "#7c3aed")
+        self.kpi_mon_pcd_earf = self._create_kpi_card("PCD EARF Ready", "0", "#d97706")
         self.kpi_mon_incomplete = self._create_kpi_card("Incomplete / Pending", "1,655", "#e11d48")
 
         for k in (
@@ -8854,6 +9426,7 @@ class COProcessingDialog(QDialog):
             self.kpi_mon_gpkg,
             self.kpi_mon_final_earf,
             self.kpi_mon_mis_earf,
+            self.kpi_mon_pcd_earf,
             self.kpi_mon_incomplete,
         ):
             kpi_layout.addWidget(k)
@@ -8896,12 +9469,13 @@ class COProcessingDialog(QDialog):
         self.cmb_mon_status = QComboBox()
         self.cmb_mon_status.addItems([
             "All Statuses",
-            "Complete (3/3)",
-            "Partial (1-2/3)",
-            "Missing All (0/3)",
+            "Complete (4/4)",
+            "Partial (1-3/4)",
+            "Missing All (0/4)",
             "Missing GPKG",
             "Missing Final EARF",
             "Missing MIS EARF",
+            "Missing PCD EARF",
         ])
         self.cmb_mon_status.currentIndexChanged.connect(self._on_mon_filter_changed)
         filter_bar.addWidget(self.cmb_mon_status)
@@ -8951,6 +9525,7 @@ class COProcessingDialog(QDialog):
             "Output GPKG",
             "Final EARF",
             "MIS EARF",
+            "PCD EARF",
             "Last Modified",
             "Subfolder Location",
         ]
@@ -8966,15 +9541,17 @@ class COProcessingDialog(QDialog):
         h.setSectionResizeMode(6, QHeaderView.Interactive)
         h.setSectionResizeMode(7, QHeaderView.Interactive)
         h.setSectionResizeMode(8, QHeaderView.Interactive)
-        h.setSectionResizeMode(9, QHeaderView.Stretch)
+        h.setSectionResizeMode(9, QHeaderView.Interactive)
+        h.setSectionResizeMode(10, QHeaderView.Stretch)
         self.table_monitoring.setColumnWidth(1, 140)
         self.table_monitoring.setColumnWidth(2, 110)
         self.table_monitoring.setColumnWidth(3, 170)
         self.table_monitoring.setColumnWidth(4, 125)
-        self.table_monitoring.setColumnWidth(5, 145)
-        self.table_monitoring.setColumnWidth(6, 145)
-        self.table_monitoring.setColumnWidth(7, 145)
-        self.table_monitoring.setColumnWidth(8, 125)
+        self.table_monitoring.setColumnWidth(5, 140)
+        self.table_monitoring.setColumnWidth(6, 140)
+        self.table_monitoring.setColumnWidth(7, 140)
+        self.table_monitoring.setColumnWidth(8, 140)
+        self.table_monitoring.setColumnWidth(9, 125)
 
         layout.addWidget(self.table_monitoring, 1)
 
@@ -9021,7 +9598,7 @@ class COProcessingDialog(QDialog):
 
         detail_layout.addLayout(det_head)
 
-        # 3 Deliverable Status Detail Cards
+        # 4 Deliverable Status Detail Cards
         cards_layout = QHBoxLayout()
         cards_layout.setSpacing(8)
 
@@ -9090,6 +9667,28 @@ class COProcessingDialog(QDialog):
         cm_layout.addWidget(self.lbl_det_mis_info)
         cm_layout.addWidget(self.btn_mon_open_mis)
         cards_layout.addWidget(self.card_det_mis, 1)
+
+        # PCD EARF Block
+        self.card_det_pcd = QFrame()
+        self.card_det_pcd.setObjectName("kpiCard")
+        cp_layout = QVBoxLayout(self.card_det_pcd)
+        cp_layout.setContentsMargins(8, 6, 8, 6)
+        cp_layout.setSpacing(3)
+        cp_title = QLabel("4. PCD EARF Excel (.xlsx)")
+        cp_title.setFont(QFont("Segoe UI", 8, QFont.Bold))
+        cp_title.setStyleSheet("color: #d97706;")
+        self.lbl_det_pcd_status = QLabel("Status: -")
+        self.lbl_det_pcd_info = QLabel("File: -")
+        self.lbl_det_pcd_info.setWordWrap(True)
+        self.btn_mon_open_pcd = QPushButton("Open PCD EARF")
+        self.btn_mon_open_pcd.setObjectName("secondaryBtn")
+        self.btn_mon_open_pcd.setEnabled(False)
+        self.btn_mon_open_pcd.clicked.connect(self._open_selected_pcd_earf)
+        cp_layout.addWidget(cp_title)
+        cp_layout.addWidget(self.lbl_det_pcd_status)
+        cp_layout.addWidget(self.lbl_det_pcd_info)
+        cp_layout.addWidget(self.btn_mon_open_pcd)
+        cards_layout.addWidget(self.card_det_pcd, 1)
 
         detail_layout.addLayout(cards_layout)
         layout.addWidget(self.mon_detail_frame)
@@ -9286,11 +9885,11 @@ class COProcessingDialog(QDialog):
             # Status filter
             if status_filter and status_filter != "All Statuses":
                 st = r.get("status")
-                if status_filter == "Complete (3/3)" and st != "COMPLETE":
+                if status_filter in ("Complete (4/4)", "Complete (3/3)") and st != "COMPLETE":
                     continue
-                elif status_filter == "Partial (1-2/3)" and st != "PARTIAL":
+                elif status_filter in ("Partial (1-3/4)", "Partial (1-2/3)") and st != "PARTIAL":
                     continue
-                elif status_filter == "Missing All (0/3)" and st != "MISSING":
+                elif status_filter in ("Missing All (0/4)", "Missing All (0/3)") and st != "MISSING":
                     continue
                 elif status_filter == "Missing GPKG" and r["gpkg"]["exists"]:
                     continue
@@ -9298,10 +9897,13 @@ class COProcessingDialog(QDialog):
                     continue
                 elif status_filter == "Missing MIS EARF" and r["mis_earf"]["exists"]:
                     continue
+                elif status_filter == "Missing PCD EARF" and r.get("pcd_earf", {}).get("exists"):
+                    continue
 
             # Search query
             if search_query:
-                haystack = f"{r.get('code', '')} {r.get('pppmm', '')} {r.get('name', '')} {r.get('province', '')} {r.get('region', '')} {r['gpkg']['filename']} {r['final_earf']['filename']} {r['mis_earf']['filename']}".lower()
+                pcd_fn = r.get('pcd_earf', {}).get('filename', '')
+                haystack = f"{r.get('code', '')} {r.get('pppmm', '')} {r.get('name', '')} {r.get('province', '')} {r.get('region', '')} {r['gpkg']['filename']} {r['final_earf']['filename']} {r['mis_earf']['filename']} {pcd_fn}".lower()
                 if search_query not in haystack:
                     continue
 
@@ -9313,7 +9915,7 @@ class COProcessingDialog(QDialog):
         self._fetch_and_render_mon_page()
 
     def _update_monitoring_kpi_cards(self, records):
-        """Updates the 7 KPI cards on the monitoring tab with fixed 1,655 benchmark."""
+        """Updates the KPI cards on the monitoring tab with fixed 1,655 benchmark."""
         FIXED_TOTAL_CITIES_MUN = 1655
         tot = len(records)
         comp = sum(1 for r in records if r.get("status") == "COMPLETE")
@@ -9322,11 +9924,12 @@ class COProcessingDialog(QDialog):
         gpkg_cnt = sum(1 for r in records if r.get("gpkg", {}).get("exists"))
         earf_cnt = sum(1 for r in records if r.get("final_earf", {}).get("exists"))
         mis_cnt = sum(1 for r in records if r.get("mis_earf", {}).get("exists"))
+        pcd_cnt = sum(1 for r in records if r.get("pcd_earf", {}).get("exists"))
 
         # The total count of cities/municipalities is fixed at 1,655 nationwide
         self.kpi_mon_total.val_label.setText("1,655")
 
-        # Percent Completed = Total Fully Complete (3/3) / 1,655 Cities/Municipalities * 100%
+        # Percent Completed = Total Fully Complete (4/4) / 1,655 Cities/Municipalities * 100%
         pct = (comp / FIXED_TOTAL_CITIES_MUN * 100.0)
         self.kpi_mon_percent.val_label.setText(f"{pct:.1f}%")
 
@@ -9334,6 +9937,7 @@ class COProcessingDialog(QDialog):
         self.kpi_mon_gpkg.val_label.setText(f"{gpkg_cnt:,}")
         self.kpi_mon_final_earf.val_label.setText(f"{earf_cnt:,}")
         self.kpi_mon_mis_earf.val_label.setText(f"{mis_cnt:,}")
+        self.kpi_mon_pcd_earf.val_label.setText(f"{pcd_cnt:,}")
 
         # Incomplete / Pending
         incomp = FIXED_TOTAL_CITIES_MUN - comp if (not self.mon_records or tot >= len(self.mon_records)) else (tot - comp)
@@ -9407,7 +10011,7 @@ class COProcessingDialog(QDialog):
 
             # Col 4: Overall Status Badge
             st = r.get("status", "MISSING")
-            ratio = r.get("completion_ratio", "0/3")
+            ratio = r.get("completion_ratio", "0/4")
             status_item = SmartTableWidgetItem(f"{ratio} {st}")
             status_item.setTextAlignment(Qt.AlignCenter)
             status_font = QFont()
@@ -9474,16 +10078,32 @@ class COProcessingDialog(QDialog):
                 mis_item.setToolTip(f"Expected: {r.get('pppmm')}_MIS_{r.get('clean_name')}.xlsx")
             self.table_monitoring.setItem(row_idx, 7, mis_item)
 
-            # Col 8: Last Modified
+            # Col 8: PCD EARF Excel
+            pcd = r.get("pcd_earf", {})
+            if pcd.get("exists"):
+                pcd_item = SmartTableWidgetItem(f"READY ({pcd.get('size_str', '')})")
+                pcd_item.setTextAlignment(Qt.AlignCenter)
+                pcd_item.setForeground(QColor("#b45309"))
+                pcd_item.setBackground(QColor("#fef3c7"))
+                pcd_item.setToolTip(f"File: {pcd.get('filename')}\nPath: {pcd.get('path')}\nSize: {pcd.get('size_str')}\nModified: {pcd.get('mtime_str')}")
+            else:
+                pcd_item = SmartTableWidgetItem("MISSING")
+                pcd_item.setTextAlignment(Qt.AlignCenter)
+                pcd_item.setForeground(QColor("#94a3b8"))
+                pcd_item.setBackground(QColor("#f8fafc"))
+                pcd_item.setToolTip(f"Expected: {r.get('pppmm')}_earf2026_PCD.xlsx")
+            self.table_monitoring.setItem(row_idx, 8, pcd_item)
+
+            # Col 9: Last Modified
             mod_str = str(r.get("last_modified_str") or r.get("last_modified") or "-")
             mod_item = SmartTableWidgetItem(mod_str)
             mod_item.setTextAlignment(Qt.AlignCenter)
-            self.table_monitoring.setItem(row_idx, 8, mod_item)
+            self.table_monitoring.setItem(row_idx, 9, mod_item)
 
-            # Col 9: Subfolder Location
+            # Col 10: Subfolder Location
             loc_item = SmartTableWidgetItem(r.get("folder_path", "") or "-")
             loc_item.setToolTip(r.get("folder_path", ""))
-            self.table_monitoring.setItem(row_idx, 9, loc_item)
+            self.table_monitoring.setItem(row_idx, 10, loc_item)
 
         self.table_monitoring.setSortingEnabled(True)
 
@@ -9517,6 +10137,9 @@ class COProcessingDialog(QDialog):
             self.lbl_det_mis_status.setText("Status: -")
             self.lbl_det_mis_info.setText("File: -")
             self.btn_mon_open_mis.setEnabled(False)
+            self.lbl_det_pcd_status.setText("Status: -")
+            self.lbl_det_pcd_info.setText("File: -")
+            self.btn_mon_open_pcd.setEnabled(False)
             return
 
         m_title = f"<b>Selected:</b> {rec.get('code', '')} - {rec.get('name', '')} ({rec.get('province', '')}, {rec.get('region', '')})"
@@ -9529,7 +10152,8 @@ class COProcessingDialog(QDialog):
             rec.get("has_matching_data") or
             rec.get("gpkg", {}).get("exists") or
             rec.get("final_earf", {}).get("exists") or
-            rec.get("mis_earf", {}).get("exists")
+            rec.get("mis_earf", {}).get("exists") or
+            rec.get("pcd_earf", {}).get("exists")
         )
         self.btn_mon_review_qa.setEnabled(has_any_deliv)
 
@@ -9567,6 +10191,17 @@ class COProcessingDialog(QDialog):
             self.lbl_det_mis_info.setText(f"File: Expected {rec.get('pppmm')}_MIS_{rec.get('clean_name')}.xlsx")
             self.btn_mon_open_mis.setEnabled(False)
 
+        # PCD EARF Block
+        pcd = rec.get("pcd_earf", {})
+        if pcd.get("exists"):
+            self.lbl_det_pcd_status.setText(f"Status: <b style='color:#d97706;'>READY</b> ({pcd.get('size_str')})")
+            self.lbl_det_pcd_info.setText(f"File: {pcd.get('filename')}\nModified: {pcd.get('mtime_str')}")
+            self.btn_mon_open_pcd.setEnabled(True)
+        else:
+            self.lbl_det_pcd_status.setText("Status: <b style='color:#dc2626;'>MISSING</b>")
+            self.lbl_det_pcd_info.setText(f"File: Expected {rec.get('pppmm')}_earf2026_PCD.xlsx")
+            self.btn_mon_open_pcd.setEnabled(False)
+
     def _on_monitoring_row_double_clicked(self, row, col):
         """Double clicking a row loads GPKG to map if available, or opens the subfolder."""
         page_size = self.mon_page_size if self.mon_page_size > 0 else len(self.mon_filtered_records)
@@ -9603,6 +10238,10 @@ class COProcessingDialog(QDialog):
         action_mis.setEnabled(bool(rec.get("mis_earf", {}).get("exists")))
         action_mis.triggered.connect(self._open_selected_mis_earf)
 
+        action_pcd = menu.addAction("Open PCD EARF Spreadsheet")
+        action_pcd.setEnabled(bool(rec.get("pcd_earf", {}).get("exists")))
+        action_pcd.triggered.connect(self._open_selected_pcd_earf)
+
         menu.addSeparator()
 
         action_folder = menu.addAction("Open Subfolder in Windows Explorer")
@@ -9620,7 +10259,8 @@ class COProcessingDialog(QDialog):
             rec.get("has_matching_data") or
             rec.get("gpkg", {}).get("exists") or
             rec.get("final_earf", {}).get("exists") or
-            rec.get("mis_earf", {}).get("exists")
+            rec.get("mis_earf", {}).get("exists") or
+            rec.get("pcd_earf", {}).get("exists")
         ))
         action_qa.triggered.connect(lambda: self._open_qa_review_for_record(rec))
 
@@ -9670,6 +10310,16 @@ class COProcessingDialog(QDialog):
             os.startfile(p)
         except Exception as e:
             QMessageBox.warning(self, "Open File Failed", f"Could not open MIS EARF file: {e}")
+
+    def _open_selected_pcd_earf(self):
+        rec = self.mon_selected_record
+        if not rec or not rec.get("pcd_earf", {}).get("exists"):
+            return
+        p = rec["pcd_earf"]["path"]
+        try:
+            os.startfile(p)
+        except Exception as e:
+            QMessageBox.warning(self, "Open File Failed", f"Could not open PCD EARF file: {e}")
 
     def _open_selected_folder(self):
         rec = self.mon_selected_record
@@ -9775,17 +10425,31 @@ class COProcessingDialog(QDialog):
         self._export_deliverables_for_citymun(c_code)
 
     def _export_deliverables_for_citymun(self, city_mun_code: str) -> bool:
-        """Exports the 3 final deliverables for a specific municipality in a background worker thread."""
+        """Exports the final deliverables for a specific municipality in a background worker thread."""
         root_dir = self.txt_mon_root_dir.text().strip() or getattr(self, "_final_export_root_dir", None) or DEFAULT_FINAL_EXPORT_ROOT
         if not os.path.exists(root_dir):
             root_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
-        target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, city_mun_code)
-        if not target_folder:
-            target_folder = root_dir
-        os.makedirs(target_folder, exist_ok=True)
+        rec = getattr(self, "mon_selected_record", None)
+        if rec and rec.get("code") == city_mun_code and rec.get("folder_path") and os.path.exists(rec.get("folder_path")):
+            target_folder = rec["folder_path"]
+            hier = self.db.get_citymun_hierarchy(city_mun_code)
+        else:
+            target_folder, hier = self.db.resolve_final_export_subfolder(root_dir, city_mun_code)
 
-        mun_name = hier.get("city_mun") or city_mun_code
+        if not target_folder or not os.path.exists(target_folder):
+            mun_display = hier.get("city_mun") or city_mun_code
+            QMessageBox.warning(
+                self,
+                "Subfolder Not Found",
+                f"No existing subfolder found matching '{mun_display}' ({city_mun_code}) in root directory:\n{root_dir}\n\n"
+                "Please ensure the municipality subfolder exists in the root directory before exporting."
+            )
+            return False
+
+        mun_name = hier.get("city_mun")
+        if not is_valid_mun_name(mun_name):
+            mun_name = f"City/Mun {city_mun_code}"
         clean_cm = re.sub(r'\s*\([^)]*\)', '', mun_name)
         clean_cm = re.sub(r'[^a-zA-Z0-9]+', '_', clean_cm).strip('_').lower()
         if not clean_cm:
@@ -9811,6 +10475,11 @@ class COProcessingDialog(QDialog):
         except Exception:
             pass
 
+        exp_gpkg = getattr(self, "chk_export_gpkg", None) is None or self.chk_export_gpkg.isChecked()
+        exp_earf = getattr(self, "chk_export_earf", None) is None or self.chk_export_earf.isChecked()
+        exp_mis = getattr(self, "chk_export_mis", None) is None or self.chk_export_mis.isChecked()
+        exp_pcd = getattr(self, "chk_export_pcd", None) is None or self.chk_export_pcd.isChecked()
+
         task = {
             "city_mun": city_mun_code,
             "mun_name": mun_name,
@@ -9820,6 +10489,10 @@ class COProcessingDialog(QDialog):
             "out_excel_path": out_excel_path,
             "out_mis_path": out_mis_path,
             "out_pcd_path": out_pcd_path,
+            "export_gpkg": exp_gpkg,
+            "export_earf": exp_earf,
+            "export_mis": exp_mis,
+            "export_pcd": exp_pcd,
             "search": "",
             "status": "All",
             "ea_lifecycle": "All",

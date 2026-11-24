@@ -18,7 +18,7 @@ import sqlite3
 import collections
 from datetime import datetime
 import pandas as pd
-from typing import Dict, List, Optional, Tuple, Any, Union, Callable
+from typing import Dict, List, Optional, Tuple, Any, Union, Callable, Set
 
 try:
     from ..core.algorithm import build_geocode, read_earf_table, POPCEN_FIELDS, GPKG_EARF_FIELDS, to_whole_number_str
@@ -172,6 +172,7 @@ def get_default_gpkg_db_path() -> str:
 DEFAULT_FINAL_EXPORT_ROOT = r"Y:\2026\1Map\Final EARF and geopackages"
 DEFAULT_GPKG_ROOT = r"Y:\geotags-uploads\ea-delineation"
 DEFAULT_EARF_ROOT = r"D:\PSA-GIS\Camarines Sur\Project 1MAP\3_EA Delineation and Merging\1_Downloaded Files\Output\2_output_files"
+DEFAULT_POPCEN_ROOT = r"Y:\geotags-uploads\ea-delineation"
 
 
 
@@ -179,17 +180,40 @@ def _clean_hier_name(s: str) -> str:
     return re.sub(r'[^a-zA-Z0-9]', '', str(s or '').lower())
 
 
+def is_valid_mun_name(name: Optional[str]) -> bool:
+    """
+    Validates whether a candidate string is an actual municipality or city name,
+    rather than an Enumeration Area (EA) label, numeric code, or empty placeholder.
+    """
+    if not name:
+        return False
+    s = str(name).strip()
+    if not s or s.lower() in ("nan", "none", "null", "undefined", ""):
+        return False
+    if s.isdigit():
+        return False
+    # Reject strings that look like EA indicators (e.g. "EA 000000", "EA 157000", "EA_001", "EA-001", "EA 01")
+    if re.match(r"^ea[\s_-]*\d+$", s, re.IGNORECASE) or re.match(r"^ea\s+", s, re.IGNORECASE):
+        return False
+    return True
+
+
 def _match_hier_names(d_name: str, target_name: str) -> bool:
     cd = _clean_hier_name(d_name)
     ct = _clean_hier_name(target_name)
     if not cd or not ct:
         return False
-    if cd == ct or cd in ct or ct in cd:
+    if cd == ct:
+        return True
+    if len(cd) >= 4 and len(ct) >= 4 and (cd in ct or ct in cd):
         return True
     cd_strip = cd.replace("cityof", "").replace("city", "").replace("municipalityof", "").replace("provinceof", "")
     ct_strip = ct.replace("cityof", "").replace("city", "").replace("municipalityof", "").replace("provinceof", "")
-    if cd_strip and ct_strip and (cd_strip == ct_strip or cd_strip in ct_strip or ct_strip in cd_strip):
-        return True
+    if cd_strip and ct_strip:
+        if cd_strip == ct_strip:
+            return True
+        if len(cd_strip) >= 4 and len(ct_strip) >= 4 and (cd_strip in ct_strip or ct_strip in cd_strip):
+            return True
     return False
 
 
@@ -393,6 +417,42 @@ def find_earf_files_in_folder(folder_path: str, recursive: bool = False, pattern
     return earf_files
 
 
+def find_popcen_files_in_folder(folder_path: str, recursive: bool = False, pattern: Optional[str] = None) -> List[str]:
+    """
+    Scans folder_path for all 2024 POPCEN Excel/CSV files (.xlsx / .xls / .csv),
+    excluding temporary files ('~$') and 'versions' directories.
+    If pattern is given and matching files exist, returns those;
+    otherwise returns all valid Excel/CSV files in the directory.
+    """
+    if not folder_path or not os.path.exists(folder_path):
+        return []
+
+    target_pattern = pattern.lower().strip() if pattern else "popcen"
+
+    candidate_files = []
+    if recursive:
+        for root, dirs, files in os.walk(folder_path):
+            dirs[:] = [d for d in dirs if not is_version_dir(d)]
+            rel_path = os.path.relpath(root, folder_path)
+            if rel_path != "." and any(is_version_dir(part) for part in rel_path.replace(os.sep, "/").split("/")):
+                continue
+            for f in sorted(files):
+                f_low = f.lower()
+                if f_low.endswith((".xlsx", ".xls", ".csv")) and not f.startswith("~$"):
+                    candidate_files.append(os.path.normpath(os.path.join(root, f)))
+    else:
+        for f in sorted(os.listdir(folder_path)):
+            fpath = os.path.join(folder_path, f)
+            f_low = f.lower()
+            if os.path.isfile(fpath) and f_low.endswith((".xlsx", ".xls", ".csv")) and not f.startswith("~$"):
+                candidate_files.append(os.path.normpath(fpath))
+
+    matched = [f for f in candidate_files if target_pattern in os.path.basename(f).lower()]
+    if matched:
+        return matched
+    return candidate_files
+
+
 
 
 def is_summary_header_record(r: Dict[str, Any]) -> bool:
@@ -437,9 +497,140 @@ def is_summary_header_record(r: Dict[str, Any]) -> bool:
     return False
 
 
+def cluster_merged_records(b_records: List[Dict[str, Any]]) -> List[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
+    """
+    Finds connected components of merged records within a barangay.
+    Returns a list of tuples: (prevailing_record, [absorbed_records]) for each merge group.
+    Prevailing record is determined under official PSA census cartography guidelines:
+      1. Higher 2024 Household Count (no_of_households / popcen_households)
+      2. Active geometry in GeoPackage (in_gpkg / has_geometry)
+      3. Remarks not containing 'merged to' or 'merged into' (survivor remarks say 'merged with')
+      4. Lowest baseline EAN
+    """
+    merged_records = []
+    for r in b_records:
+        if is_summary_header_record(r):
+            continue
+        ea_t = str(r.get("ea_type") or r.get("ea_lifecycle") or "").strip().upper()
+        rem = str(r.get("remarks") or r.get("earf_remarks") or r.get("popcen_remarks") or "").strip()
+        if ("MERG" in ea_t) or ("MERG" in rem.upper()):
+            merged_records.append(r)
+
+    if not merged_records:
+        return []
+
+    n_m = len(merged_records)
+    adj = collections.defaultdict(list)
+
+    for i in range(n_m):
+        ri = merged_records[i]
+        rem_i = str(ri.get("remarks") or ri.get("earf_remarks") or ri.get("popcen_remarks") or "").strip()
+        rec_i = str(ri.get("recoded_ean") or "").strip()
+        new_i = str(ri.get("new_enumeration_area_code") or ri.get("new_ean") or "").strip()
+        ean_i = str(ri.get("ean") or "").strip()
+
+        targets_i = set()
+        for m in re.finditer(r"merge[d\s]+(?:to|with|into)\s+(?:EA\s*)?(\d+)", rem_i, re.IGNORECASE):
+            targets_i.add(m.group(1).zfill(6))
+            targets_i.add(str(int(m.group(1))))
+
+        for j in range(i + 1, n_m):
+            rj = merged_records[j]
+            rem_j = str(rj.get("remarks") or rj.get("earf_remarks") or rj.get("popcen_remarks") or "").strip()
+            rec_j = str(rj.get("recoded_ean") or "").strip()
+            new_j = str(rj.get("new_enumeration_area_code") or rj.get("new_ean") or "").strip()
+            ean_j = str(rj.get("ean") or "").strip()
+
+            targets_j = set()
+            for m in re.finditer(r"merge[d\s]+(?:to|with|into)\s+(?:EA\s*)?(\d+)", rem_j, re.IGNORECASE):
+                targets_j.add(m.group(1).zfill(6))
+                targets_j.add(str(int(m.group(1))))
+
+            is_connected = False
+            # 1. Share non-empty recoded_ean (if valid)
+            if rec_i and rec_j and rec_i == rec_j:
+                is_connected = True
+            # 2. Share non-empty new_ean
+            elif new_i and new_j and new_i == new_j:
+                is_connected = True
+            # 3. ri targets rj's ean or new_ean
+            elif ean_j and (ean_j in targets_i or ean_j.zfill(6) in targets_i or (ean_j.isdigit() and str(int(ean_j)) in targets_i)):
+                is_connected = True
+            elif new_j and (new_j in targets_i or new_j.zfill(6) in targets_i or (new_j.isdigit() and str(int(new_j)) in targets_i)):
+                is_connected = True
+            # 4. rj targets ri's ean or new_ean
+            elif ean_i and (ean_i in targets_j or ean_i.zfill(6) in targets_j or (ean_i.isdigit() and str(int(ean_i)) in targets_j)):
+                is_connected = True
+            elif new_i and (new_i in targets_j or new_i.zfill(6) in targets_j or (new_i.isdigit() and str(int(new_i)) in targets_j)):
+                is_connected = True
+            # 5. Share common target in remarks
+            elif targets_i and targets_j and (targets_i & targets_j):
+                is_connected = True
+
+            if is_connected:
+                adj[i].append(j)
+                adj[j].append(i)
+
+    visited = [False] * n_m
+    groups = []
+    for i in range(n_m):
+        if visited[i]:
+            continue
+        comp = []
+        queue = [i]
+        visited[i] = True
+        while queue:
+            curr = queue.pop(0)
+            comp.append(curr)
+            for neighbor in adj[curr]:
+                if not visited[neighbor]:
+                    visited[neighbor] = True
+                    queue.append(neighbor)
+
+        comp_records = [merged_records[idx] for idx in comp]
+        if len(comp_records) <= 1:
+            r = comp_records[0]
+            rem = str(r.get("remarks") or r.get("earf_remarks") or r.get("popcen_remarks") or "").lower()
+            if any(k in rem for k in ("merged to", "merged into")) and not (r.get("in_gpkg") or r.get("has_geometry")):
+                groups.append((r, [r]))
+            else:
+                groups.append((r, []))
+            continue
+
+        def prevailing_score(rec):
+            hh_2024 = 0
+            try:
+                hh_raw = rec.get("no_of_households")
+                if hh_raw is None or str(hh_raw).strip() == "":
+                    hh_raw = rec.get("popcen_households")
+                if hh_raw is None or str(hh_raw).strip() == "":
+                    hh_raw = rec.get("household_count")
+                if hh_raw is None or str(hh_raw).strip() == "":
+                    hh_raw = rec.get("earf_household_count")
+                if str(hh_raw).isdigit():
+                    hh_2024 = int(hh_raw)
+            except Exception:
+                pass
+
+            has_geom = 1 if (rec.get("in_gpkg") or rec.get("has_geometry")) else 0
+            rem_low = str(rec.get("remarks") or rec.get("earf_remarks") or rec.get("popcen_remarks") or "").lower()
+            not_merged_to = 0 if any(k in rem_low for k in ("merged to", "merged into")) else 1
+            orig_ean = str(rec.get("ean") or "").strip()
+            ean_int = int(orig_ean) if orig_ean.isdigit() else 999999
+
+            return (hh_2024, has_geom, not_merged_to, -ean_int)
+
+        sorted_m = sorted(comp_records, key=prevailing_score, reverse=True)
+        prevailing = sorted_m[0]
+        absorbed = sorted_m[1:]
+        groups.append((prevailing, absorbed))
+
+    return groups
+
+
 def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Computes 'recoded_ean' (Column 22: Recoded Enumeration Area) per Barangay adhering to PSA EARF rules:
+    Computes and populates 'recoded_ean' across records using PSA rules:
       - Scope: Per Barangay (PSGC prefix: prov_code + city_mun_code + barangay_code).
       - Option B: Keeps Column 16 ('new_enumeration_area_code' / 'new_ean') as the raw preliminary input code (e.g. '004003').
       - Rule A (Single EA Barangay): If only 1 resulting EA in barangay (or merged to 1 EA), code is strictly '000000'.
@@ -480,6 +671,18 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
         by_brgy[brgy_key].append(r)
 
     for brgy_key, b_records in by_brgy.items():
+        # Cluster merged records so all records in a merge group share the prevailing EA's entity key
+        merged_groups = cluster_merged_records(b_records)
+        merged_entity_keys = {}
+        for prevailing, absorbed_list in merged_groups:
+            prev_ean = str(prevailing.get("ean") or "").strip().replace(".0", "")
+            if prev_ean.isdigit() and len(prev_ean) < 6:
+                prev_ean = f"{int(prev_ean):03d}000" if len(prev_ean) <= 3 else f"{int(prev_ean):06d}"
+            comp_key = f"MERGED_{prev_ean or id(prevailing)}"
+            merged_entity_keys[id(prevailing)] = comp_key
+            for abs_rec in absorbed_list:
+                merged_entity_keys[id(abs_rec)] = comp_key
+
         record_entities = []
         seen_base_keys = collections.defaultdict(int)
         seen_split_keys = collections.defaultdict(int)
@@ -504,6 +707,7 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
                 r["new_enumeration_area_code"] = norm_nean
                 r["new_ean"] = norm_nean
             else:
+                norm_nean = ""
                 r["new_enumeration_area_code"] = ""
                 r["new_ean"] = ""
 
@@ -531,7 +735,7 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
             cand_base = old_ean if is_base_code(old_ean) else (norm_nean if is_base_code(norm_nean) else "")
 
             if is_merged:
-                entity_key = target_merged if target_merged else (cand_base or "MERGED_TARGET")
+                entity_key = merged_entity_keys.get(id(r)) or target_merged or (cand_base or "MERGED_TARGET")
                 record_entities.append((r, entity_key, "MERGED", norm_nean, old_ean))
             elif has_sub_code:
                 # Sub-code e.g. 004003, 003002 -> Appended Delineated entity
@@ -597,19 +801,23 @@ def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dic
     return records
 
 
-def filter_pcd_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def identify_absorbed_records(records: List[Dict[str, Any]]) -> Set[int]:
     """
-    Filters records for the PCD deliverable (<pppmm>_earf2026_PCD.xlsx):
-      - RETAINED: 100% kept.
-      - DELINEATED / SPLIT (treated as equivalent): 100% kept (all subdivided parts).
-      - MERGED: Absorbed merged partner rows are filtered out so that only the surviving
-        primary / consolidated EA record is kept.
+    Identifies absorbed merged EAs within each barangay.
+    Under official PSA census cartography guidelines:
+      - The EA in a merge group with the HIGHER 2024 Household Count is the PREVAILING EA (The Survivor).
+      - The EA with the LOWER 2024 Household Count is the ABSORBED EA.
+      - In case of a tie in 2024 household count:
+          1. Active geometry in GeoPackage
+          2. Remarks not containing 'merged to' or 'merged into' (survivor typically has 'merged with')
+          3. Base EAN matches target recoded EAN
+          4. Lowest baseline EAN
+      - The absorbed EA should NOT have values in columns J, K, L, and M in the Final EARF Excel.
+    Returns a set of id(record) for all absorbed records.
     """
+    absorbed_set: Set[int] = set()
     if not records:
-        return []
-
-    # First ensure recoded_ean is populated across records
-    records = compute_recoded_enumeration_areas(records)
+        return absorbed_set
 
     by_brgy = collections.defaultdict(list)
     for r in records:
@@ -628,59 +836,39 @@ def filter_pcd_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             brgy_key = str(r.get("areaname", "") or r.get("geographic_name") or "UNKNOWN")
         by_brgy[brgy_key].append(r)
 
-    filtered_records: List[Dict[str, Any]] = []
-
     for brgy_key, b_records in by_brgy.items():
-        # Identify absorbed merged partner rows within the barangay
-        merged_groups = collections.defaultdict(list)
-        for r in b_records:
-            ea_t = str(r.get("ea_type") or r.get("ea_lifecycle") or "").strip().upper()
-            rem = str(r.get("remarks") or r.get("earf_remarks") or r.get("popcen_remarks") or "").strip()
-            is_merged = ("MERG" in ea_t) or ("MERG" in rem.upper())
-            if is_merged:
-                # Group by recoded_ean (the target consolidated EA code)
-                rec_ean = str(r.get("recoded_ean") or "").strip()
-                merged_groups[rec_ean].append(r)
+        groups = cluster_merged_records(b_records)
+        for prevailing, absorbed_list in groups:
+            for abs_rec in absorbed_list:
+                absorbed_set.add(id(abs_rec))
 
-        absorbed_set = set()
-        for rec_ean, m_recs in merged_groups.items():
-            if len(m_recs) <= 1:
-                # If only one record marked as merged in this group, check if it's explicitly an absorbed row
-                r = m_recs[0]
-                rem = str(r.get("remarks") or r.get("earf_remarks") or r.get("popcen_remarks") or "").lower()
-                if any(k in rem for k in ("merged to", "merged with", "merged into")) and not (r.get("in_gpkg") or r.get("has_geometry")):
-                    absorbed_set.add(id(r))
-                continue
+    return absorbed_set
 
-            # In a group of merged EAs sharing the same recoded_ean, pick the primary survivor
-            # 1st priority: Active geometry in GeoPackage
-            # 2nd priority: Does NOT contain "merged to" in remarks
-            # 3rd priority: Base EAN matches target code or lowest ean
-            def survivor_score(rec):
-                score = 0
-                if rec.get("in_gpkg") or rec.get("has_geometry"):
-                    score += 100
-                rem_low = str(rec.get("remarks") or rec.get("earf_remarks") or rec.get("popcen_remarks") or "").lower()
-                if not any(k in rem_low for k in ("merged to", "merged with", "merged into")):
-                    score += 50
-                orig_ean = str(rec.get("ean") or "").strip()
-                if orig_ean and rec_ean and orig_ean.zfill(6) == rec_ean.zfill(6):
-                    score += 25
-                return score
 
-            sorted_m = sorted(m_recs, key=survivor_score, reverse=True)
-            # The top-scoring record is the primary survivor; all other partner records are absorbed
-            for partner in sorted_m[1:]:
-                absorbed_set.add(id(partner))
+def filter_pcd_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Filters records for the PCD deliverable (<pppmm>_earf2026_PCD.xlsx):
+      - RETAINED: 100% kept.
+      - DELINEATED / SPLIT (treated as equivalent): 100% kept (all subdivided parts).
+      - MERGED: Absorbed merged partner rows are filtered out so that only the surviving
+        prevailing EA record is kept.
+    """
+    if not records:
+        return []
 
-        for r in b_records:
-            # Must be a valid physical record that belongs to the GeoPackage
-            # (or has geometry / is in_gpkg) and is not an absorbed merged partner
-            if id(r) in absorbed_set:
-                continue
-            if not (r.get("in_gpkg") or r.get("has_geometry")):
-                continue
-            filtered_records.append(r)
+    # First ensure recoded_ean is populated across records
+    records = compute_recoded_enumeration_areas(records)
+    absorbed_set = identify_absorbed_records(records)
+
+    filtered_records: List[Dict[str, Any]] = []
+    for r in records:
+        if is_summary_header_record(r):
+            continue
+        if id(r) in absorbed_set:
+            continue
+        if not (r.get("in_gpkg") or r.get("has_geometry")):
+            continue
+        filtered_records.append(r)
 
     return filtered_records
 
@@ -788,25 +976,59 @@ def audit_matched_flags(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return records
 
 
+def extract_sort_geocode(r_item: Dict[str, Any]) -> str:
+    """Extracts or computes the 14-digit geocode for sorting records."""
+    p = str(r_item.get("province_code") or "").strip()
+    m = str(r_item.get("city_mun_code") or "").strip()
+    b = str(r_item.get("barangay_code") or "").strip()
+    gc = str(r_item.get("geocode") or "").strip()
+    if not (p and m and b) and len(gc) >= 8:
+        if not p: p = gc[:3]
+        if not m: m = gc[3:5]
+        if not b: b = gc[5:8]
+    p = p.zfill(3)
+    m = m.zfill(2)
+    b = b.zfill(3)
+
+    final_ea = str(r_item.get("recoded_ean") or r_item.get("final_ean") or "").strip()
+    if final_ea.isdigit() and len(final_ea) < 6:
+        final_ea = f"{int(final_ea):03d}000" if len(final_ea) <= 3 else f"{int(final_ea):06d}"
+    if not final_ea:
+        prelim_ea = str(r_item.get("new_enumeration_area_code") or r_item.get("new_ean") or "").strip()
+        if prelim_ea.isdigit() and len(prelim_ea) < 6:
+            prelim_ea = f"{int(prelim_ea):03d}000" if len(prelim_ea) <= 3 else f"{int(prelim_ea):06d}"
+        ean_raw = str(r_item.get("ean") or "000000").strip()
+        if ean_raw.isdigit() and len(ean_raw) < 6:
+            ean_raw = f"{int(ean_raw):03d}000" if len(ean_raw) <= 3 else f"{int(ean_raw):06d}"
+        final_ea = prelim_ea or ean_raw
+
+    ea_gc = str(r_item.get("ea_geocode") or "").strip()
+    if not ea_gc or len(ea_gc) != 14:
+        ea_gc = f"{p}{m}{b}{final_ea}"
+    return ea_gc
+
+
 def export_matched_to_excel(
     records: List[Dict[str, Any]], 
     out_path: str,
-    metadata: Optional[Dict[str, str]] = None
+    metadata: Optional[Dict[str, str]] = None,
+    is_pcd: bool = False
 ):
     """
     Exports matched records to the official PSA Final EARF Excel workbook (.xlsx)
     matching the exact 15-column template structure:
-      - Sheet 1: '2026 Final EARF' (15-column PSA official hierarchical format)
+      - Sheet 1: '2026 Final EARF' (15-column PSA official hierarchical format, or 11-column for PCD)
         - Row 1: '2026 Final Enumeration Area Reference File'
         - Row 2: 'As of Oct 2026'
-        - Row 3: Group Headers ('2024 EARF' [A3:H3] | '2026 Preliminary EA' [I3:O3])
+        - Row 3: Group Headers ('2024 EARF' [B3:I3] | '2026 Preliminary EA' [J3:P3] or [J3:K3] for PCD)
         - Row 4: Column Headers (Prov, Mun, Brgy, EA, Number of EAs, Province/City/Barangay/EA name,
                  Number of Households, Number of Buildings, Prelim EA Code, Final EA Code,
                  Household Count, Building Count, EA Type, Source Year, Remarks)
+                 (For PCD: columns J, L, M, N, O are removed and remarks values are cleared)
         - Row 5: Numbered tags (2) to (14)
         - Row 6+: Hierarchical rows (Province summary, Municipality summary, Barangay summary,
                  and pure EA rows with recoded_ean in Final EA Code, peach highlight for MERGED EAs)
-      - Sheet 2: 'Reconciliation Log' (22-column comprehensive side-by-side reconciliation)
+      - Sheet 2: 'Reconciliation Log' (22-column comprehensive side-by-side reconciliation, omitted for PCD)
     """
     import openpyxl
     from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
@@ -866,23 +1088,14 @@ def export_matched_to_excel(
     records = deduped_records
 
     # Strictly sort records by geocode
-    def _extract_sort_geocode(r_item: Dict[str, Any]) -> str:
-        gc_val = str(r_item.get("ea_geocode") or r_item.get("geocode") or "").strip()
-        if not gc_val or len(gc_val) < 8:
-            p = str(r_item.get("province_code") or "").strip().zfill(3)
-            m = str(r_item.get("city_mun_code") or "").strip().zfill(2)
-            b = str(r_item.get("barangay_code") or "").strip().zfill(3)
-            e = str(r_item.get("final_ean") or r_item.get("recoded_ean") or r_item.get("ean") or "").strip()
-            if e.isdigit() and len(e) < 6:
-                e = e.zfill(6)
-            gc_val = f"{p}{m}{b}{e}"
-        return gc_val
-
+    _extract_sort_geocode = extract_sort_geocode
     records = sorted(records, key=_extract_sort_geocode)
 
     # Ensure recoded_ean is populated across records
     if any(not r.get("recoded_ean") for r in records):
         records = compute_recoded_enumeration_areas(records)
+
+    absorbed_set = identify_absorbed_records(records)
 
     wb = openpyxl.Workbook()
     
@@ -947,37 +1160,72 @@ def export_matched_to_excel(
     cell_a3.fill = fill_neutral_gray
     cell_a3.border = thin_border
 
-    # 2024 EARF covers Prov to Number of Buildings (Cols B to I)
-    ws1.merge_cells("B3:I3")
-    ws1["B3"] = "2024 EARF"
-    ws1["B3"].font = font_group_header
-    ws1["B3"].alignment = center_align
+    if is_pcd:
+        # PCD: 2024 EARF covers Old Geocode to Name (Cols B to H, cols 2 to 8)
+        ws1.merge_cells("B3:H3")
+        ws1["B3"] = "2024 EARF"
+        ws1["B3"].font = font_group_header
+        ws1["B3"].alignment = center_align
 
-    # 2026 Preliminary EA covers Prelim EA Code to Remarks (Cols J to P)
-    ws1.merge_cells("J3:P3")
-    ws1["J3"] = "2026 Preliminary EA"
-    ws1["J3"].font = font_group_header
-    ws1["J3"].alignment = center_align
+        for c in range(2, 9):
+            cell = ws1.cell(row=3, column=c)
+            cell.fill = fill_green_grp
+            cell.border = thin_border
 
-    for c in range(2, 10):
-        cell = ws1.cell(row=3, column=c)
-        cell.fill = fill_green_grp
-        cell.border = thin_border
-    for c in range(10, 17):
-        cell = ws1.cell(row=3, column=c)
-        cell.fill = fill_blue_grp
-        cell.border = thin_border
+        # PCD: 2026 Preliminary EA covers Final EA Code to Remarks (Cols I to J, cols 9 to 10)
+        ws1.merge_cells("I3:J3")
+        ws1["I3"] = "2026 Preliminary EA"
+        ws1["I3"].font = font_group_header
+        ws1["I3"].alignment = center_align
 
-    # Row 4: Column Headers (16 Columns with Geocode as Column 1)
-    col_names = [
-        "Geocode",
-        "Prov", "Mun", "Brgy", "EA", "Number of\nEAs",
-        "Province, City, Municipality,\nBarangay, and EA",
-        "Number of\nHouseholds", "Number of\nBuildings",
-        "Prelim Enumeration\nArea Code", "Final Enumeration\nArea Code",
-        "Household\nCount", "Building\nCount", "EA Type",
-        "Source\nYear", "Remarks"
-    ]
+        for c in range(9, 11):
+            cell = ws1.cell(row=3, column=c)
+            cell.fill = fill_blue_grp
+            cell.border = thin_border
+    else:
+        # 2024 EARF covers Prov to Number of Buildings (Cols B to I)
+        ws1.merge_cells("B3:I3")
+        ws1["B3"] = "2024 EARF"
+        ws1["B3"].font = font_group_header
+        ws1["B3"].alignment = center_align
+
+        for c in range(2, 10):
+            cell = ws1.cell(row=3, column=c)
+            cell.fill = fill_green_grp
+            cell.border = thin_border
+
+        # 2026 Preliminary EA covers Prelim EA Code to Remarks (Cols J to P, cols 10 to 16)
+        ws1.merge_cells("J3:P3")
+        ws1["J3"] = "2026 Preliminary EA"
+        ws1["J3"].font = font_group_header
+        ws1["J3"].alignment = center_align
+
+        for c in range(10, 17):
+            cell = ws1.cell(row=3, column=c)
+            cell.fill = fill_blue_grp
+            cell.border = thin_border
+
+    # Row 4: Column Headers (16 Columns for Final EARF, 10 Columns for PCD)
+    if is_pcd:
+        # Removed columns H (HH Count), I (Bldg Count), J (Prelim EA), L (HH Count), M (Bldg Count), N (EA Type), O (Source Year)
+        # Added Old Geocode at left side of Prov column
+        col_names = [
+            "Geocode",
+            "Old Geocode",
+            "Prov", "Mun", "Brgy", "EA", "Number of\nEAs",
+            "Province, City, Municipality,\nBarangay, and EA",
+            "Final Enumeration\nArea Code", "Remarks"
+        ]
+    else:
+        col_names = [
+            "Geocode",
+            "Prov", "Mun", "Brgy", "EA", "Number of\nEAs",
+            "Province, City, Municipality,\nBarangay, and EA",
+            "Number of\nHouseholds", "Number of\nBuildings",
+            "Prelim Enumeration\nArea Code", "Final Enumeration\nArea Code",
+            "Household\nCount", "Building\nCount", "EA Type",
+            "Source\nYear", "Remarks"
+        ]
 
     for idx, name in enumerate(col_names, start=1):
         cell = ws1.cell(row=4, column=idx, value=name)
@@ -985,20 +1233,29 @@ def export_matched_to_excel(
         cell.alignment = wrap_center_align
         if idx == 1:
             cell.fill = fill_neutral_gray
-        elif idx <= 9:
+        elif (is_pcd and idx <= 8) or (not is_pcd and idx <= 9):
             cell.fill = fill_green_grp
         else:
             cell.fill = fill_blue_grp
         cell.border = thin_border
 
-    # Row 5: Column Numbers ((1) to (14))
-    col_nums = [
-        "(1)",
-        "(2)", "(3)", "(4)", "(5)", "(6)",
-        "(7)", "(8)", "(9)",
-        "(10)", "",
-        "(11)", "(12)", "(13)", "(14)", ""
-    ]
+    # Row 5: Column Numbers
+    if is_pcd:
+        col_nums = [
+            "(1)",
+            "",
+            "(2)", "(3)", "(4)", "(5)", "(6)",
+            "(7)",
+            "(8)", ""
+        ]
+    else:
+        col_nums = [
+            "(1)",
+            "(2)", "(3)", "(4)", "(5)", "(6)",
+            "(7)", "(8)", "(9)",
+            "(10)", "",
+            "(11)", "(12)", "(13)", "(14)", ""
+        ]
 
     for idx, num in enumerate(col_nums, start=1):
         cell = ws1.cell(row=5, column=idx, value=num)
@@ -1006,7 +1263,7 @@ def export_matched_to_excel(
         cell.alignment = center_align
         if idx == 1:
             cell.fill = fill_neutral_gray
-        elif idx <= 9:
+        elif (is_pcd and idx <= 8) or (not is_pcd and idx <= 9):
             cell.fill = fill_green_grp
         else:
             cell.fill = fill_blue_grp
@@ -1112,29 +1369,47 @@ def export_matched_to_excel(
 
     # 1. Province Header Row (Row 6)
     prov_gc = f"{resolved_prov_code}00000000000"
-    prov_row_vals = [
-        prov_gc, resolved_prov_code, "00", "000", "000000", tot_eas,
-        resolved_prov_name, tot_hh, tot_bldg,
-        "", "", "", "", "", "", ""
-    ]
+    if is_pcd:
+        prov_row_vals = [
+            prov_gc, prov_gc, resolved_prov_code, "00", "000", "000000", tot_eas,
+            resolved_prov_name,
+            "", ""
+        ]
+    else:
+        prov_row_vals = [
+            prov_gc, resolved_prov_code, "00", "000", "000000", tot_eas,
+            resolved_prov_name, tot_hh, tot_bldg,
+            "", "", "", "", "", "", ""
+        ]
     for c_idx, val in enumerate(prov_row_vals, start=1):
         cell = ws1.cell(row=current_row, column=c_idx, value=val)
         cell.font = font_bold
         cell.fill = fill_neutral_gray if c_idx == 1 else fill_green_grp
         cell.border = thin_border
-        if c_idx in (1, 2, 3, 4, 5):
-            cell.alignment = center_align
-            cell.number_format = "@"
-        elif c_idx == 6:
-            cell.alignment = right_align
-            if isinstance(val, int):
-                cell.number_format = "#,##0"
-        elif c_idx == 7:
-            cell.alignment = left_align
-        elif c_idx in (8, 9):
-            cell.alignment = right_align
-            if isinstance(val, int):
-                cell.number_format = "#,##0"
+        if is_pcd:
+            if c_idx in (1, 2, 3, 4, 5, 6):
+                cell.alignment = center_align
+                cell.number_format = "@"
+            elif c_idx == 7:
+                cell.alignment = right_align
+                if isinstance(val, int):
+                    cell.number_format = "#,##0"
+            elif c_idx == 8:
+                cell.alignment = left_align
+        else:
+            if c_idx in (1, 2, 3, 4, 5):
+                cell.alignment = center_align
+                cell.number_format = "@"
+            elif c_idx == 6:
+                cell.alignment = right_align
+                if isinstance(val, int):
+                    cell.number_format = "#,##0"
+            elif c_idx == 7:
+                cell.alignment = left_align
+            elif c_idx in (8, 9):
+                cell.alignment = right_align
+                if isinstance(val, int):
+                    cell.number_format = "#,##0"
     ws1.row_dimensions[current_row].height = 20
     current_row += 1
 
@@ -1143,20 +1418,34 @@ def export_matched_to_excel(
         # Municipality Header Row
         m_name_disp = resolved_mun_name
         mun_gc = f"{p_c}{m_c}000000000"
-        mun_row_vals = [
-            mun_gc, p_c, m_c, "000", "000000", "",
-            m_name_disp, "", "",
-            "", "", "", "", "", "", ""
-        ]
+        if is_pcd:
+            mun_row_vals = [
+                mun_gc, mun_gc, p_c, m_c, "000", "000000", "",
+                m_name_disp,
+                "", ""
+            ]
+        else:
+            mun_row_vals = [
+                mun_gc, p_c, m_c, "000", "000000", "",
+                m_name_disp, "", "",
+                "", "", "", "", "", "", ""
+            ]
         for c_idx, val in enumerate(mun_row_vals, start=1):
             cell = ws1.cell(row=current_row, column=c_idx, value=val)
             cell.font = font_bold
             cell.border = thin_border
-            if c_idx in (1, 2, 3, 4, 5):
-                cell.alignment = center_align
-                cell.number_format = "@"
-            elif c_idx == 7:
-                cell.alignment = left_align
+            if is_pcd:
+                if c_idx in (1, 2, 3, 4, 5, 6):
+                    cell.alignment = center_align
+                    cell.number_format = "@"
+                elif c_idx == 8:
+                    cell.alignment = left_align
+            else:
+                if c_idx in (1, 2, 3, 4, 5):
+                    cell.alignment = center_align
+                    cell.number_format = "@"
+                elif c_idx == 7:
+                    cell.alignment = left_align
         ws1.row_dimensions[current_row].height = 20
         current_row += 1
 
@@ -1169,20 +1458,34 @@ def export_matched_to_excel(
 
             # Barangay Header Row
             brgy_gc = f"{p_c}{m_c}{b_code}000000"
-            brgy_row_vals = [
-                brgy_gc, p_c, m_c, b_code, "000000", "",
-                b_name, "", "",
-                "", "", "", "", "", "", ""
-            ]
+            if is_pcd:
+                brgy_row_vals = [
+                    brgy_gc, brgy_gc, p_c, m_c, b_code, "000000", "",
+                    b_name,
+                    "", ""
+                ]
+            else:
+                brgy_row_vals = [
+                    brgy_gc, p_c, m_c, b_code, "000000", "",
+                    b_name, "", "",
+                    "", "", "", "", "", "", ""
+                ]
             for c_idx, val in enumerate(brgy_row_vals, start=1):
                 cell = ws1.cell(row=current_row, column=c_idx, value=val)
                 cell.font = font_bold
                 cell.border = thin_border
-                if c_idx in (1, 2, 3, 4, 5):
-                    cell.alignment = center_align
-                    cell.number_format = "@"
-                elif c_idx == 7:
-                    cell.alignment = left_align
+                if is_pcd:
+                    if c_idx in (1, 2, 3, 4, 5, 6):
+                        cell.alignment = center_align
+                        cell.number_format = "@"
+                    elif c_idx == 8:
+                        cell.alignment = left_align
+                else:
+                    if c_idx in (1, 2, 3, 4, 5):
+                        cell.alignment = center_align
+                        cell.number_format = "@"
+                    elif c_idx == 7:
+                        cell.alignment = left_align
             ws1.row_dimensions[current_row].height = 20
             current_row += 1
 
@@ -1202,7 +1505,7 @@ def export_matched_to_excel(
                 if not final_ea:
                     final_ea = prelim_ea or ean_raw
 
-                # Exact ea_geocode matching the exported GPKG (bgy_geocode + final_ea / gpkg_ean)
+                # Exact ea_geocode matching the exported GPKG (bgy_gc + final_ea / gpkg_ean)
                 bgy_gc = f"{p_c.zfill(3)}{m_c.zfill(2)}{b_code.zfill(3)}"
                 gpkg_ean = final_ea or prelim_ea or ean_raw
                 ea_gc = str(r.get("ea_geocode") or "").strip()
@@ -1224,21 +1527,47 @@ def export_matched_to_excel(
                     ea_t = "RETAINED"
 
                 src_y = str(r.get("source_year") or ("2024" if ea_t == "RETAINED" else "2026")).strip()
-                rem_str = str(r.get("remarks") or r.get("earf_remarks") or "").strip()
+                rem_str = "" if is_pcd else str(r.get("remarks") or r.get("earf_remarks") or "").strip()
 
                 is_merged = (ea_t == "MERGED")
+                is_absorbed = (id(r) in absorbed_set)
 
-                effective_name_ean = final_ea or prelim_ea or ean_raw
-                ea_row_vals = [
-                    ea_gc, p_c, m_c, b_code, ean_raw, 1,
-                    f"EA {effective_name_ean}",
-                    int(p_hh_val) if str(p_hh_val).isdigit() else p_hh_val,
-                    int(p_bldg_val) if str(p_bldg_val).isdigit() else p_bldg_val,
-                    prelim_ea, final_ea,
-                    int(e_hh_val) if str(e_hh_val).isdigit() else e_hh_val,
-                    int(e_bldg_val) if str(e_bldg_val).isdigit() else e_bldg_val,
-                    ea_t, src_y, rem_str
-                ]
+                if is_pcd:
+                    if is_absorbed:
+                        continue
+                    effective_name_ean = final_ea or prelim_ea or ean_raw
+                    old_ea_gc = f"{p_c.zfill(3)}{m_c.zfill(2)}{b_code.zfill(3)}{ean_raw.zfill(6)}"
+                    # PCD: Columns H (HH Count), I (Bldg Count), J (Prelim EA), L (HH Count), M (Bldg Count), N (EA Type), O (Source Year) removed.
+                    # Column Remarks has values cleared. Added Old Geocode at left side of Prov column.
+                    ea_row_vals = [
+                        ea_gc, old_ea_gc, p_c, m_c, b_code, ean_raw, 1,
+                        f"EA {effective_name_ean}",
+                        final_ea,
+                        ""
+                    ]
+                elif is_absorbed:
+                    # Absorbed EA in Final EARF: columns J, K, L, and M have NO values
+                    effective_name_ean = ean_raw
+                    ea_row_vals = [
+                        ea_gc, p_c, m_c, b_code, ean_raw, 1,
+                        f"EA {effective_name_ean}",
+                        int(p_hh_val) if str(p_hh_val).isdigit() else p_hh_val,
+                        int(p_bldg_val) if str(p_bldg_val).isdigit() else p_bldg_val,
+                        "", "", "", "",  # J (prelim_ea), K (final_ea), L (household_count), M (building_count) are empty
+                        ea_t, src_y, rem_str
+                    ]
+                else:
+                    effective_name_ean = final_ea or prelim_ea or ean_raw
+                    ea_row_vals = [
+                        ea_gc, p_c, m_c, b_code, ean_raw, 1,
+                        f"EA {effective_name_ean}",
+                        int(p_hh_val) if str(p_hh_val).isdigit() else p_hh_val,
+                        int(p_bldg_val) if str(p_bldg_val).isdigit() else p_bldg_val,
+                        prelim_ea, final_ea,
+                        int(e_hh_val) if str(e_hh_val).isdigit() else e_hh_val,
+                        int(e_bldg_val) if str(e_bldg_val).isdigit() else e_bldg_val,
+                        ea_t, src_y, rem_str
+                    ]
 
                 for c_idx, val in enumerate(ea_row_vals, start=1):
                     cell = ws1.cell(row=current_row, column=c_idx, value=val)
@@ -1246,33 +1575,57 @@ def export_matched_to_excel(
                     if is_merged:
                         cell.fill = fill_peach_merged
 
-                    if c_idx == 11:  # Final EA Code (from recoded_ean)
-                        cell.font = font_final_ea
-                        cell.alignment = center_align
-                        cell.number_format = "@"
-                    elif c_idx in (1, 2, 3, 4, 5, 10, 14, 15):
-                        cell.font = font_data
-                        cell.alignment = center_align
-                        if c_idx in (1, 2, 3, 4, 5, 10):
+                    if is_pcd:
+                        if c_idx == 9:  # Final EA Code (from recoded_ean)
+                            cell.font = font_final_ea
+                            cell.alignment = center_align
                             cell.number_format = "@"
-                    elif c_idx in (6, 8, 9, 12, 13):
-                        cell.font = font_data
-                        cell.alignment = right_align
-                        if isinstance(val, int):
-                            cell.number_format = "#,##0"
+                        elif c_idx in (1, 2, 3, 4, 5, 6):  # Geocode, Old Geocode, Prov, Mun, Brgy, EA
+                            cell.font = font_data
+                            cell.alignment = center_align
+                            cell.number_format = "@"
+                        elif c_idx == 7:  # Number of EAs
+                            cell.font = font_data
+                            cell.alignment = right_align
+                            if isinstance(val, int):
+                                cell.number_format = "#,##0"
+                        else:  # c_idx 8 (Name) and c_idx 10 (Remarks)
+                            cell.font = font_data
+                            cell.alignment = left_align
                     else:
-                        cell.font = font_data
-                        cell.alignment = left_align
+                        if c_idx == 11:  # Final EA Code (from recoded_ean)
+                            cell.font = font_final_ea if val else font_data
+                            cell.alignment = center_align
+                            cell.number_format = "@"
+                        elif c_idx in (1, 2, 3, 4, 5, 10, 14, 15):
+                            cell.font = font_data
+                            cell.alignment = center_align
+                            if c_idx in (1, 2, 3, 4, 5, 10):
+                                cell.number_format = "@"
+                        elif c_idx in (6, 8, 9, 12, 13):
+                            cell.font = font_data
+                            cell.alignment = right_align
+                            if isinstance(val, int):
+                                cell.number_format = "#,##0"
+                        else:
+                            cell.font = font_data
+                            cell.alignment = left_align
 
                 ws1.row_dimensions[current_row].height = 20
                 current_row += 1
 
-    # Format Column Widths for Sheet 1 (16 Columns: A to P)
-    col_w_map = {
-        "A": 18, "B": 8, "C": 8, "D": 8, "E": 10,
-        "F": 14, "G": 36, "H": 14, "I": 14, "J": 16,
-        "K": 16, "L": 14, "M": 14, "N": 14, "O": 12, "P": 30
-    }
+    # Format Column Widths for Sheet 1
+    if is_pcd:
+        col_w_map = {
+            "A": 18, "B": 18, "C": 8, "D": 8, "E": 8,
+            "F": 10, "G": 14, "H": 36, "I": 16, "J": 30
+        }
+    else:
+        col_w_map = {
+            "A": 18, "B": 8, "C": 8, "D": 8, "E": 10,
+            "F": 14, "G": 36, "H": 14, "I": 14, "J": 16,
+            "K": 16, "L": 14, "M": 14, "N": 14, "O": 12, "P": 30
+        }
     for col_letter, width in col_w_map.items():
         ws1.column_dimensions[col_letter].width = width
 
@@ -1280,128 +1633,129 @@ def export_matched_to_excel(
     ws1.views.sheetView[0].showGridLines = True
 
     # ----------------------------------------------------
-    # SHEET 2: Full 22-Column Reconciliation Log
+    # SHEET 2: Full 22-Column Reconciliation Log (Omitted for PCD)
     # ----------------------------------------------------
-    ws2 = wb.create_sheet(title="Reconciliation Log")
+    if not is_pcd:
+        ws2 = wb.create_sheet(title="Reconciliation Log")
 
-    fill_popcen_s2 = PatternFill(start_color="FDE8E8", end_color="FDE8E8", fill_type="solid")
-    fill_prelim_s2 = PatternFill(start_color="DEF7EC", end_color="DEF7EC", fill_type="solid")
-    fill_final_s2 = PatternFill(start_color="E1EFFE", end_color="E1EFFE", fill_type="solid")
-    fill_rec_cell_s2 = PatternFill(start_color="EFF6FF", end_color="EFF6FF", fill_type="solid")
-    font_rec_s2 = Font(name="Calibri", size=10, bold=True, color="1E40AF")
+        fill_popcen_s2 = PatternFill(start_color="FDE8E8", end_color="FDE8E8", fill_type="solid")
+        fill_prelim_s2 = PatternFill(start_color="DEF7EC", end_color="DEF7EC", fill_type="solid")
+        fill_final_s2 = PatternFill(start_color="E1EFFE", end_color="E1EFFE", fill_type="solid")
+        fill_rec_cell_s2 = PatternFill(start_color="EFF6FF", end_color="EFF6FF", fill_type="solid")
+        font_rec_s2 = Font(name="Calibri", size=10, bold=True, color="1E40AF")
 
-    ws2.merge_cells("A1:O1")
-    ws2["A1"] = "2024 POPCEN-CBMS Worksheet"
-    ws2["A1"].font = font_group_header
-    ws2["A1"].alignment = center_align
+        ws2.merge_cells("A1:O1")
+        ws2["A1"] = "2024 POPCEN-CBMS Worksheet"
+        ws2["A1"].font = font_group_header
+        ws2["A1"].alignment = center_align
 
-    ws2.merge_cells("P1:V1")
-    ws2["P1"] = "2026 EARF Worksheet"
-    ws2["P1"].font = font_group_header
-    ws2["P1"].alignment = center_align
+        ws2.merge_cells("P1:V1")
+        ws2["P1"] = "2026 EARF Worksheet"
+        ws2["P1"].font = font_group_header
+        ws2["P1"].alignment = center_align
 
-    for col in range(1, 16):
-        c = ws2.cell(row=1, column=col)
-        c.fill = fill_popcen_s2
-        c.border = thin_border
-    for col in range(16, 23):
-        c = ws2.cell(row=1, column=col)
-        c.fill = fill_prelim_s2 if col <= 21 else fill_final_s2
-        c.border = thin_border
+        for col in range(1, 16):
+            c = ws2.cell(row=1, column=col)
+            c.fill = fill_popcen_s2
+            c.border = thin_border
+        for col in range(16, 23):
+            c = ws2.cell(row=1, column=col)
+            c.fill = fill_prelim_s2 if col <= 21 else fill_final_s2
+            c.border = thin_border
 
-    headers_s2 = [
-        "Geocode", "Geographic Name", "Geographic Level", "region_code", "province_code",
-        "city_mun_code", "barangay_code", "ean", "No. of EAs", "Areaname",
-        "Household Population", "No. of Households", "EA Subject for Delineation", "EA Subject for Merging", "Remarks",
-        "New Enumeration Area Code", "Household Count", "Building Count", "EA Type", "Source Year", "Remarks",
-        "Recoded Enumeration Area"
-    ]
+        headers_s2 = [
+            "Geocode", "Geographic Name", "Geographic Level", "region_code", "province_code",
+            "city_mun_code", "barangay_code", "ean", "No. of EAs", "Areaname",
+            "Household Population", "No. of Households", "EA Subject for Delineation", "EA Subject for Merging", "Remarks",
+            "New Enumeration Area Code", "Household Count", "Building Count", "EA Type", "Source Year", "Remarks",
+            "Recoded Enumeration Area"
+        ]
 
-    for col_idx, h_text in enumerate(headers_s2, start=1):
-        cell = ws2.cell(row=2, column=col_idx, value=h_text)
-        cell.font = font_col_header
-        cell.alignment = wrap_center_align
-        cell.fill = fill_popcen_s2 if col_idx <= 15 else (fill_prelim_s2 if col_idx <= 21 else fill_final_s2)
-        cell.border = thin_border
-
-    field_keys_s2 = [
-        "geocode", "geographic_name", "geographic_level", "region_code", "province_code",
-        "city_mun_code", "barangay_code", "ean", "no_of_eas", "areaname",
-        "household_population", "no_of_households", "ea_subject_for_delineation", "ea_subject_for_merging", "popcen_remarks",
-        "new_enumeration_area_code", "household_count", "building_count", "ea_type", "source_year", "earf_remarks",
-        "recoded_ean"
-    ]
-
-    for row_idx, r in enumerate(records, start=3):
-        is_pop = r.get("in_popcen") in (1, "1", True) and bool(r.get("geographic_name"))
-        for col_idx, k in enumerate(field_keys_s2, start=1):
-            if not is_pop and k in (
-                "geographic_name", "geographic_level", "region_code", "province_code",
-                "city_mun_code", "barangay_code", "ean", "no_of_eas", "areaname",
-                "household_population", "no_of_households", "ea_subject_for_delineation",
-                "ea_subject_for_merging", "popcen_remarks"
-            ):
-                val = ""
-            else:
-                val = r.get(k, "")
-                if (val is None or val == "") and k == "new_enumeration_area_code":
-                    val = r.get("new_ean", "")
-                elif (val is None or val == "") and k == "household_count":
-                    val = r.get("earf_household_count") or r.get("earf_households", "")
-                elif (val is None or val == "") and k == "building_count":
-                    val = r.get("earf_building_count", "")
-                elif (val is None or val == "") and k == "earf_remarks":
-                    val = r.get("remarks", "")
-                elif (val is None or val == "") and k == "popcen_remarks" and is_pop:
-                    val = r.get("remarks", "")
-                elif (val is None or val == "") and k == "no_of_households" and is_pop:
-                    val = r.get("popcen_households", "")
-                elif (val is None or val == "") and k == "ea_subject_for_delineation" and is_pop:
-                    val = r.get("popcen_delineation", "")
-                elif (val is None or val == "") and k == "ea_subject_for_merging" and is_pop:
-                    val = r.get("popcen_merging", "")
-
-            cell_val = str(val).strip() if val is not None else ""
-            if cell_val.endswith(".0"):
-                cell_val = cell_val[:-2]
-
-            cell = ws2.cell(row=row_idx, column=col_idx)
+        for col_idx, h_text in enumerate(headers_s2, start=1):
+            cell = ws2.cell(row=2, column=col_idx, value=h_text)
+            cell.font = font_col_header
+            cell.alignment = wrap_center_align
+            cell.fill = fill_popcen_s2 if col_idx <= 15 else (fill_prelim_s2 if col_idx <= 21 else fill_final_s2)
             cell.border = thin_border
 
-            if k == "recoded_ean":
-                cell.value = cell_val
-                cell.font = font_rec_s2
-                cell.fill = fill_rec_cell_s2
-                cell.alignment = center_align
-            elif k in ("geocode", "region_code", "province_code", "city_mun_code", "barangay_code", "ean", "new_enumeration_area_code", "source_year"):
-                cell.value = cell_val
-                cell.font = font_data
-                cell.alignment = center_align
-            elif k in ("no_of_eas", "household_population", "no_of_households", "household_count", "building_count"):
-                if cell_val.isdigit():
-                    cell.value = int(cell_val)
-                    cell.number_format = "#,##0"
+        field_keys_s2 = [
+            "geocode", "geographic_name", "geographic_level", "region_code", "province_code",
+            "city_mun_code", "barangay_code", "ean", "no_of_eas", "areaname",
+            "household_population", "no_of_households", "ea_subject_for_delineation", "ea_subject_for_merging", "popcen_remarks",
+            "new_enumeration_area_code", "household_count", "building_count", "ea_type", "source_year", "earf_remarks",
+            "recoded_ean"
+        ]
+
+        for row_idx, r in enumerate(records, start=3):
+            is_pop = r.get("in_popcen") in (1, "1", True) and bool(r.get("geographic_name"))
+            for col_idx, k in enumerate(field_keys_s2, start=1):
+                if not is_pop and k in (
+                    "geographic_name", "geographic_level", "region_code", "province_code",
+                    "city_mun_code", "barangay_code", "ean", "no_of_eas", "areaname",
+                    "household_population", "no_of_households", "ea_subject_for_delineation",
+                    "ea_subject_for_merging", "popcen_remarks"
+                ):
+                    val = ""
+                else:
+                    val = r.get(k, "")
+                    if (val is None or val == "") and k == "new_enumeration_area_code":
+                        val = r.get("new_ean", "")
+                    elif (val is None or val == "") and k == "household_count":
+                        val = r.get("earf_household_count") or r.get("earf_households", "")
+                    elif (val is None or val == "") and k == "building_count":
+                        val = r.get("earf_building_count", "")
+                    elif (val is None or val == "") and k == "earf_remarks":
+                        val = r.get("remarks", "")
+                    elif (val is None or val == "") and k == "popcen_remarks" and is_pop:
+                        val = r.get("remarks", "")
+                    elif (val is None or val == "") and k == "no_of_households" and is_pop:
+                        val = r.get("popcen_households", "")
+                    elif (val is None or val == "") and k == "ea_subject_for_delineation" and is_pop:
+                        val = r.get("popcen_delineation", "")
+                    elif (val is None or val == "") and k == "ea_subject_for_merging" and is_pop:
+                        val = r.get("popcen_merging", "")
+
+                cell_val = str(val).strip() if val is not None else ""
+                if cell_val.endswith(".0"):
+                    cell_val = cell_val[:-2]
+
+                cell = ws2.cell(row=row_idx, column=col_idx)
+                cell.border = thin_border
+
+                if k == "recoded_ean":
+                    cell.value = cell_val
+                    cell.font = font_rec_s2
+                    cell.fill = fill_rec_cell_s2
+                    cell.alignment = center_align
+                elif k in ("geocode", "region_code", "province_code", "city_mun_code", "barangay_code", "ean", "new_enumeration_area_code", "source_year"):
+                    cell.value = cell_val
+                    cell.font = font_data
+                    cell.alignment = center_align
+                elif k in ("no_of_eas", "household_population", "no_of_households", "household_count", "building_count"):
+                    if cell_val.isdigit():
+                        cell.value = int(cell_val)
+                        cell.number_format = "#,##0"
+                    else:
+                        cell.value = cell_val
+                    cell.font = font_data
+                    cell.alignment = right_align
                 else:
                     cell.value = cell_val
-                cell.font = font_data
-                cell.alignment = right_align
-            else:
-                cell.value = cell_val
-                cell.font = font_data
-                cell.alignment = left_align
+                    cell.font = font_data
+                    cell.alignment = left_align
 
-        ws2.row_dimensions[row_idx].height = 20
+            ws2.row_dimensions[row_idx].height = 20
 
-    for col in ws2.columns:
-        col_letter = get_column_letter(col[0].column)
-        lengths = [len(str(cell.value or '')) for cell in col[1:]]
-        max_len = max(lengths) if lengths else 10
-        ws2.column_dimensions[col_letter].width = max(max_len + 3, 12)
+        for col in ws2.columns:
+            col_letter = get_column_letter(col[0].column)
+            lengths = [len(str(cell.value or '')) for cell in col[1:]]
+            max_len = max(lengths) if lengths else 10
+            ws2.column_dimensions[col_letter].width = max(max_len + 3, 12)
 
-    ws2.row_dimensions[1].height = 24
-    ws2.row_dimensions[2].height = 28
-    ws2.freeze_panes = "B3"
-    ws2.views.sheetView[0].showGridLines = True
+        ws2.row_dimensions[1].height = 24
+        ws2.row_dimensions[2].height = 28
+        ws2.freeze_panes = "B3"
+        ws2.views.sheetView[0].showGridLines = True
 
     # Make Sheet 1 the default active sheet
     wb.active = ws1
@@ -2630,6 +2984,13 @@ class POPCENDatabase:
                 mis_earf_size_str TEXT DEFAULT '',
                 mis_earf_mtime REAL DEFAULT 0,
                 mis_earf_mtime_str TEXT DEFAULT '',
+                pcd_earf_exists INTEGER DEFAULT 0,
+                pcd_earf_filename TEXT DEFAULT '',
+                pcd_earf_path TEXT DEFAULT '',
+                pcd_earf_size INTEGER DEFAULT 0,
+                pcd_earf_size_str TEXT DEFAULT '',
+                pcd_earf_mtime REAL DEFAULT 0,
+                pcd_earf_mtime_str TEXT DEFAULT '',
                 subfolder_path TEXT DEFAULT '',
                 subfolder_exists INTEGER DEFAULT 0,
                 last_modified REAL DEFAULT 0,
@@ -2637,6 +2998,18 @@ class POPCENDatabase:
                 last_scanned TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """)
+
+            cur.execute("PRAGMA table_info(dashboard_monitoring_records);")
+            dmr_cols = {row[1] for row in cur.fetchall()}
+            if "pcd_earf_exists" not in dmr_cols:
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_exists INTEGER DEFAULT 0;")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_filename TEXT DEFAULT '';")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_path TEXT DEFAULT '';")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_size INTEGER DEFAULT 0;")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_size_str TEXT DEFAULT '';")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_mtime REAL DEFAULT 0;")
+                cur.execute("ALTER TABLE dashboard_monitoring_records ADD COLUMN pcd_earf_mtime_str TEXT DEFAULT '';")
+
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dash_reg ON dashboard_monitoring_records(region);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dash_prv ON dashboard_monitoring_records(province);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dash_stat ON dashboard_monitoring_records(status);")
@@ -2676,6 +3049,7 @@ class POPCENDatabase:
             CREATE TABLE IF NOT EXISTS earf_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 geocode TEXT,
+                new_geocode TEXT,
                 prov TEXT,
                 mun TEXT,
                 brgy TEXT,
@@ -2698,7 +3072,22 @@ class POPCENDatabase:
             )
             """)
 
+            cur.execute("PRAGMA table_info(earf_records);")
+            existing_cols = {row[1] for row in cur.fetchall()}
+            if "new_geocode" not in existing_cols:
+                cur.execute("ALTER TABLE earf_records ADD COLUMN new_geocode TEXT;")
+                cur.execute("""
+                UPDATE earf_records
+                SET new_geocode = CASE
+                    WHEN new_enumeration_area_code IS NOT NULL AND TRIM(new_enumeration_area_code) != '' AND LOWER(TRIM(new_enumeration_area_code)) NOT IN ('nan', 'none', 'null', '-')
+                    THEN printf('%03d%02d%03d%06d', CAST(prov AS INT), CAST(mun AS INT), CAST(brgy AS INT), CAST(new_enumeration_area_code AS INT))
+                    ELSE ''
+                END
+                """)
+                conn.commit()
+
             cur.execute("CREATE INDEX IF NOT EXISTS idx_earf_gc ON earf_records(geocode);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_earf_new_gc ON earf_records(new_geocode);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_earf_prov ON earf_records(prov);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_earf_mun ON earf_records(prov, mun);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_earf_brgy ON earf_records(prov, mun, brgy);")
@@ -3046,6 +3435,75 @@ class POPCENDatabase:
                 from dialog import load_popcen_data
         df = load_popcen_data(file_path, sheet_name=sheet_name)
         return self.import_dataframe(df, replace=replace, progress_callback=progress_callback)
+
+    def import_popcen_from_files(
+        self, file_list: List[str], sheet_name=0, replace: bool = True, progress_callback=None
+    ) -> Tuple[int, int]:
+        """
+        Parses multiple 2024 POPCEN Excel/CSV files and bulk-inserts them into popcen_records.
+        Returns (total_imported_records, files_count).
+        """
+        raw_valid = [f for f in file_list if f and os.path.exists(f)]
+        if not raw_valid:
+            return 0, 0
+
+        valid_files = [
+            f for f in raw_valid
+            if f.lower().endswith(('.xlsx', '.xls', '.csv')) and not os.path.basename(f).startswith('~$')
+        ]
+        if not valid_files:
+            return 0, 0
+
+        total_files = len(valid_files)
+        total_records = 0
+        successful_files = 0
+
+        try:
+            from ..ui.dialog import load_popcen_data
+        except (ImportError, ValueError):
+            try:
+                from ui.dialog import load_popcen_data
+            except (ImportError, ValueError):
+                from dialog import load_popcen_data
+
+        if replace:
+            with self._get_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM popcen_records")
+                conn.commit()
+
+        for f_idx, fpath in enumerate(valid_files):
+            fname = os.path.basename(fpath)
+            if progress_callback:
+                pct = int((f_idx / total_files) * 85)
+                if progress_callback(pct, f"Parsing POPCEN ({f_idx + 1}/{total_files}): {fname}...") is False:
+                    break
+
+            try:
+                df = load_popcen_data(fpath, sheet_name=sheet_name)
+                if df.empty:
+                    continue
+                cnt = self.import_dataframe(df, replace=False)
+                total_records += cnt
+                successful_files += 1
+            except Exception:
+                continue
+
+        if progress_callback:
+            progress_callback(100, f"Completed consolidating {total_records:,} records from {successful_files:,} POPCEN file(s).")
+
+        return total_records, successful_files
+
+    def import_popcen_from_folder(
+        self, folder_path: str, recursive: bool = False, sheet_name=0, replace: bool = True, progress_callback=None
+    ) -> Tuple[int, int]:
+        """
+        Scans folder_path for all 2024 POPCEN Excel/CSV files and imports them into popcen_records.
+        """
+        if not folder_path or not os.path.exists(folder_path):
+            return 0, 0
+        files = find_popcen_files_in_folder(folder_path, recursive=recursive)
+        return self.import_popcen_from_files(files, sheet_name=sheet_name, replace=replace, progress_callback=progress_callback)
 
     def _build_popcen_where_clause(
         self,
@@ -3417,8 +3875,30 @@ class POPCENDatabase:
                     if not gc and (prov or mun or brgy or ea):
                         gc = build_geocode(row.to_dict(), GPKG_EARF_FIELDS)
 
+                    ne_code = _get_val(["new enumeration area code (2026)", "new enumeration area code", "new ea code (2026)", "new ea code", "new_ean", "new_ea_code", "code"])
+                    ne_str = str(ne_code or "").strip().replace(".0", "")
+                    if ne_str.lower() in ("nan", "none", "null", "-", ""):
+                        ne_str = ""
+                    new_gc = ""
+                    if ne_str:
+                        if ne_str.isdigit() and len(ne_str) < 6:
+                            ne_str = ne_str.zfill(6)
+                        p_s = str(prov or "").strip()
+                        m_s = str(mun or "").strip()
+                        b_s = str(brgy or "").strip()
+                        if not (p_s and m_s and b_s) and gc and len(gc) >= 8:
+                            if not p_s: p_s = gc[:3]
+                            if not m_s: m_s = gc[3:5]
+                            if not b_s: b_s = gc[5:8]
+                        if p_s and m_s and b_s:
+                            p_s = p_s.zfill(3) if p_s.isdigit() else p_s
+                            m_s = m_s.zfill(2) if m_s.isdigit() else m_s
+                            b_s = b_s.zfill(3) if b_s.isdigit() else b_s
+                            new_gc = f"{p_s}{m_s}{b_s}{ne_str}"
+
                     rec = {
                         "geocode": gc,
+                        "new_geocode": new_gc,
                         "prov": prov,
                         "mun": mun,
                         "brgy": brgy,
@@ -3432,7 +3912,7 @@ class POPCENDatabase:
                         ]),
                         "number_of_households": _get_val(["number of households", "number_of_households", "2024 estimated"]),
                         "number_of_buildings": _get_val(["number of buildings", "number_of_buildings"]),
-                        "new_enumeration_area_code": _get_val(["new enumeration area code (2026)", "new enumeration area code", "new ea code (2026)", "new ea code", "new_ean", "new_ea_code", "code"]),
+                        "new_enumeration_area_code": ne_str,
                         "household_count": _get_val(["household count (2026)", "household count", "household_count", "hh_count", "hhcount"]),
                         "building_count": _get_val(["building count (2026)", "building count", "building_count", "bldg_count", "bldgcount"]),
                         "ea_type": _get_val(["ea type", "ea_type", "type"]),
@@ -3452,7 +3932,7 @@ class POPCENDatabase:
             return 0, len(valid_files)
 
         cols = [
-            "geocode", "prov", "mun", "brgy", "ea", "number_of_eas", "areaname",
+            "geocode", "new_geocode", "prov", "mun", "brgy", "ea", "number_of_eas", "areaname",
             "number_of_households", "number_of_buildings", "new_enumeration_area_code",
             "household_count", "building_count", "ea_type", "source_year", "remarks",
             "source_file", "match_status", "consistency_status", "consistency_notes",
@@ -3789,6 +4269,7 @@ class POPCENDatabase:
             s = f"%{search.strip().lower()}%"
             conditions.append("""(
                 LOWER(geocode) LIKE ? OR
+                LOWER(new_geocode) LIKE ? OR
                 LOWER(areaname) LIKE ? OR
                 LOWER(prov) LIKE ? OR
                 LOWER(mun) LIKE ? OR
@@ -3798,7 +4279,7 @@ class POPCENDatabase:
                 LOWER(remarks) LIKE ? OR
                 LOWER(source_file) LIKE ?
             )""")
-            params.extend([s, s, s, s, s, s, s, s, s])
+            params.extend([s, s, s, s, s, s, s, s, s, s])
 
         if ea_type and ea_type != "All EA Types":
             if ea_type == "Other":
@@ -5159,67 +5640,21 @@ class POPCENDatabase:
             cur.execute(f"""
                 SELECT DISTINCT SUBSTR(geocode, 1, 5), areaname 
                 FROM popcen_records 
-                WHERE geographic_level LIKE '%3 - City%' 
+                WHERE (geographic_level LIKE '%3%' OR geographic_level LIKE '%City%' OR geographic_level LIKE '%Mun%') 
                   AND SUBSTR(geocode, 1, 5) IN ({placeholders})
             """, list(codes))
             for c_code, c_name in cur.fetchall():
-                names_map[str(c_code).strip()] = str(c_name).strip()
-
-        missing_codes = [c for c in codes if c not in names_map]
-        if missing_codes and self.is_gpkg_populated():
-            with self._get_gpkg_connection() as conn:
-                cur = conn.cursor()
-                for c in missing_codes:
-                    cur.execute("""
-                        SELECT city_mun, province 
-                        FROM gpkg_records 
-                        WHERE SUBSTR(geocode, 1, 5) = ? 
-                          AND city_mun IS NOT NULL AND city_mun != '' 
-                        LIMIT 1
-                    """, (c,))
-                    row = cur.fetchone()
-                    if row and row[0]:
-                        names_map[c] = str(row[0]).strip()
-
-        missing_codes = [c for c in codes if c not in names_map]
-        if missing_codes and self.is_earf_populated():
-            with self._get_earf_connection() as conn:
-                cur = conn.cursor()
-                for c in missing_codes:
-                    cur.execute("""
-                        SELECT areaname 
-                        FROM earf_records 
-                        WHERE (SUBSTR(geocode, 1, 5) = ? OR (prov = ? AND mun = ?))
-                          AND (brgy = '000' OR SUBSTR(geocode, 6, 3) = '000')
-                          AND areaname IS NOT NULL AND TRIM(areaname) != '' 
-                        LIMIT 1
-                    """, (c, c[:3], c[3:5]))
-                    row = cur.fetchone()
-                    if row and row[0]:
-                        names_map[c] = str(row[0]).strip()
-
-        still_missing = [c for c in codes if c not in names_map]
-        if still_missing:
-            with self._get_connection() as conn:
-                cur = conn.cursor()
-                for c in still_missing:
-                    cur.execute("""
-                        SELECT areaname, geographic_name 
-                        FROM matched_records 
-                        WHERE SUBSTR(geocode, 1, 5) = ? 
-                          AND (areaname IS NOT NULL OR geographic_name IS NOT NULL) 
-                        LIMIT 1
-                    """, (c,))
-                    row = cur.fetchone()
-                    if row and (row[0] or row[1]):
-                        raw_name = str(row[0] or row[1]).strip()
-                        if " - EA" in raw_name:
-                            raw_name = raw_name.split(" - EA")[0].strip()
-                        names_map[c] = raw_name
+                if is_valid_mun_name(c_name):
+                    names_map[str(c_code).strip()] = str(c_name).strip()
 
         result = []
         for c in sorted(list(codes)):
-            c_name = names_map.get(c, f"City/Mun {c}")
+            c_name = names_map.get(c)
+            if not is_valid_mun_name(c_name):
+                h = self.get_citymun_hierarchy(c)
+                c_name = h.get("city_mun")
+            if not is_valid_mun_name(c_name):
+                c_name = f"City/Mun {c}"
             result.append({
                 "code": c,
                 "name": c_name,
@@ -5231,6 +5666,7 @@ class POPCENDatabase:
         """
         Resolves the geographic hierarchy (Region, Province, City/Municipality names and codes)
         for a 5-digit city/municipality code across gpkg_records, popcen_records, and earf_records.
+        Guarantees that city_mun is never an EA label (e.g. 'EA 000000').
         """
         cm_code = str(city_mun_code or "").strip()
         cm_5 = cm_code[:5] if len(cm_code) >= 5 else cm_code
@@ -5253,13 +5689,14 @@ class POPCENDatabase:
                     """, (cm_5, cm_code))
                     row = cur.fetchone()
                     if row:
-                        reg_name = str(row[0] or "").strip()
-                        prov_name = str(row[1] or "").strip()
-                        mun_name = str(row[2] or "").strip()
+                        if not reg_name and str(row[0] or "").strip(): reg_name = str(row[0]).strip()
+                        if not prov_name and str(row[1] or "").strip(): prov_name = str(row[1]).strip()
+                        cand = str(row[2] or "").strip()
+                        if is_valid_mun_name(cand): mun_name = cand
             except Exception:
                 pass
 
-        # 2. Check popcen_records
+        # 2. Check popcen_records (Level 3 City/Municipality)
         if (not reg_name or not prov_name or not mun_name) and self.is_populated():
             try:
                 with self._get_connection() as conn:
@@ -5267,49 +5704,100 @@ class POPCENDatabase:
                     cur.execute("""
                         SELECT region_code, province_code, city_mun_code, areaname, geographic_name 
                         FROM popcen_records 
-                        WHERE (SUBSTR(geocode, 1, 5) = ? OR SUBSTR(geocode, 1, 6) = ?)
+                        WHERE (SUBSTR(geocode, 1, 5) = ? OR (province_code = ? AND city_mun_code = ?))
+                          AND (geographic_level LIKE '%3%' OR geographic_level LIKE '%City%' OR geographic_level LIKE '%Mun%')
                         LIMIT 1
-                    """, (cm_5, cm_code))
+                    """, (cm_5, cm_5[:3], cm_5[3:5]))
                     p_row = cur.fetchone()
                     if p_row:
-                        if not mun_name:
-                            mun_name = str(p_row[4] or p_row[3] or "").strip()
+                        cand = str(p_row[4] or p_row[3] or "").strip()
+                        if is_valid_mun_name(cand):
+                            mun_name = cand
                         reg_code = str(p_row[0] or "").strip()
                         prov_code = str(p_row[1] or "").strip()
-                        if reg_code and not reg_name:
-                            cur.execute("SELECT areaname FROM popcen_records WHERE geographic_level LIKE '%1 - Region%' AND region_code = ? LIMIT 1", (reg_code,))
-                            r_res = cur.fetchone()
-                            if r_res:
-                                reg_name = str(r_res[0] or "").strip()
-                        if prov_code and not prov_name:
-                            cur.execute("SELECT areaname FROM popcen_records WHERE geographic_level LIKE '%2 - Prov%' AND province_code = ? LIMIT 1", (prov_code,))
-                            pr_res = cur.fetchone()
-                            if pr_res:
-                                prov_name = str(pr_res[0] or "").strip()
             except Exception:
                 pass
 
-        # 3. Check earf_records
+        # 3. Check earf_records for source_file naming pattern (e.g. 05418_earf_San_Simon.xlsx)
+        if (not mun_name or not is_valid_mun_name(mun_name)) and self.is_earf_populated():
+            try:
+                with self._get_earf_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT source_file 
+                        FROM earf_records 
+                        WHERE (SUBSTR(geocode, 1, 5) = ? OR (prov = ? AND mun = ?))
+                          AND source_file IS NOT NULL AND source_file != '' 
+                        LIMIT 1
+                    """, (cm_5, cm_5[:3], cm_5[3:5]))
+                    sf_row = cur.fetchone()
+                    if sf_row and sf_row[0]:
+                        sf_base = os.path.basename(sf_row[0])
+                        m_sf = re.search(r"^\d{3}(\d{2})_earf_(.+?)(?:\.[^.]+)?$", sf_base, re.IGNORECASE)
+                        if m_sf:
+                            f_mun = m_sf.group(2).replace("_", " ").strip()
+                            if is_valid_mun_name(f_mun):
+                                mun_name = f_mun
+                            real_p = sf_base[:5]
+                            if real_p.isdigit() and self.is_populated():
+                                with self._get_connection() as pconn:
+                                    pcur = pconn.cursor()
+                                    pcur.execute("""
+                                        SELECT region_code, province_code, areaname 
+                                        FROM popcen_records 
+                                        WHERE SUBSTR(geocode, 1, 5) = ? 
+                                          AND (geographic_level LIKE '%3%' OR geographic_level LIKE '%City%' OR geographic_level LIKE '%Mun%')
+                                        LIMIT 1
+                                    """, (real_p,))
+                                    pr = pcur.fetchone()
+                                    if pr:
+                                        if is_valid_mun_name(pr[2]):
+                                            mun_name = str(pr[2]).strip()
+                                        if not prov_code: prov_code = str(pr[1] or "").strip()
+                                        if not reg_code: reg_code = str(pr[0] or "").strip()
+            except Exception:
+                pass
+
+        # 4. Check earf_records (Level 3 or Barangay 000 summary record)
         if (not reg_name or not prov_name or not mun_name) and self.is_earf_populated():
             try:
                 with self._get_earf_connection() as conn:
                     cur = conn.cursor()
                     cur.execute("""
-                        SELECT region, province, city_mun 
+                        SELECT areaname 
                         FROM earf_records 
-                        WHERE (SUBSTR(geocode, 1, 5) = ? OR SUBSTR(geocode, 1, 6) = ?)
-                          AND region IS NOT NULL AND region != '' 
-                          AND province IS NOT NULL AND province != '' 
-                          AND city_mun IS NOT NULL AND city_mun != '' 
+                        WHERE (SUBSTR(geocode, 1, 5) = ? OR (prov = ? AND mun = ?))
+                          AND (brgy = '000' OR SUBSTR(geocode, 6, 3) = '000')
+                          AND areaname IS NOT NULL AND TRIM(areaname) != '' 
                         LIMIT 1
-                    """, (cm_5, cm_code))
+                    """, (cm_5, cm_5[:3], cm_5[3:5]))
                     e_row = cur.fetchone()
-                    if e_row:
-                        if not reg_name: reg_name = str(e_row[0] or "").strip()
-                        if not prov_name: prov_name = str(e_row[1] or "").strip()
-                        if not mun_name: mun_name = str(e_row[2] or "").strip()
+                    if e_row and is_valid_mun_name(e_row[0]):
+                        mun_name = str(e_row[0]).strip()
             except Exception:
                 pass
+
+        # 5. Check region and province names from popcen_records if codes are known
+        if self.is_populated():
+            try:
+                with self._get_connection() as conn:
+                    cur = conn.cursor()
+                    if reg_code and not reg_name:
+                        cur.execute("SELECT areaname FROM popcen_records WHERE geographic_level LIKE '%1 - Region%' AND region_code = ? LIMIT 1", (reg_code,))
+                        r_res = cur.fetchone()
+                        if r_res:
+                            reg_name = str(r_res[0] or "").strip()
+                    if prov_code and not prov_name:
+                        cur.execute("SELECT areaname FROM popcen_records WHERE geographic_level LIKE '%2 - Prov%' AND province_code = ? LIMIT 1", (prov_code,))
+                        pr_res = cur.fetchone()
+                        if pr_res:
+                            prov_name = str(pr_res[0] or "").strip()
+            except Exception:
+                pass
+
+        # 6. Fallback ensuring no EA string ever leaks as municipality name
+        if not is_valid_mun_name(mun_name):
+            mun_name = f"City/Mun {cm_5}"
 
         return {
             "region": reg_name,
@@ -5320,62 +5808,111 @@ class POPCENDatabase:
             "city_mun_code": cm_5,
         }
 
+    def _get_root_subfolders_tree(self, root_dir: str) -> List[Tuple[str, str, str, str, List[str], bool]]:
+        """
+        Indexes all subfolders under root_dir to allow rapid searching across all municipalities
+        without repeatedly walking the file system. Cached in memory.
+        Returns list of tuples: (dirpath, folder_name, parent_name, grandparent_name, filenames, is_leaf).
+        """
+        if not root_dir or not os.path.exists(root_dir) or not os.path.isdir(root_dir):
+            return []
+
+        norm_root = os.path.normcase(os.path.abspath(root_dir))
+        try:
+            mtime = os.path.getmtime(root_dir)
+        except Exception:
+            mtime = 0
+
+        cached = getattr(self, "_root_subfolders_tree_cache", None)
+        if cached and cached.get("root") == norm_root and cached.get("mtime") == mtime:
+            return cached.get("tree", [])
+
+        tree = []
+        for dirpath, dirnames, filenames in os.walk(root_dir):
+            dirnames[:] = [d for d in dirnames if not d.startswith('.') and not d.startswith('_') and not is_version_dir(d)]
+            if os.path.abspath(dirpath) == os.path.abspath(root_dir):
+                continue
+            folder_name = os.path.basename(dirpath)
+            parent_dir = os.path.dirname(dirpath)
+            parent_name = os.path.basename(parent_dir) if parent_dir != root_dir else ""
+            gp_dir = os.path.dirname(parent_dir) if parent_dir != root_dir else ""
+            gp_name = os.path.basename(gp_dir) if gp_dir != root_dir else ""
+            is_leaf = len(dirnames) == 0
+            tree.append((dirpath, folder_name, parent_name, gp_name, filenames, is_leaf))
+
+        self._root_subfolders_tree_cache = {
+            "root": norm_root,
+            "mtime": mtime,
+            "tree": tree,
+        }
+        return tree
+
+    def find_subfolder_for_citymun(self, root_dir: str, city_mun_code: str, hier: Optional[Dict[str, str]] = None) -> Optional[str]:
+        """
+        Searches root_dir recursively for an existing subfolder matching the given city/municipality
+        by name or 5-digit code. Does NOT create any new directories.
+        Returns the absolute path to the matching existing subfolder, or None if not found.
+        """
+        if not root_dir or not os.path.exists(root_dir) or not os.path.isdir(root_dir):
+            return None
+
+        if not hier:
+            hier = self.get_citymun_hierarchy(city_mun_code)
+        mun_name = hier.get("city_mun", "")
+        prov_name = hier.get("province", "")
+        reg_name = hier.get("region", "")
+        pppmm = str(city_mun_code)[:5] if len(str(city_mun_code)) >= 5 else str(city_mun_code)
+
+        tree = self._get_root_subfolders_tree(root_dir)
+        best_match = None
+        best_score = 0
+
+        for dirpath, folder_name, parent_name, gp_name, filenames, is_leaf in tree:
+            score = 0
+
+            # 1. 5-digit code match in folder name (e.g. '01915 - San Pedro', '01915_san_pedro', '01915')
+            if pppmm and pppmm in folder_name:
+                score += 80
+                if folder_name.startswith(pppmm):
+                    score += 20
+
+            # 2. City / Municipality name match
+            if mun_name and _match_hier_names(folder_name, mun_name):
+                score += 70
+
+            # 3. Existing deliverables or files with 5-digit code prefix inside folder
+            if pppmm and any(f.startswith(f"{pppmm}_") or f.startswith(f"{pppmm}.") for f in filenames):
+                score += 90
+
+            if score > 0:
+                if prov_name and _match_hier_names(parent_name, prov_name):
+                    score += 30
+                if reg_name and _match_hier_names(gp_name, reg_name):
+                    score += 20
+                if is_leaf:
+                    score += 15
+
+                if score > best_score:
+                    best_score = score
+                    best_match = dirpath
+
+        if best_score >= 60:
+            return best_match
+
+        return None
+
     def resolve_final_export_subfolder(self, root_dir: str, city_mun_code: str) -> Tuple[Optional[str], Dict[str, str]]:
         """
-        Locates or constructs the specific City/Municipality subfolder under root_dir
-        following the official hierarchy: <root_dir>/<Region>/<Province>/<CityMun>.
-        Checks the Region, Province, and CityMun folder names dynamically on disk.
+        Locates the specific City/Municipality subfolder under root_dir by searching
+        for the city/mun name or 5-digit code dynamically across existing subfolders.
+        Does NOT create any new directories.
         """
         hier = self.get_citymun_hierarchy(city_mun_code)
-        reg_name = hier.get("region", "")
-        prov_name = hier.get("province", "")
-        mun_name = hier.get("city_mun", "")
-
         if not root_dir or not os.path.exists(root_dir):
             return None, hier
 
-        matched_reg_dir = None
-        try:
-            for d in os.listdir(root_dir):
-                full_d = os.path.join(root_dir, d)
-                if os.path.isdir(full_d) and _match_hier_names(d, reg_name):
-                    matched_reg_dir = full_d
-                    break
-        except Exception:
-            pass
-
-        if not matched_reg_dir:
-            fallback = os.path.join(root_dir, reg_name or "Region", prov_name or "Province", mun_name or city_mun_code)
-            return fallback, hier
-
-        # 1. Try matching Province/District then CityMun
-        try:
-            for d in os.listdir(matched_reg_dir):
-                full_d = os.path.join(matched_reg_dir, d)
-                if os.path.isdir(full_d) and _match_hier_names(d, prov_name):
-                    for sub_d in os.listdir(full_d):
-                        full_sub = os.path.join(full_d, sub_d)
-                        if os.path.isdir(full_sub) and _match_hier_names(sub_d, mun_name):
-                            return full_sub, hier
-        except Exception:
-            pass
-
-        # 2. Try matching CityMun anywhere under matched_reg_dir (handles NCR districts like NCR I - NCR V)
-        try:
-            for d in os.listdir(matched_reg_dir):
-                full_d = os.path.join(matched_reg_dir, d)
-                if os.path.isdir(full_d):
-                    if _match_hier_names(d, mun_name):
-                        return full_d, hier
-                    for sub_d in os.listdir(full_d):
-                        full_sub = os.path.join(full_d, sub_d)
-                        if os.path.isdir(full_sub) and _match_hier_names(sub_d, mun_name):
-                            return full_sub, hier
-        except Exception:
-            pass
-
-        fallback = os.path.join(matched_reg_dir, prov_name or "Province", mun_name or city_mun_code)
-        return fallback, hier
+        matched = self.find_subfolder_for_citymun(root_dir, city_mun_code, hier)
+        return matched, hier
 
     def query_matched_records(
         self,
@@ -5972,9 +6509,9 @@ class POPCENDatabase:
                 meta = self.get_citymun_hierarchy(f"{p_c}{m_c}")
 
         # Strictly sort by geocode before generating PCD Excel
-        pcd_rows.sort(key=lambda r: str(r.get("ea_geocode") or r.get("geocode") or "").strip())
+        pcd_rows.sort(key=extract_sort_geocode)
 
-        export_matched_to_excel(pcd_rows, out_excel, metadata=meta)
+        export_matched_to_excel(pcd_rows, out_excel, metadata=meta, is_pcd=True)
 
     @staticmethod
     def is_summary_header_record(r: Dict[str, Any]) -> bool:
@@ -5983,6 +6520,10 @@ class POPCENDatabase:
     @staticmethod
     def compute_recoded_enumeration_areas(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         return compute_recoded_enumeration_areas(records)
+
+    @staticmethod
+    def identify_absorbed_records(records: List[Dict[str, Any]]) -> Set[int]:
+        return identify_absorbed_records(records)
 
     @staticmethod
     def filter_pcd_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -6235,6 +6776,7 @@ class POPCENDatabase:
         gpkg_data = {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-", "layer_name": "", "feature_count": 0}
         earf_data = {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"}
         mis_data = {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"}
+        pcd_data = {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"}
 
         for sdir in search_dirs:
             try:
@@ -6299,7 +6841,7 @@ class POPCENDatabase:
             # 2. Final EARF Excel
             if not earf_data["exists"]:
                 excel_cands = [f for f in entries if f.lower().endswith((".xlsx", ".xls")) and not f.startswith("~$") and not f.startswith("._")]
-                earf_cands = [f for f in excel_cands if "mis" not in f.lower()]
+                earf_cands = [f for f in excel_cands if "mis" not in f.lower() and "pcd" not in f.lower()]
                 best_earf = None
                 if earf_cands:
                     for f in earf_cands:
@@ -6370,15 +6912,48 @@ class POPCENDatabase:
                     except Exception:
                         pass
 
-        files_present = sum([gpkg_data["exists"], earf_data["exists"], mis_data["exists"]])
-        if files_present == 3:
+            # 4. PCD EARF Excel
+            if not pcd_data["exists"]:
+                excel_cands = [f for f in entries if f.lower().endswith((".xlsx", ".xls")) and not f.startswith("~$") and not f.startswith("._")]
+                pcd_cands = [f for f in excel_cands if "pcd" in f.lower()]
+                best_pcd = None
+                if pcd_cands:
+                    for f in pcd_cands:
+                        if f.startswith(pppmm) and "pcd" in f.lower():
+                            best_pcd = f; break
+                    if not best_pcd:
+                        for f in pcd_cands:
+                            if "pcd" in f.lower() and (clean_cm in f.lower() or is_specific):
+                                best_pcd = f; break
+                    if not best_pcd and is_specific:
+                        best_pcd = pcd_cands[0]
+
+                if best_pcd:
+                    p = os.path.join(sdir, best_pcd)
+                    try:
+                        st = os.stat(p)
+                        dt_str = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+                        pcd_data = {
+                            "exists": True,
+                            "filename": best_pcd,
+                            "path": p,
+                            "size": st.st_size,
+                            "size_str": _fmt_size(st.st_size),
+                            "mtime": st.st_mtime,
+                            "mtime_str": dt_str,
+                        }
+                    except Exception:
+                        pass
+
+        files_present = sum([gpkg_data["exists"], earf_data["exists"], mis_data["exists"], pcd_data["exists"]])
+        if files_present == 4:
             status = "COMPLETE"
         elif files_present > 0:
             status = "PARTIAL"
         else:
             status = "MISSING"
 
-        latest_mtime = max([gpkg_data["mtime"], earf_data["mtime"], mis_data["mtime"]])
+        latest_mtime = max([gpkg_data["mtime"], earf_data["mtime"], mis_data["mtime"], pcd_data["mtime"]])
         latest_mtime_str = datetime.datetime.fromtimestamp(latest_mtime).strftime("%Y-%m-%d %H:%M") if latest_mtime > 0 else "-"
 
         # Check if matched records exist for this municipality
@@ -6403,13 +6978,14 @@ class POPCENDatabase:
             "folder_exists": folder_exists,
             "status": status,
             "completion_count": files_present,
-            "completion_ratio": f"{files_present}/3",
+            "completion_ratio": f"{files_present}/4",
             "last_modified": latest_mtime_str,
             "last_modified_ts": latest_mtime,
             "has_matching_data": has_matching,
             "gpkg": gpkg_data,
             "final_earf": earf_data,
             "mis_earf": mis_data,
+            "pcd_earf": pcd_data,
         }
 
     def find_last_subfolders_in_root(self, root_dir: str) -> List[Tuple[str, List[str]]]:
@@ -6479,6 +7055,7 @@ class POPCENDatabase:
                 gpkg_cnt = sum(1 for r in saved if r.get("gpkg", {}).get("exists"))
                 earf_cnt = sum(1 for r in saved if r.get("final_earf", {}).get("exists"))
                 mis_cnt = sum(1 for r in saved if r.get("mis_earf", {}).get("exists"))
+                pcd_cnt = sum(1 for r in saved if r.get("pcd_earf", {}).get("exists"))
                 pct_comp = round((comp / 1655 * 100), 1)
                 return {
                     "root_dir": root_dir,
@@ -6493,6 +7070,7 @@ class POPCENDatabase:
                     "gpkg_ready": gpkg_cnt,
                     "final_earf_ready": earf_cnt,
                     "mis_earf_ready": mis_cnt,
+                    "pcd_earf_ready": pcd_cnt,
                     "completion_percentage": pct_comp,
                     "records": saved,
                 }
@@ -6675,8 +7253,9 @@ class POPCENDatabase:
                     "gpkg": {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-", "layer_name": "", "feature_count": 0},
                     "final_earf": {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"},
                     "mis_earf": {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"},
+                    "pcd_earf": {"exists": False, "filename": "", "path": "", "size": 0, "size_str": "-", "mtime": 0, "mtime_str": "-"},
                     "status": "MISSING",
-                    "completion_ratio": "0/3",
+                    "completion_ratio": "0/4",
                     "last_modified": 0,
                     "last_modified_str": "-",
                     "has_matching_data": False,
@@ -6705,24 +7284,27 @@ class POPCENDatabase:
             # Apply search filter if specified
             if search:
                 s_lower = search.strip().lower()
-                searchable = f"{rec['code']} {rec['pppmm']} {rec['name']} {rec['province']} {rec['region']} {rec['gpkg']['filename']} {rec['final_earf']['filename']} {rec['mis_earf']['filename']}".lower()
+                pcd_fname = rec.get("pcd_earf", {}).get("filename", "")
+                searchable = f"{rec['code']} {rec['pppmm']} {rec['name']} {rec['province']} {rec['region']} {rec['gpkg']['filename']} {rec['final_earf']['filename']} {rec['mis_earf']['filename']} {pcd_fname}".lower()
                 if s_lower not in searchable:
                     continue
 
             # Apply status filter if specified
             if status_filter and status_filter != "All Statuses":
                 sf = status_filter.strip()
-                if sf == "Complete (3/3)" and rec["status"] != "COMPLETE":
+                if sf in ("Complete (4/4)", "Complete (3/3)") and rec["status"] != "COMPLETE":
                     continue
-                elif sf == "Partial (1-2/3)" and rec["status"] != "PARTIAL":
+                elif sf in ("Partial (1-3/4)", "Partial (1-2/3)") and rec["status"] != "PARTIAL":
                     continue
-                elif sf == "Missing All (0/3)" and rec["status"] != "MISSING":
+                elif sf in ("Missing All (0/4)", "Missing All (0/3)") and rec["status"] != "MISSING":
                     continue
                 elif sf == "Missing GPKG" and rec["gpkg"]["exists"]:
                     continue
                 elif sf == "Missing Final EARF" and rec["final_earf"]["exists"]:
                     continue
                 elif sf == "Missing MIS EARF" and rec["mis_earf"]["exists"]:
+                    continue
+                elif sf == "Missing PCD EARF" and rec.get("pcd_earf", {}).get("exists"):
                     continue
 
             all_records.append(rec)
@@ -6737,6 +7319,7 @@ class POPCENDatabase:
         gpkg_cnt = sum(1 for r in all_records if r["gpkg"]["exists"])
         earf_cnt = sum(1 for r in all_records if r["final_earf"]["exists"])
         mis_cnt = sum(1 for r in all_records if r["mis_earf"]["exists"])
+        pcd_cnt = sum(1 for r in all_records if r.get("pcd_earf", {}).get("exists"))
         pct_comp = round((comp / FIXED_TOTAL_CITIES_MUN * 100), 1)
 
         # Persist scan results in SQLite so the dashboard keeps the records across sessions
@@ -6758,6 +7341,7 @@ class POPCENDatabase:
             "gpkg_ready": gpkg_cnt,
             "final_earf_ready": earf_cnt,
             "mis_earf_ready": mis_cnt,
+            "pcd_earf_ready": pcd_cnt,
             "completion_percentage": pct_comp,
             "records": all_records,
         }
@@ -6774,10 +7358,12 @@ class POPCENDatabase:
                 "Output GPKG Status", "Output GPKG File", "Output GPKG Size",
                 "Final EARF Status", "Final EARF File", "Final EARF Size",
                 "MIS EARF Status", "MIS EARF File", "MIS EARF Size",
+                "PCD EARF Status", "PCD EARF File", "PCD EARF Size",
                 "Subfolder Path", "Folder Exists", "Last Modified"
             ])
             for r in records:
                 c5 = str(r.get("pppmm") or r.get("code") or "")[:5]
+                pcd = r.get("pcd_earf", {})
                 writer.writerow([
                     r.get("region", ""),
                     r.get("province", ""),
@@ -6795,6 +7381,9 @@ class POPCENDatabase:
                     "READY" if r["mis_earf"]["exists"] else "MISSING",
                     r["mis_earf"]["filename"],
                     r["mis_earf"]["size_str"],
+                    "READY" if pcd.get("exists") else "MISSING",
+                    pcd.get("filename", ""),
+                    pcd.get("size_str", ""),
                     r.get("folder_path", ""),
                     "YES" if r.get("folder_exists") else "NO",
                     r.get("last_modified", ""),
@@ -6819,10 +7408,12 @@ class POPCENDatabase:
                     gpkg_exists, gpkg_filename, gpkg_path, gpkg_size, gpkg_size_str, gpkg_mtime, gpkg_mtime_str, gpkg_feature_count,
                     final_earf_exists, final_earf_filename, final_earf_path, final_earf_size, final_earf_size_str, final_earf_mtime, final_earf_mtime_str,
                     mis_earf_exists, mis_earf_filename, mis_earf_path, mis_earf_size, mis_earf_size_str, mis_earf_mtime, mis_earf_mtime_str,
+                    pcd_earf_exists, pcd_earf_filename, pcd_earf_path, pcd_earf_size, pcd_earf_size_str, pcd_earf_mtime, pcd_earf_mtime_str,
                     subfolder_path, subfolder_exists, last_modified, last_modified_str, last_scanned
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, CURRENT_TIMESTAMP
@@ -6833,6 +7424,7 @@ class POPCENDatabase:
                     g = r.get("gpkg", {})
                     fe = r.get("final_earf", {})
                     me = r.get("mis_earf", {})
+                    pe = r.get("pcd_earf", {})
                     c_code = r.get("code") or r.get("city_mun_code") or ""
                     if not c_code:
                         continue
@@ -6865,6 +7457,13 @@ class POPCENDatabase:
                         me.get("size_str") or "",
                         me.get("mtime") or 0.0,
                         me.get("mtime_str") or "",
+                        1 if pe.get("exists") else 0,
+                        pe.get("filename") or "",
+                        pe.get("path") or "",
+                        pe.get("size") or 0,
+                        pe.get("size_str") or "",
+                        pe.get("mtime") or 0.0,
+                        pe.get("mtime_str") or "",
                         r.get("folder_path") or r.get("subfolder_path") or "",
                         1 if r.get("folder_exists") or r.get("subfolder_exists") else 0,
                         r.get("last_modified") or 0.0,
@@ -6896,9 +7495,10 @@ class POPCENDatabase:
                     g_exists = bool(r_dict.get("gpkg_exists"))
                     fe_exists = bool(r_dict.get("final_earf_exists"))
                     me_exists = bool(r_dict.get("mis_earf_exists"))
+                    pe_exists = bool(r_dict.get("pcd_earf_exists"))
                     
-                    ready_cnt = sum([1 if g_exists else 0, 1 if fe_exists else 0, 1 if me_exists else 0])
-                    comp_ratio = f"{ready_cnt}/3"
+                    ready_cnt = sum([1 if g_exists else 0, 1 if fe_exists else 0, 1 if me_exists else 0, 1 if pe_exists else 0])
+                    comp_ratio = f"{ready_cnt}/4"
 
                     records.append({
                         "code": c_code,
@@ -6937,6 +7537,15 @@ class POPCENDatabase:
                             "size_str": r_dict.get("mis_earf_size_str", ""),
                             "mtime": r_dict.get("mis_earf_mtime", 0.0),
                             "mtime_str": r_dict.get("mis_earf_mtime_str", ""),
+                        },
+                        "pcd_earf": {
+                            "exists": pe_exists,
+                            "filename": r_dict.get("pcd_earf_filename", ""),
+                            "path": r_dict.get("pcd_earf_path", ""),
+                            "size": r_dict.get("pcd_earf_size", 0),
+                            "size_str": r_dict.get("pcd_earf_size_str", ""),
+                            "mtime": r_dict.get("pcd_earf_mtime", 0.0),
+                            "mtime_str": r_dict.get("pcd_earf_mtime_str", ""),
                         },
                         "folder_path": r_dict.get("subfolder_path", ""),
                         "subfolder_path": r_dict.get("subfolder_path", ""),
