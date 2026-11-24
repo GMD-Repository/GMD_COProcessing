@@ -30,8 +30,9 @@ Requires `geopandas`, `pandas`, `pyogrio` and `shapely` in the QGIS Python.
    filtered out.
 4. Press **Scan**. Progress, warnings and the summary appear in the Log.
 5. The **Discrepancies** list shows every issue, largest first. Click a row to flash it on the map,
-   double-click to zoom. The zoom blinks a **dotted outline with a circle marker** on the discrepancy
-   (orange = cut off, red = added, grey = fix by hand) and a **dotted green outline** of the Fix feature as it
+   double-click to zoom. The zoom blinks a **dotted outline** on the discrepancy, with a **circle on each vertex of the
+   Fix feature that is out of place** (not yet on its neighbour's edge), in orange = cut off, red = added,
+   grey = fix by hand, and a **dotted green outline** of the Fix feature as it
    will be after **Snap Selected**. They stay drawn until the next zoom, scan, snap or Clear. A tiny piece
    (e.g. 1 m²) is zoomed to at least ~55 m across so its surroundings show. **Zoom to Selected** does the
    same for several rows. Untick **Blinking dotted outline and snap preview on zoom** (Snap panel) to get
@@ -59,7 +60,8 @@ narrow it; the magnifier button next to them zooms to the selected rows.
 | **Zoom to Selected** | Zooms to the selected rows (with the blinking outlines if ticked). |
 | **Switch Fix** | Gives the selected row to the next feature that could take it. For a detached piece (island), goes through the features of its reference area, nearest first. |
 | **Snap Selected** | Changes the features named in **Fix** for the selected rows. |
-| **Undo Last Snap** | Takes back the last snap (see Safety checks and saving). |
+| **Match Vertices** | Pairs the vertices along every shared edge of the checked layer: a vertex within 1 cm of a neighbour's edge is moved onto it and added to the neighbour, so both hold the same point. In EA vs BGY, a vertex on its barangay line is never moved. Undo Last Snap takes it back. |
+| **Undo Last Snap** | Takes back the last snap or Match Vertices (see Safety checks and saving). |
 | **Clear** (left column) | Clears the list and the log. |
 
 ### Ticking layers
@@ -96,8 +98,13 @@ flowchart LR
      result never silently misses a city / municipality.
    - Each feature gets a key: the barangay (first 8 geocode digits) in EA vs BGY and BGY vs BGY, or the
      `ea_geocode` in EA vs EA.
-   - Overlays run in the layers' own lat/lon, so shared edges stay exact. Areas are measured in an
-     equal-area projection centred on the Philippines.
+   - Checks and overlays run in a projected working CRS in metres, so an edge is straight exactly as the
+     map draws it: the layers' own CRS when projected, else the map canvas's CRS, else the WGS 84 / UTM zone
+     of the data. It must convert to and from the layers' CRS exactly (a PRS92 ↔ WGS 84 datum shift comes
+     back about 1 mm off, so then UTM is used). The Log names the CRS. In lat/lon, a vertex put on a
+     kilometre-long edge would show up to ~10 cm off the barangay line on the map. The features' own
+     vertices are written back untouched. Areas are measured in an equal-area projection centred on the
+     Philippines.
 2. **Compare with a reference.** Features are matched to the reference feature with the same key.
    - **Outside:** feature − its reference. Each piece names the reference area it extends into.
    - **Short of:** reference − the union of its features. The gap is linked to the features within 1 m of
@@ -132,6 +139,7 @@ flowchart LR
 | **No matching …** | The feature's geocode is not in the reference layer | Nothing — fix by hand |
 | **Overlap** | Self check: land in two features | Cuts it from the larger one (Switch Fix: the other) |
 | **Gap** | Self check: land enclosed by the features but in none | Adds it to the feature with the longest border (Switch Fix: the next one) |
+| **Unmatched vertices** | A feature has a vertex within 1 cm of a neighbour's edge with no partner vertex there, or two vertices within 2 mm (duplicate) | Snap Selected matches them (moved at most 1 cm; in EA vs BGY a vertex on its barangay line stays put). Snapped only if a re-check finds nothing left |
 
 Holes and parts smaller than the sliver setting that an edit leaves behind are removed.
 
@@ -141,8 +149,32 @@ Holes and parts smaller than the sliver setting that an edit leaves behind are r
 
 Before a feature changes, the new geometry must be valid, not empty, have the expected area, stay valid in
 the layer's CRS, fit the layer (a single-part layer cannot take several parts), and the feature must not
-have been edited since the scan. Otherwise the row is marked **Failed** with the reason, and the feature is
-untouched.
+have been edited since the scan. It must also really fix what was selected: the cut pieces gone and the
+gaps covered, with less than a quarter of the minimum area left over in total, so a row marked **Snapped**
+does not come back on the next scan. The scan itself re-checks every piece on the exact geometry, so it
+never reports a hairline that is only a rounding effect and could not be snapped away. Otherwise the row is marked **Failed** with the reason, and the
+feature is untouched.
+
+When features are checked against each other (no reference), an overlap is cut along the kept feature's own
+outline and an added gap is clipped by the features around it, so the fixed edge lands exactly on the
+neighbour's edge. Only that edge changes: every other vertex of the feature stays exactly where it was.
+
+When snapping to a reference, the feature is likewise cut to its own reference outline around each piece,
+and given all reference land around it that no other feature rightly holds, so the hairline slivers
+beside the piece are fixed with it. After every snap, the snapped feature and its neighbours get the same
+vertices along their shared edges: a vertex of one within 1 cm of the other's edge is moved onto that edge
+(onto the neighbour's vertex if one is that close) and added to the neighbour, and a vertex shared with a
+third feature moves there too. Checked against a reference, a vertex on the feature's own reference line is
+never moved. Vertices within 2 mm of each other become one point in every feature that has them, and
+duplicate vertices and spikes (a vertex that goes out and straight back) are removed, so QGIS finds no
+duplicate nodes. Undo Last Snap takes this back with the snap. **Match Vertices** does the same for the whole
+layer, which also pairs vertices that were already a hair apart in the data; run it last, from an EA vs BGY
+scan, then Scan again to confirm.
+
+**Recommended order:** EA vs EA first, then EA vs BGY, then EA vs EA again to confirm it is clean. A long
+hairline strip (thinner than a millimetre) can need a second Scan and Snap in EA vs BGY. If EA vs EA still
+finds a gap after that, it is land that lies in no barangay: the barangay layer has a hole or a pinched
+inlet there.
 
 Only geometry changes — attributes such as household counts stay as they are. Each snap edits the
 feature's own layer, and the changed layers are left in edit mode (the Log names them):
