@@ -1,7 +1,7 @@
 # =====================================================================================
 # EA vs Barangay Check (GMD CO Processing > EA Tools)
 # Timestamp : 2026-11-24 20:00 (Asia/Manila, UTC+08:00)
-# Version   : 1.6.0
+# Version   : 1.7.1
 #
 # Changelog (oldest to newest)
 #   1.0.0  Baseline as supplied: EA vs BGY / BGY vs BGY / EA vs EA checks, snapping of selected
@@ -75,6 +75,28 @@
 #            two vertices within 2 mm. Shown as small squares; the zoom circles sit on the vertices. Snap
 #            Selected on these rows matches them (share_vertices) in the same edit command as the other
 #            snaps, then re-checks the feature: Snapped only if nothing is left, else Failed with the reason.
+#   1.7.0  2026-11-24  EA vs BGY no longer says "all snapped" while an EA edge sits mm off the barangay line.
+#          - Vertex check against the reference (ref_off_vertices / ref_missing_vertices): an EA vertex up to
+#            5 cm (REF_TOL_M) off its own barangay line, or a barangay vertex missing from an EA edge running
+#            along that line. Such slivers are under 0.1 sqm, so the area check never listed them.
+#          - Snapping puts those vertices onto the line (onto the barangay vertex if one is within 2 mm) and
+#            adds the missing barangay vertices (insert_ref_vertices), for the snapped EA and its neighbours.
+#          - The weld keeps a barangay vertex where it is; a vertex on its own barangay line may slide along it
+#            onto the neighbour's vertex (never a barangay corner).
+#          - KEEP_VERTEX_TOL_M 1e-5 -> 1e-7: a move of a few microns was undone when written back.
+#          - Where barangays do not meet at one point (corners mm apart), the EA vertex on another barangay's
+#            line is left as is: no position fits all of them.
+#   1.7.1  2026-11-24  Repeated Snap Selected no longer piles vertices at intersections or makes bow ties / lines.
+#          - snap_inputs(): the hairline slivers beside a piece are taken whole, not clipped to a 1 cm pad
+#            around it: the pad's outline put new vertices mm-cm from each real crossing, and every snap added
+#            more (199 vertex pairs under 5 mm after a few rounds; now 0).
+#          - share_vertices(): a vertex on its own reference line within 5 cm (SLIDE_M) of a reference vertex
+#            slides onto it, so an intersection is one vertex.
+#          - to_layer_geometry(): a QGIS repair (makeValid) that splits the feature into parts touching at a
+#            point (a bow tie) or leaves specks is never used. If the shape crosses itself only in a lat/lon
+#            layer (km-long edges bend ~10 cm between the CRSs), its long edges get a vertex every 100 m
+#            (DENSIFY_M) instead, and the scan copy keeps exactly what was written.
+#          - clean_vertices(): needles under 1 degree enclosing under 0.01 sqm (an overlay's leftover) are removed.
 # =====================================================================================
 r"""
 EA vs Barangay boundary check (QGIS), with three check modes chosen in the window:
@@ -169,7 +191,7 @@ TOUCH_TOL_M = 1.0   # a gap within this distance of an EA counts as bordering th
 MIN_OWNER_SHARE = 0.3  # a gap is added to one EA only if that EA has at least this share of its EA border
 GRID_M = 1e-4      # fallback precision grid (0.1 mm) when an exact snap gives an invalid geometry
 SNAP_TOL_M = 2e-4  # cut / added pieces are snapped onto the EA within this distance (0.2 mm) before the overlay
-KEEP_VERTEX_TOL_M = 1e-5  # a vertex this close (0.01 mm) to one of the feature's own keeps that exact position
+KEEP_VERTEX_TOL_M = 1e-7  # a vertex this close (0.1 micron) to one of the feature's own keeps that exact position
 SHARE_TOL_M = 1e-2  # a vertex this close (1 cm) to a neighbour's edge is put into that edge too (shared)
 SAME_VERTEX_M = 1e-6  # two vertices this close (1 micron) are the same vertex
 
@@ -1017,18 +1039,31 @@ def snap_inputs(scan, idx, rows):
         own = getattr(scan, "ref", {}).get(ea.at[idx, "key"]) if "key" in ea.columns else None
         if own is None or own.is_empty:
             return cuts, adds, None
-        # Snapped to its reference: around each piece, everything of the feature outside the reference is
-        # cut, and all reference land not held by another feature is added. The hairline slivers under
-        # min_area beside the piece (where the two edges cross back and forth) go with it, so they cannot
-        # merge into a new discrepancy once the piece is gone.
-        pads = {r: shapely.buffer(d.geometry[r], NEIGHBOUR_PAD_M, join_style="mitre") for r in rows}
-        cuts = [polygons_only(shapely.union(d.geometry[r], shapely.difference(pads[r], own))) or d.geometry[r]
-                for r in rows if d.at[r, "_kind"] == "cut"]
-        adds = [polygons_only(shapely.union(d.geometry[r], shapely.intersection(pads[r], own))) or d.geometry[r]
-                for r in rows if d.at[r, "_kind"] == "add"]
+        # Snapped to its reference: the hairline slivers under min_area touching each piece (where the two
+        # edges cross back and forth) go with it, so they cannot merge into a new discrepancy once the piece is
+        # gone. Each sliver is taken WHOLE: clipping it to a pad around the piece would put new vertices where
+        # the pad's outline crosses the edges (a few mm to cm from the real crossing), and repeated snaps
+        # would pile them up at the intersections.
+        geom = ea.geometry[idx]
+
+        def slivers(area):
+            parts = [q for q in shapely.get_parts(polygons_only(area) or shapely.Polygon()) if q.area > 0]
+            return [q for q, a in zip(parts, areas_sqm(parts) if parts else []) if a < scan.min_area]
+
+        outside = slivers(exact_difference(geom, own))
+        inside = slivers(exact_difference(own, geom))
+
+        def with_slivers(r, pool):
+            pad = shapely.buffer(d.geometry[r], NEIGHBOUR_PAD_M, join_style="mitre")
+            touching = [q for q in pool if shapely.intersects(q, pad)]
+            return polygons_only(shapely.union_all([d.geometry[r], *touching])) or d.geometry[r]
+
+        cuts = [with_slivers(r, outside) for r in rows if d.at[r, "_kind"] == "cut"]
+        adds = [with_slivers(r, inside) for r in rows if d.at[r, "_kind"] == "add"]
         if not adds:
             return cuts, adds, None
-        reach = shapely.union_all([pads[r] for r in rows if d.at[r, "_kind"] == "add"])
+        # around the added land (the pad's outline stays outside it, so it adds no vertex)
+        reach = shapely.buffer(shapely.union_all(adds), NEIGHBOUR_PAD_M, join_style="mitre")
         # Only land another feature rightly holds (inside its own reference) is left to it: a feature reaching
         # in from another reference is itself cut back to its own by the same snap.
         def rightful(j, g):
@@ -1038,6 +1073,35 @@ def snap_inputs(scan, idx, rows):
                 if j != idx and g is not None and shapely.intersects(g, reach)]
         near = [g for g in near if g is not None and not g.is_empty]
         return cuts, adds, (shapely.union_all(near) if near else None)
+
+    def others_of(r):
+        return [int(c) for c in (d.at[r, "_candidates"] or []) if int(c) != idx and int(c) in ea.index]
+
+    def around(r):
+        """The other candidate features' shapes around the piece (its pad's outline stays outside the piece,
+        so clipping the added land with them adds no vertex)."""
+        pad = shapely.buffer(d.geometry[r], NEIGHBOUR_PAD_M, join_style="mitre")
+        parts = [shapely.intersection(ea.geometry[o], pad) for o in others_of(r)]
+        return [polygons_only(p) for p in parts if p is not None and not p.is_empty and polygons_only(p) is not None]
+
+    def overlap_slivers(r):
+        """The hairline overlaps (under min_area) with the kept feature touching the piece, each WHOLE (not
+        clipped to a pad: see above)."""
+        pad = shapely.buffer(d.geometry[r], NEIGHBOUR_PAD_M, join_style="mitre")
+        out = []
+        for o in others_of(r):
+            shared = polygons_only(shapely.intersection(ea.geometry[idx], ea.geometry[o]))
+            parts = [q for q in shapely.get_parts(shared or shapely.Polygon()) if q.area > 0]
+            out += [q for q, a in zip(parts, areas_sqm(parts) if parts else [])
+                    if a < scan.min_area and shapely.intersects(q, pad)]
+        return out
+
+    cuts = []
+    for r in rows:
+        if d.at[r, "_kind"] == "cut":
+            cuts.append(polygons_only(shapely.union_all([d.geometry[r], *overlap_slivers(r)])) or d.geometry[r])
+    near = [p for r in rows if d.at[r, "_kind"] == "add" for p in around(r)]
+    return cuts, adds, (shapely.union_all(near) if near else None)
 
     def around(r):
         """The other candidate features' shapes within NEIGHBOUR_PAD_M of the piece."""
@@ -1160,12 +1224,36 @@ def layer_xy(geom, original_latlon, original_layer, convert):
     return out
 
 
-def to_layer_geometry(geom, ea_layer, original=None):
+DENSIFY_M = 100.0  # fallback: edges longer than this get vertices every 100 m (see to_layer_geometry)
+
+
+def to_layer_geometry(geom, ea_layer, original=None, used=None):
     """Shapely geometry (working CRS) -> valid QgsGeometry in the EA layer's CRS and geometry type, or (None, why).
 
-    `original` is the feature's current QgsGeometry in the layer's CRS: its vertices are kept exactly as they
-    are (see layer_xy), so only the edge that was fixed changes.
+    A shape valid in the working CRS can cross itself in a lat/lon layer: an edge kilometres long bends up
+    to ~10 cm between the two (a straight line in one is a curve in the other), so two long edges close
+    together can cross once converted. Then the long edges are given a vertex every DENSIFY_M along the
+    working-CRS line (the bend is then under 0.1 mm) and it is tried again; a repair that would split the
+    feature (a "bow tie") is never used. `used` (a list), if given, receives the working-CRS geometry that
+    was written (the densified one if that was needed).
     """
+    attempts = [(geom, False)]
+    dense = shapely.segmentize(geom, DENSIFY_M)
+    if shapely.get_num_coordinates(dense) != shapely.get_num_coordinates(geom):
+        attempts.append((dense, False))
+    attempts.append((geom, True))
+    why = None
+    for g, repair in attempts:
+        out, why = _to_layer_geometry_once(g, ea_layer, original, repair)
+        if out is not None:
+            if used is not None:
+                used.append(g)
+            return out, None
+    return None, why
+
+
+def _to_layer_geometry_once(geom, ea_layer, original=None, repair=True):
+    """One try of to_layer_geometry (see there); `repair`: also try QGIS repairs of an invalid result."""
     from qgis.core import (QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry, QgsPointXY,
                            QgsProject, QgsWkbTypes)
 
@@ -1200,10 +1288,13 @@ def to_layer_geometry(geom, ea_layer, original=None):
         # them, and accept a repair only if it is valid polygon geometry with the same area. The repairs only
         # touch the broken spot: snapping the whole feature to a grid is not used, because it would move the
         # edges shared with the neighbouring features and leave hairline overlaps / gaps between them.
+        if not repair:
+            return None, "it becomes invalid when converted to the EA layer's CRS"
         deduped = QgsGeometry(g)
         deduped.removeDuplicateNodes(1e-12)
-        candidates = [g.makeValid(), deduped]
+        candidates = [deduped, g.makeValid()]
         fixed = None
+        parts_before = int(shapely.get_num_geometries(geom))
         for c in candidates:
             if c is None or c.isNull() or c.isEmpty():
                 continue
@@ -1211,7 +1302,18 @@ def to_layer_geometry(geom, ea_layer, original=None):
                 c = c.convertToType(QgsWkbTypes.PolygonGeometry, True)
                 if c is None or c.isNull():
                     continue
-            if c.isGeosValid() and abs(c.area() - g.area()) <= 1e-3 * abs(g.area()):
+            # a repair must not split the feature: makeValid turns a pinched outline into two parts touching
+            # at a point (a "bow tie") plus specks. Specks are dropped; the rest must keep its part count and
+            # area, else the feature is left untouched.
+            cs = shapely.from_wkb(bytes(c.asWkb()))
+            cparts = [q for q in shapely.get_parts(cs) if q.area > 1e-6 * max(cs.area, 1e-30)]
+            if not cparts or len(cparts) != parts_before:
+                continue
+            if len(cparts) != shapely.get_num_geometries(cs):
+                cs = cparts[0] if len(cparts) == 1 else MultiPolygon(cparts)
+                c = QgsGeometry()
+                c.fromWkb(shapely.to_wkb(cs))
+            if c.isGeosValid() and abs(c.area() - g.area()) <= 1e-6 * abs(g.area()):
                 fixed = c
                 break
         if fixed is None:
@@ -1345,7 +1447,12 @@ def _vertices_onto(target, source_xy, tol):
     return new, total
 
 
+SLIDE_M = 0.05  # a vertex on its own reference line this close (5 cm) to a reference vertex slides onto it
 DUPLICATE_M = 2e-3  # vertices closer than this (2 mm) are one vertex (QGIS flags 1e-8 deg, ~1.1 mm)
+
+
+SPIKE_DEG = 1.0  # a vertex whose two edges meet at less than this angle ...
+SPIKE_AREA_SQM = 0.01  # ... and enclose less than this is a needle left by an overlay: removed
 
 
 def _clean_ring(xy, tol=DUPLICATE_M):
@@ -1365,6 +1472,19 @@ def _clean_ring(xy, tol=DUPLICATE_M):
             out.pop()
             changed = True
         n = len(out)
+        if n >= 4:
+            for i in range(n):  # a needle (under SPIKE_DEG) enclosing a speck: drop its tip
+                a, b, c = out[i - 1], out[i], out[(i + 1) % n]
+                v1, v2 = a - b, c - b
+                l1, l2 = float(np.hypot(*v1)), float(np.hypot(*v2))
+                if l1 <= 0 or l2 <= 0:
+                    continue
+                cos = float((v1 * v2).sum()) / (l1 * l2)
+                if cos > np.cos(np.radians(SPIKE_DEG)) and abs(v1[0] * v2[1] - v1[1] * v2[0]) / 2 < SPIKE_AREA_SQM:
+                    out = out[:i] + out[i + 1:]
+                    changed = True
+                    break
+            n = len(out)
         if n >= 3:
             for i in range(n):  # A-B-A: drop B and the repeated A
                 a, c = out[i - 1], out[(i + 1) % n]
@@ -1403,6 +1523,122 @@ def clean_vertices(geom, tol=DUPLICATE_M):
     if not new.is_valid or abs(new.area - geom.area) > tol * geom.length:
         return geom
     return new
+
+
+REF_TOL_M = 0.05  # a vertex this close (5 cm) to its own reference line belongs on it (checked against one)
+
+
+_REF_LINES = {}
+
+
+def all_ref_lines(ref):
+    """The outlines of all reference features (dict key -> geometry) as one geometry, cached per dict."""
+    key = id(ref)
+    if key not in _REF_LINES:
+        _REF_LINES.clear()
+        lines = [g.boundary for g in ref.values() if g is not None and not g.is_empty]
+        _REF_LINES[key] = shapely.union_all(lines) if lines else None
+    return _REF_LINES[key]
+
+
+def ref_off_vertices(geom, ref, others=None):
+    """Vertices of `geom` lying near its reference outline (within REF_TOL_M) but not on it, and where each
+    belongs: the reference vertex nearby (within DUPLICATE_M), else the nearest point of the reference line.
+    A vertex lying exactly on another reference outline (`others`: all of them) is left out: there the
+    reference features themselves do not meet (e.g. three barangay corners mm apart), so no position fits
+    all of them and moving it would pull the neighbours off their own lines.
+    Returns (points (n, 2), targets (n, 2))."""
+    empty = (np.empty((0, 2)), np.empty((0, 2)))
+    if ref is None or ref.is_empty or geom is None or geom.is_empty:
+        return empty
+    line = ref.boundary
+    xy = np.unique(shapely.get_coordinates(geom), axis=0)
+    pts = shapely.points(xy)
+    d = shapely.distance(pts, line)
+    off = (d > SAME_VERTEX_M) & (d <= REF_TOL_M)
+    if others is not None and off.any():
+        off &= shapely.distance(pts, others) > SAME_VERTEX_M
+    if not off.any():
+        return empty
+    rv = np.unique(shapely.get_coordinates(ref), axis=0)
+    tree = shapely.STRtree(shapely.points(rv))
+    targets = []
+    for pt in pts[off]:
+        hit = tree.query_nearest(pt, max_distance=DUPLICATE_M, return_distance=False, all_matches=False)
+        if len(hit):
+            targets.append(rv[int(hit[0])])
+        else:
+            targets.append(shapely.get_coordinates(shapely.shortest_line(pt, line))[1])
+    return xy[off], np.array(targets).reshape(-1, 2)
+
+
+def _ref_inserts(ring_xy, line, rv, rv_tree):
+    """{segment index: [(t, point)]}: reference vertices to put into the ring's segments that run along the
+    reference line (both ends on it) and pass within REF_TOL_M of them (inside the segment, not at an end)."""
+    on = shapely.distance(shapely.points(ring_xy), line) <= SAME_VERTEX_M
+    out = {}
+    for k in range(len(ring_xy) - 1):
+        if not (on[k] and on[k + 1]):
+            continue
+        a, b = ring_xy[k], ring_xy[k + 1]
+        ab = b - a
+        L2 = float((ab ** 2).sum())
+        if L2 <= 0:
+            continue
+        seg = shapely.LineString([a, b])
+        for h in rv_tree.query(seg, predicate="dwithin", distance=REF_TOL_M):
+            q = rv[int(h)]
+            t = float(((q - a) * ab).sum() / L2)
+            if t <= 0 or t >= 1 or ((q - a) ** 2).sum() <= SAME_VERTEX_M ** 2 \
+                    or ((q - b) ** 2).sum() <= SAME_VERTEX_M ** 2:
+                continue
+            out.setdefault(k, []).append((t, q))
+    return out
+
+
+def ref_missing_vertices(geom, ref):
+    """Reference vertices missing from `geom`'s edges that run along the reference line (see _ref_inserts),
+    as an (n, 2) array."""
+    if ref is None or ref.is_empty or geom is None or geom.is_empty:
+        return np.empty((0, 2))
+    line, rv = ref.boundary, np.unique(shapely.get_coordinates(ref), axis=0)
+    tree = shapely.STRtree(shapely.points(rv))
+    pts = []
+    for poly in shapely.get_parts(geom):
+        for ring in [poly.exterior, *poly.interiors]:
+            for lst in _ref_inserts(shapely.get_coordinates(ring), line, rv, tree).values():
+                pts.extend(q for _t, q in lst)
+    return np.unique(np.array(pts), axis=0) if pts else np.empty((0, 2))
+
+
+def insert_ref_vertices(geom, ref):
+    """`geom` with the reference vertices missing from its edges along the reference line put in (each such
+    edge then follows the reference line vertex for vertex). Returns (geometry, count)."""
+    if ref is None or ref.is_empty or geom is None or geom.is_empty:
+        return geom, 0
+    line, rv = ref.boundary, np.unique(shapely.get_coordinates(ref), axis=0)
+    tree = shapely.STRtree(shapely.points(rv))
+    polys, total = [], 0
+    for poly in shapely.get_parts(geom):
+        rings = []
+        for ring in [poly.exterior, *poly.interiors]:
+            xy = shapely.get_coordinates(ring)
+            ins = _ref_inserts(xy, line, rv, tree)
+            if ins:
+                out = []
+                for k in range(len(xy) - 1):
+                    out.append(xy[k])
+                    for _t, q in sorted(ins.get(k, []), key=lambda e: e[0]):
+                        out.append(q)
+                        total += 1
+                out.append(xy[-1])
+                xy = np.array(out)
+            rings.append(xy)
+        polys.append(shapely.Polygon(rings[0], rings[1:]))
+    if not total:
+        return geom, 0
+    new = polys[0] if len(polys) == 1 and geom.geom_type == "Polygon" else MultiPolygon(polys)
+    return new, total
 
 
 def share_vertices(scan, layer, snapped, undo_geoms):
@@ -1480,7 +1716,7 @@ def share_vertices(scan, layer, snapped, undo_geoms):
             if hit.any():
                 xy[hit] = q
                 g2 = shapely.set_coordinates(shapely.from_wkb(shapely.to_wkb(g)), xy)
-                if not g2.is_valid or abs(g2.area - g.area) > tol * g.length:
+                if not g2.is_valid or abs(g2.area - g.area) > REF_TOL_M * g.length:
                     return False
                 new[f] = g2
         geoms.update(new)
@@ -1501,10 +1737,19 @@ def share_vertices(scan, layer, snapped, undo_geoms):
         for p, pt, dist in zip(xy, pts, d):
             if dist > tol or shapely.distance(pt, bpts).min() <= SAME_VERTEX_M:
                 continue  # not near the edge, or already one of its vertices
-            if dist > SAME_VERTEX_M and not on_own_ref(fid, pt):
+            slide = None
+            if dist > SAME_VERTEX_M and on_own_ref(fid, pt):
+                # on its own reference line: it may only slide along that line onto the neighbour's vertex,
+                # and never if it is a reference vertex itself (a barangay corner stays put)
+                vd = shapely.distance(pt, bpts)
+                rt = ref_vertices()
+                if vd.min() <= tol and on_own_ref(fid, bpts[int(vd.argmin())]) and not (
+                        rt is not None and len(rt.query(pt, predicate="dwithin", distance=SAME_VERTEX_M))):
+                    slide = bxy[int(vd.argmin())]
+            if dist > SAME_VERTEX_M and (slide is not None or not on_own_ref(fid, pt)):
                 # off the edge: move the vertex onto the neighbour's vertex nearby, else onto its edge
                 vd = shapely.distance(pt, bpts)
-                q = bxy[int(vd.argmin())] if vd.min() <= tol else \
+                q = slide if slide is not None else bxy[int(vd.argmin())] if vd.min() <= tol else \
                     np.array(shapely.get_coordinates(shapely.shortest_line(pt, line))[1])
                 if not move_vertex(p, q, [f for f in geoms if shapely.distance(geoms[f], pt) <= tol]):
                     continue
@@ -1518,7 +1763,26 @@ def share_vertices(scan, layer, snapped, undo_geoms):
                 geoms[ofid] = new_b
                 touched.add(ofid)
                 done += 1
+            elif on_own_ref(fid, pt):
+                # it stays put (on its reference line) but cannot go into the neighbour's edge (that edge would
+                # fold back): slide the neighbour's nearby vertex along its own line onto it instead
+                vd = shapely.distance(pt, bpts)
+                for k in np.argsort(vd):
+                    if vd[k] > tol:
+                        break
+                    v = bxy[int(k)]
+                    if on_own_ref(ofid, bpts[int(k)]) and move_vertex(
+                            v, p, [f for f in geoms if shapely.distance(geoms[f], bpts[int(k)]) <= tol]):
+                        done += 1
+                        break
         return done
+
+    def ref_vertices():
+        """STRtree of the reference vertices of the features loaded so far (a weld keeps them in place)."""
+        if not scan.ref:
+            return None
+        rxy = [shapely.get_coordinates(r) for r in (scan.ref.get(keys.get(f)) for f in geoms) if r is not None]
+        return shapely.STRtree(shapely.points(np.unique(np.concatenate(rxy), axis=0))) if rxy else None
 
     def weld():
         """Vertices within DUPLICATE_M of each other, in any loaded feature, become one identical point in
@@ -1526,6 +1790,7 @@ def share_vertices(scan, layer, snapped, undo_geoms):
         then exact duplicates and spikes are dropped. Done for all features at once, so a vertex pair
         between neighbours stays a pair."""
         fids = list(geoms)
+        ref_vertex_tree = ref_vertices()
         arrays = [shapely.get_coordinates(geoms[f]) for f in fids]
         if not arrays:
             return
@@ -1557,7 +1822,9 @@ def share_vertices(scan, layer, snapped, undo_geoms):
                 for k in cand:
                     same = ((xy - xy[k]) ** 2).sum(axis=1) <= SAME_VERTEX_M ** 2
                     on_ref = any(on_own_ref(fids[o], pts[k]) for o in np.unique(owner[same]))
-                    score.append((on_ref, int(same.sum())))
+                    is_ref_vertex = ref_vertex_tree is not None and len(ref_vertex_tree.query(
+                        pts[k], predicate="dwithin", distance=SAME_VERTEX_M)) > 0
+                    score.append((is_ref_vertex, on_ref, int(same.sum())))  # a reference vertex wins
                 rep = xy[cand[max(range(len(cand)), key=lambda n: score[n])]]
                 for k in cand:
                     same = ((xy - xy[k]) ** 2).sum(axis=1) <= SAME_VERTEX_M ** 2
@@ -1584,12 +1851,43 @@ def share_vertices(scan, layer, snapped, undo_geoms):
                 if other.id() in by_fid:
                     current(other.id())
     weld()  # first, no near-duplicate vertices / spikes (e.g. left by the snap's overlay)
+    if scan.ref:  # checked against a reference: each feature's edges along its own line follow it exactly
+        for fid in list(geoms):  # (the neighbours too: they share those edges)
+            ref = scan.ref.get(keys.get(fid))
+            if ref is None:
+                continue
+            for p, q in zip(*ref_off_vertices(geoms[fid], ref, all_ref_lines(scan.ref))):  # onto the line (its vertex if one is near)
+                pt = shapely.points(p)
+                move_vertex(p, q, [f for f in geoms if shapely.distance(geoms[f], pt) <= REF_TOL_M])
+            g = geoms[fid]
+            g2, n = insert_ref_vertices(g, ref)  # the line's own vertices along those edges
+            if n and g2.is_valid and abs(g2.area - g.area) <= REF_TOL_M * g.length:
+                geoms[fid] = g2
+                touched.add(fid)
     for _ in range(3):  # a vertex put in can bring another within reach: repeat until nothing changes
         added = 0
         for fid, ofid in pairs:
             added += pair(fid, ofid) + pair(ofid, fid)
         if not added:
             break
+    if scan.ref:  # a vertex on its own reference line, a few mm-cm beside a reference vertex: slide onto it,
+        # so an intersection is one vertex, not a cluster (it stays on the line: only the edge leaving it moves)
+        rt = ref_vertices()
+        if rt is not None:
+            rverts = shapely.get_coordinates(rt.geometries)
+            for fid in list(geoms):
+                xy = np.unique(shapely.get_coordinates(geoms[fid]), axis=0)
+                pts = shapely.points(xy)
+                for p, pt in zip(xy, pts):
+                    if not on_own_ref(fid, pt):
+                        continue
+                    hit = rt.query_nearest(pt, max_distance=SLIDE_M, return_distance=False, all_matches=False)
+                    if not len(hit):
+                        continue
+                    q = rverts[int(hit[0])]
+                    if ((q - p) ** 2).sum() <= SAME_VERTEX_M ** 2 or not on_own_ref(fid, shapely.points(q)):
+                        continue
+                    move_vertex(p, q, [f for f in geoms if shapely.distance(geoms[f], pt) <= SLIDE_M])
     weld()  # a vertex put in or moved can land next to another: one point again, everywhere
 
     if not touched:
@@ -1636,10 +1934,11 @@ def neighbour_lists(geoms):
     return out
 
 
-def vertex_problems(geoms, i, nbrs):
+def vertex_problems(geoms, i, nbrs, ref=None, others=None):
     """Vertices of geoms[i] (working CRS) that need matching, as an (n, 2) array: within SHARE_TOL_M of a
-    neighbour's edge without the neighbour having a vertex there (within SAME_VERTEX_M), or closer than
-    DUPLICATE_M to the next vertex of the same ring (a duplicate)."""
+    neighbour's edge without the neighbour having a vertex there (within SAME_VERTEX_M), closer than
+    DUPLICATE_M to the next vertex of the same ring (a duplicate), and, with its reference `ref`: off the
+    reference line by up to REF_TOL_M, or a reference vertex missing from an edge along that line."""
     g = geoms[i]
     if g is None or g.is_empty:
         return np.empty((0, 2))
@@ -1667,13 +1966,16 @@ def vertex_problems(geoms, i, nbrs):
                 continue
             step = np.hypot(*(np.roll(c, -1, axis=0) - c).T)
             dups.extend(c[step <= DUPLICATE_M])
-    out = xy[bad]
+    out = [xy[bad]]
     if dups:
-        out = np.unique(np.vstack([out, np.array(dups)]), axis=0)
-    return out
+        out.append(np.array(dups))
+    if ref is not None:
+        out += [ref_off_vertices(g, ref, others)[0], ref_missing_vertices(g, ref)]
+    out = np.vstack([o.reshape(-1, 2) for o in out])
+    return np.unique(out, axis=0) if len(out) else out
 
 
-def find_vertex_issues(ea, unit="EA"):
+def find_vertex_issues(ea, unit="EA", ref=None):
     """One 'Unmatched vertices' row per feature with vertices to match (see vertex_problems): Snap Selected
     matches them (share_vertices). The row's shape is a small square around each such vertex."""
     cols = ["Issue", *TABLE_KEYS, "_ea_idx", "_snappable", "_kind", "_candidates"]
@@ -1682,7 +1984,8 @@ def find_vertex_issues(ea, unit="EA"):
     rows = []
     codes = ea["EA Geocode"].astype(str).values
     for k, idx in enumerate(ea.index):
-        pts = vertex_problems(geoms, k, nbrs[k])
+        own = ref.get(ea.at[idx, "key"]) if ref and "key" in ea.columns else None
+        pts = vertex_problems(geoms, k, nbrs[k], own, all_ref_lines(ref) if ref else None)
         if not len(pts):
             continue
         marks = shapely.union_all(shapely.buffer(shapely.points(pts), VERTEX_MARK_M, cap_style="square"))
@@ -1698,8 +2001,10 @@ def find_vertex_issues(ea, unit="EA"):
             "Fix EA": codes[k],
             "Status": STATUS_PENDING,
             "Note": f"{len(pts)} vertex(es) without their partner on a neighbouring {unit} "
-                    f"({', '.join(others[:5])}{'...' if len(others) > 5 else ''}) or duplicated: Snap matches "
-                    "them (moved at most 1 cm; a vertex on its barangay line stays put)",
+                    f"({', '.join(others[:5])}{'...' if len(others) > 5 else ''})"
+                    + (", off its reference line (up to 5 cm) or missing a vertex of that line" if own is not None
+                       else "") + ", or duplicated: Snap puts them in place (a vertex on its reference line "
+                    "stays put)",
             "_ea_idx": int(idx),
             "_snappable": True,
             "_kind": "vertex",
@@ -1814,7 +2119,10 @@ def snap_rows(scan, rows):
             scan.needs_multi.setdefault(layer_id, []).extend(ea_rows)
             continue
 
-        geom, why = to_layer_geometry(new, ea_layer, feature.geometry())
+        written = []
+        geom, why = to_layer_geometry(new, ea_layer, feature.geometry(), written)
+        if written:
+            new = written[0]  # what the layer holds (with the extra vertices if long edges needed them)
         if geom is None:
             fail(why)
             continue
@@ -1854,7 +2162,9 @@ def snap_rows(scan, rows):
                     nbrs = neighbour_lists(geoms)
                     pos = {i: k for k, i in enumerate(ea.index)}
                     for idx, rs in vtx:
-                        left = len(vertex_problems(geoms, pos[idx], nbrs[pos[idx]]))
+                        own = scan.ref.get(ea.at[idx, "key"]) if scan.ref and "key" in ea.columns else None
+                        left = len(vertex_problems(geoms, pos[idx], nbrs[pos[idx]], own,
+                                                   all_ref_lines(scan.ref) if scan.ref else None))
                         code = ea.at[idx, "EA Geocode"]
                         outcome.update({r: (STATUS_DONE, f"{Unit} {code}: vertices matched") if not left else
                                         (STATUS_FAILED, f"{Unit} {code}: {left} vertex(es) could not be matched: "
@@ -2128,7 +2438,8 @@ def run_check(bgy_layers, ea_layers, min_area, step=print, mode="ea_bgy"):
                  f"{', '.join(names)}{more}")
 
     step(f"Checking the vertices along shared edges of the {unit}s...")
-    vertex_rows = find_vertex_issues(ea, unit)
+    ref = {} if self_check else {k: g for k, g in zip(bgy["key"], bgy.geometry.values) if g is not None}
+    vertex_rows = find_vertex_issues(ea, unit, ref)
     if len(vertex_rows):
         discrepancies = gpd.GeoDataFrame(pd.concat([discrepancies, vertex_rows], ignore_index=True),
                                          geometry="geometry", crs=DATA_CRS) if len(discrepancies) else \
@@ -2442,6 +2753,13 @@ HELP_HTML = f"""
         barangay line is never moved.</li>
     <li>Every scan also lists <b>Unmatched vertices</b> (teal): one row per feature that has a vertex within
         1 cm of a neighbour's edge with no partner vertex there, or two vertices within 2 mm (a duplicate).
+        In EA vs BGY also: a vertex up to 5 cm off its own barangay line, or a barangay vertex missing from an
+        EA edge along that line. These slivers are under 0.1 sqm, so they are not Outside / Short of BGY rows,
+        but they show on the map when zoomed in; snapping puts the EA edge exactly on the barangay line.</li>
+    <li>Snapping never leaves several vertices bunched at one intersection, a vertex out and straight back (a
+        line), or a feature split into parts touching at a point (a bow tie): leftover slivers are taken whole,
+        a vertex a few cm beside a barangay vertex on the same line joins it, and a repair that would split
+        the feature is refused (the row is then Failed and the feature left as it was).
         Zoom to see circles on those vertices; <b>Snap Selected</b> matches them and marks the row Snapped
         once nothing is left. A vertex lying on its own barangay line is never moved in EA vs BGY: if both
         vertices of a pair lie on their own (slightly different) barangay lines, the row is Failed: match it in
