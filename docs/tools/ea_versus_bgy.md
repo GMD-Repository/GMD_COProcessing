@@ -139,7 +139,7 @@ flowchart LR
 | **No matching …** | The feature's geocode is not in the reference layer | Nothing — fix by hand |
 | **Overlap** | Self check: land in two features | Cuts it from the larger one (Switch Fix: the other) |
 | **Gap** | Self check: land enclosed by the features but in none | Adds it to the feature with the longest border (Switch Fix: the next one) |
-| **Unmatched vertices** | A feature has a vertex within 1 cm of a neighbour's edge with no partner vertex there, or two vertices within 2 mm (duplicate) | Snap Selected matches them (moved at most 1 cm; in EA vs BGY a vertex on its barangay line stays put). Snapped only if a re-check finds nothing left |
+| **Unmatched vertices** | A feature has a vertex within 1 cm of a neighbour's edge with no partner vertex there, or two vertices within 2 mm (duplicate). Against a reference also: a vertex up to 5 cm off its own reference line, or a reference vertex missing from an edge along that line (slivers under 0.1 sqm that the area check does not list) | Snap Selected matches them (moved at most 1 cm; in EA vs BGY a vertex on its barangay line stays put). Snapped only if a re-check finds nothing left |
 
 Holes and parts smaller than the sliver setting that an edit leaves behind are removed.
 
@@ -167,7 +167,22 @@ vertices along their shared edges: a vertex of one within 1 cm of the other's ed
 third feature moves there too. Checked against a reference, a vertex on the feature's own reference line is
 never moved. Vertices within 2 mm of each other become one point in every feature that has them, and
 duplicate vertices and spikes (a vertex that goes out and straight back) are removed, so QGIS finds no
-duplicate nodes. Undo Last Snap takes this back with the snap. **Match Vertices** does the same for the whole
+duplicate nodes. Undo Last Snap takes this back with the snap.
+
+Snapping never piles vertices at an intersection, never leaves a needle (a vertex going out and straight
+back, which looks like a line) and never splits a feature into parts touching at a point (a bow tie):
+
+- the hairline slivers beside a piece are taken whole, so the only new vertices are where the two edges
+  really cross (clipping them to a pad around the piece used to add vertices mm-cm from each crossing);
+- a vertex on the barangay line within 5 cm of a barangay vertex slides onto it;
+- needles under 1° enclosing under 0.01 sqm are removed;
+- a QGIS repair that would split the feature is refused. In a lat/lon layer, a shape that crosses itself
+  only after conversion (edges kilometres long bend ~10 cm between the CRSs) gets a vertex every 100 m on
+  those long edges instead.
+
+If two barangays' outlines miss each other by a few mm at a corner, the EAs there follow their own
+barangays and cannot also meet each other exactly: EA vs EA then keeps listing one Unmatched vertices row
+at that spot. Fix the barangay layer there. **Match Vertices** does the same for the whole
 layer, which also pairs vertices that were already a hair apart in the data; run it last, from an EA vs BGY
 scan, then Scan again to confirm.
 
