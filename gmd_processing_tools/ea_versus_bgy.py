@@ -2715,10 +2715,6 @@ HELP_HTML = f"""
                      "because no feature had most of its border, or a detached piece such as an island "
                      "(the features of its reference area, nearest first)."),
       ("Snap Selected", "Changes the features named in Fix for the selected rows. Unsaved, undoable edits."),
-      ("Match Vertices", "Pairs the vertices along every shared edge of the checked layer: a vertex within 1 cm "
-                         "of a neighbour's edge is moved onto it and added to the neighbour, so both hold the same "
-                         "point. In EA vs BGY a vertex on its barangay line is never moved. <b>Undo Last Snap</b> "
-                         "takes it back."),
       ("Undo Last Snap", "Takes back the last <b>Snap Selected</b>: the features return to their shape before it and "
                          "its rows to the status they had before it (normally <i>Not snapped</i>). Press again to "
                          "undo the snap before that. It is refused (nothing changes) if you edited those layers or "
@@ -2764,10 +2760,6 @@ HELP_HTML = f"""
         once nothing is left. A vertex lying on its own barangay line is never moved in EA vs BGY: if both
         vertices of a pair lie on their own (slightly different) barangay lines, the row is Failed: match it in
         EA vs EA instead.</li>
-    <li><b>Match Vertices</b> does the same for every shared edge of the checked layer, also where nothing was
-        snapped (e.g. vertices already a hair off in the data). Vertices within 2 mm of each other become one
-        point (no duplicate vertices or spikes are left). Undo Last Snap takes it back. Best run last,
-        from an EA vs BGY scan, then Scan again to confirm.</li>
     <li>Checks and snaps run in a projected CRS in metres, so an edge is straight exactly as the map draws
         it: the layers' own CRS when projected, else the map's CRS, else the UTM zone of the data (the Log
         names it). A snapped edge then lies on the barangay line at any zoom, also along km-long edges.</li>
@@ -3220,18 +3212,10 @@ def make_dialog_class():
                 "before that. Refused if you edited those layers or used Edit > Undo afterwards; not\n"
                 "possible once their edits were saved or discarded.")
             self.undo_btn.clicked.connect(self.undo_snap)
-            self.match_btn = button("Match Vertices", 32, "/mActionVertexTool.svg")
-            self.match_btn.setToolTip(
-                "Pair the vertices along every shared edge of the checked layer: a vertex of one feature\n"
-                "within 1 cm of a neighbour's edge is moved onto it (onto the neighbour's vertex if one is that\n"
-                "close) and put into the neighbour too, so both hold the same point. Checked against a\n"
-                "barangay layer, a vertex on its barangay line is never moved. Undo Last Snap takes it back.")
-            self.match_btn.clicked.connect(self.match_all)
             arow.addWidget(self.select_btn, 1)
             arow.addWidget(self.zoom_button, 1)
             arow.addWidget(self.switch_btn, 1)
             arow.addWidget(self.snap_button, 2)
-            arow.addWidget(self.match_btn, 1)
             arow.addWidget(self.undo_btn, 1)
             gf.addLayout(arow)
             self.highlight_chk = QtWidgets.QCheckBox("Blinking dotted outline and snap preview on zoom")
@@ -4029,7 +4013,6 @@ def make_dialog_class():
             self.zoom_button.setEnabled(bool(rows) and idle)
             self.snap_button.setEnabled(bool(statuses & snappable) and idle)
             self.undo_btn.setEnabled(idle and self.scan_result is not None and bool(self.scan_result.history))
-            self.match_btn.setEnabled(idle and self.scan_result is not None)
             self.select_btn.setEnabled(has_rows and idle)
             self.switch_btn.setEnabled(idle and self.scan_result is not None
                                        and any(self.can_switch(r) for r in rows))
@@ -4420,23 +4403,6 @@ def make_dialog_class():
                     self.set_busy(False)
             return outcome
 
-        def match_all(self):
-            """Match Vertices: pair the vertices along all shared edges of the scanned layer(s)."""
-            if self.running or self.scan_result is None:
-                return
-            self.clear_highlight()
-            try:
-                n = match_vertices(self.scan_result)
-            except Exception as e:
-                self.log(f"Match Vertices failed: {e}")
-                self.update_buttons()
-                return
-            if n:
-                self.log(f"Matched the vertices along shared edges: {n:,} feature(s) changed (unsaved edits; "
-                         "Undo Last Snap takes it back). Scan again to confirm.")
-            else:
-                self.log("Match Vertices: every vertex along a shared edge already has its pair.")
-            self.update_buttons()
 
         def undo_snap(self):
             """Undo Last Snap: takes back the last Snap Selected and gives its rows their earlier status."""
